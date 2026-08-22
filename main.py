@@ -16,6 +16,8 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent
 
 TOOL_SCRIPTS = {
+    "artist": ROOT_DIR / "artist_downloader.py",
+    "download-artist": ROOT_DIR / "artist_downloader.py",
     "audit": ROOT_DIR / "check_missing_tracks.py",
     "bandcamp": ROOT_DIR / "bandcamp_scraper.py",
     "scrape": ROOT_DIR / "music_scraper.py",
@@ -32,6 +34,12 @@ Usage:
   python3 main.py <command> [options]
 
 Commands:
+  artist    Download & audit an artist's full discography using MusicBrainz data
+            (Discovers Bandcamp, MediaFire, Archive.org & netlabel releases, unpacks archives,
+            and generates comprehensive missing track reports)
+            Example: python3 main.py artist "96-glass"
+            Example: python3 main.py artist "https://musicbrainz.org/artist/2a7276cf-e768-4e7e-bf71-be7468d3604f"
+
   audit     Audit your local library against MusicBrainz for missing releases & tracks
             Example: python3 main.py audit "Stellabee" -d /mnt/music
 

@@ -206,7 +206,7 @@ class MusicBrainzClient:
                 artist=mbid,
                 limit=limit,
                 offset=offset,
-                includes=['recordings', 'release-groups', 'artist-credits', 'media']
+                includes=['recordings', 'release-groups', 'artist-credits', 'media', 'url-rels']
             )
             rels = res.get('release-list', [])
             releases_artist.extend(rels)
@@ -222,7 +222,7 @@ class MusicBrainzClient:
                 track_artist=mbid,
                 limit=limit,
                 offset=offset,
-                includes=['recordings', 'release-groups', 'artist-credits', 'media']
+                includes=['recordings', 'release-groups', 'artist-credits', 'media', 'url-rels']
             )
             rels = res.get('release-list', [])
             releases_track_artist.extend(rels)
@@ -238,7 +238,7 @@ class MusicBrainzClient:
                 artist=mbid,
                 limit=limit,
                 offset=offset,
-                includes=['artist-credits', 'work-rels']
+                includes=['artist-credits', 'work-rels', 'url-rels']
             )
             recs = res.get('recording-list', [])
             recordings.extend(recs)
@@ -254,7 +254,7 @@ class MusicBrainzClient:
                 artist=mbid,
                 limit=limit,
                 offset=offset,
-                includes=['artist-credits']
+                includes=['artist-credits', 'url-rels']
             )
             rgs = res.get('release-group-list', [])
             release_groups.extend(rgs)
@@ -393,6 +393,14 @@ class ArtistCatalog:
                     return True
             return False
 
+        self.releases: List[Dict[str, Any]] = []
+        self.all_external_urls: Set[str] = set(self.bandcamp_urls)
+        self.release_urls: Dict[str, List[str]] = {}
+        self.recording_urls: Dict[str, List[str]] = {}
+        self.mediafire_urls: List[str] = []
+        self.archive_urls: List[str] = []
+        self.web_urls: List[str] = []
+
         # 1. Primary Artist Releases
         for rel in self.raw_data.get('releases_artist', []):
             rel_title = rel.get('title', 'Unknown Release')
@@ -401,6 +409,30 @@ class ArtistCatalog:
             rg_id = rg_data.get('id')
             rg_type = rg_data.get('primary-type') or 'Album'
             rel_date = rel.get('date', '')
+
+            # Extract URLs
+            rel_urls = [u.get('target', '') for u in rel.get('url-relation-list', []) if u.get('target')]
+            if rel_id and rel_urls:
+                self.release_urls[rel_id] = rel_urls
+            for u in rel_urls:
+                self.all_external_urls.add(u)
+                if 'bandcamp.com' in u or 'suckpuck.com' in u:
+                    if u not in self.bandcamp_urls: self.bandcamp_urls.append(u)
+                elif 'mediafire.com' in u:
+                    if u not in self.mediafire_urls: self.mediafire_urls.append(u)
+                elif 'archive.org' in u:
+                    if u not in self.archive_urls: self.archive_urls.append(u)
+                elif u.startswith('http') and not any(ign in u for ign in ('discogs.com', 'rateyourmusic.com', 'wikidata.org', 'imdb.com', 'twitter.com', 'instagram.com')):
+                    if u not in self.web_urls: self.web_urls.append(u)
+
+            self.releases.append({
+                "id": rel_id,
+                "title": rel_title,
+                "type": rg_type,
+                "date": rel_date,
+                "is_va": False,
+                "urls": rel_urls
+            })
 
             for m in rel.get('medium-list', []):
                 for t in m.get('track-list', []):
@@ -412,6 +444,12 @@ class ArtistCatalog:
                     ac_raw = t.get('artist-credit', []) or rec.get('artist-credit', [])
                     artist_credit = format_credit(ac_raw)
                     norm_t = normalize_text(title)
+
+                    rec_urls = [u.get('target', '') for u in rec.get('url-relation-list', []) if u.get('target')]
+                    if rec_id and rec_urls:
+                        self.recording_urls[rec_id] = rec_urls
+                        for ru in rec_urls:
+                            self.all_external_urls.add(ru)
 
                     if not rec_id:
                         standalone_counter += 1
@@ -431,7 +469,8 @@ class ArtistCatalog:
                             "release_type": rg_type,
                             "track_number": track_num,
                             "date": rel_date,
-                            "all_releases": {rel_title}
+                            "all_releases": {rel_title},
+                            "urls": list(set(rel_urls + rec_urls))
                         }
                         if norm_t:
                             title_to_key[norm_t] = rec_id
@@ -441,6 +480,9 @@ class ArtistCatalog:
                         if track_id:
                             rec_map[rec_id]["track_ids"].add(track_id)
                         rec_map[rec_id]["all_releases"].add(rel_title)
+                        for u in rel_urls + rec_urls:
+                            if u not in rec_map[rec_id]["urls"]:
+                                rec_map[rec_id]["urls"].append(u)
 
         # 2. Track Artist Releases (Compilations, Splits, Features, VA)
         for rel in self.raw_data.get('releases_track_artist', []):
@@ -450,6 +492,29 @@ class ArtistCatalog:
             rg_id = rg_data.get('id')
             rg_type = rg_data.get('primary-type') or 'Compilation'
             rel_date = rel.get('date', '')
+
+            rel_urls = [u.get('target', '') for u in rel.get('url-relation-list', []) if u.get('target')]
+            if rel_id and rel_urls:
+                self.release_urls[rel_id] = rel_urls
+            for u in rel_urls:
+                self.all_external_urls.add(u)
+                if 'bandcamp.com' in u or 'suckpuck.com' in u:
+                    if u not in self.bandcamp_urls: self.bandcamp_urls.append(u)
+                elif 'mediafire.com' in u:
+                    if u not in self.mediafire_urls: self.mediafire_urls.append(u)
+                elif 'archive.org' in u:
+                    if u not in self.archive_urls: self.archive_urls.append(u)
+                elif u.startswith('http') and not any(ign in u for ign in ('discogs.com', 'rateyourmusic.com', 'wikidata.org', 'imdb.com', 'twitter.com', 'instagram.com')):
+                    if u not in self.web_urls: self.web_urls.append(u)
+
+            self.releases.append({
+                "id": rel_id,
+                "title": rel_title,
+                "type": f"Compilation ({rg_type})",
+                "date": rel_date,
+                "is_va": True,
+                "urls": rel_urls
+            })
 
             for m in rel.get('medium-list', []):
                 for t in m.get('track-list', []):
@@ -463,6 +528,12 @@ class ArtistCatalog:
                         track_num = str(t.get('number', ''))
                         artist_credit = format_credit(ac_raw)
                         norm_t = normalize_text(title)
+
+                        rec_urls = [u.get('target', '') for u in rec.get('url-relation-list', []) if u.get('target')]
+                        if rec_id and rec_urls:
+                            self.recording_urls[rec_id] = rec_urls
+                            for ru in rec_urls:
+                                self.all_external_urls.add(ru)
 
                         if not rec_id:
                             standalone_counter += 1
@@ -482,7 +553,8 @@ class ArtistCatalog:
                                 "release_type": f"Compilation / Feature ({rg_type})",
                                 "track_number": track_num,
                                 "date": rel_date,
-                                "all_releases": {rel_title}
+                                "all_releases": {rel_title},
+                                "urls": list(set(rel_urls + rec_urls))
                             }
                             if norm_t:
                                 title_to_key[norm_t] = rec_id
@@ -492,20 +564,40 @@ class ArtistCatalog:
                             if track_id:
                                 rec_map[rec_id]["track_ids"].add(track_id)
                             rec_map[rec_id]["all_releases"].add(rel_title)
+                            for u in rel_urls + rec_urls:
+                                if u not in rec_map[rec_id]["urls"]:
+                                    rec_map[rec_id]["urls"].append(u)
 
         # 3. Direct Recordings (Catch standalone / unreleased tracks and deduplicate by recording ID / title)
         for rec in self.raw_data.get('recordings', []):
             rec_id = rec.get('id')
             title = rec.get('title')
             norm_t = normalize_text(title)
+            rec_urls = [u.get('target', '') for u in rec.get('url-relation-list', []) if u.get('target')]
+            if rec_id and rec_urls:
+                self.recording_urls[rec_id] = rec_urls
+                for ru in rec_urls:
+                    self.all_external_urls.add(ru)
+                    if 'bandcamp.com' in ru or 'suckpuck.com' in ru:
+                        if ru not in self.bandcamp_urls: self.bandcamp_urls.append(ru)
+                    elif 'mediafire.com' in ru:
+                        if ru not in self.mediafire_urls: self.mediafire_urls.append(ru)
+                    elif 'archive.org' in ru:
+                        if ru not in self.archive_urls: self.archive_urls.append(ru)
 
             # If this recording ID or title is already associated with an existing track, merge recording ID
             if rec_id and rec_id in rec_map:
                 rec_map[rec_id]["recording_ids"].add(rec_id)
+                for u in rec_urls:
+                    if u not in rec_map[rec_id]["urls"]:
+                        rec_map[rec_id]["urls"].append(u)
             elif norm_t and norm_t in title_to_key:
                 existing_key = title_to_key[norm_t]
                 if rec_id:
                     rec_map[existing_key]["recording_ids"].add(rec_id)
+                for u in rec_urls:
+                    if u not in rec_map[existing_key]["urls"]:
+                        rec_map[existing_key]["urls"].append(u)
             elif rec_id:
                 ac_raw = rec.get('artist-credit', [])
                 artist_credit = format_credit(ac_raw)
@@ -523,7 +615,8 @@ class ArtistCatalog:
                     "release_type": "Standalone / Single",
                     "track_number": "",
                     "date": "",
-                    "all_releases": set()
+                    "all_releases": set(),
+                    "urls": list(set(rec_urls))
                 }
                 if norm_t:
                     title_to_key[norm_t] = rec_id
@@ -547,7 +640,7 @@ class AudioFileScanner:
         Scans the music directory using a 2-stage fast discovery + parallel metadata extraction.
         """
         if not self.music_dir.exists():
-            raise FileNotFoundError(f"Music directory not found: {self.music_dir}")
+            return []
 
         if progress and task_id:
             progress.update(task_id, description="[cyan]Stage 1: Discovering audio files on disk...")

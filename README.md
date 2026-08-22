@@ -1,13 +1,14 @@
 # MusicScraper
 
 A fast, versatile Python toolkit for music collectors and archivers:
-1. **Audit local music libraries** for missing tracks and albums against MusicBrainz discography data (supporting aliases, transliterations, VA compilations, and network/SSHFS libraries).
-2. **Download Bandcamp releases and artist discographies** natively (supporting high-resolution free downloads in FLAC/MP3-320/WAV, streaming fallback in MP3-128, automatic ID3 & artwork tagging, and zero-duplicate manifest tracking).
-3. **Scrape and download free music releases** from netlabels and websites without duplicates (supporting **Bandcamp**, **MediaFire**, **Archive.org**, and direct audio/archive links).
-4. **Clean up empty & non-music folders** automatically.
+1. **Download & Audit Artist Discographies from MusicBrainz**: Automatically queries MusicBrainz for an artist's full catalog (primary releases, VA compilations, splits, and standalone recordings), discovers downloadable releases across Bandcamp, MediaFire, Archive.org, and netlabels, downloads & unpacks them into project folders, cross-references downloaded audio against MusicBrainz, and generates comprehensive missing-track audit reports.
+2. **Audit local music libraries** for missing tracks and albums against MusicBrainz discography data (supporting aliases, transliterations, VA compilations, and network/SSHFS libraries).
+3. **Download Bandcamp releases and artist discographies** natively (supporting high-resolution free downloads in FLAC/MP3-320/WAV, streaming fallback in MP3-128, automatic ID3 & artwork tagging, and zero-duplicate manifest tracking).
+4. **Scrape and download free music releases** from netlabels and websites without duplicates (supporting **Bandcamp**, **MediaFire**, **Archive.org**, and direct audio/archive links).
+5. **Clean up empty & non-music folders** automatically.
 
 ### Dedicated Support Out-of-the-Box:
-- **[MusicBrainz Discography Audit](https://musicbrainz.org)**: Complete track verification with alias & compilation matching + official Bandcamp relation discovery.
+- **[MusicBrainz Artist Downloader & Auditor](https://musicbrainz.org)**: Complete discography discovery, multi-provider downloading (Bandcamp, MediaFire, Archive.org, Netlabels), archive unpacking, and missing track audit reporting.
 - **[Bandcamp](https://bandcamp.com)**: Full artist discographies, albums, and tracks with embedded metadata.
 - **[Dochakuso Records](https://dochakuso.net/release.html)** (MediaFire releases)
 - **[Otherman Records](https://www.otherman-records.com/releases)** (Archive.org releases)
@@ -32,7 +33,11 @@ pip install -r requirements.txt
 Run any tool in the suite through a single clean command:
 
 ```bash
-# Audit artist discography
+# Download and audit full artist discography using MusicBrainz
+python3 main.py artist "96-glass"
+python3 main.py artist "https://musicbrainz.org/artist/2a7276cf-e768-4e7e-bf71-be7468d3604f"
+
+# Audit local/server library against MusicBrainz
 python3 main.py audit "Stellabee" -d /mnt/music
 
 # Download Bandcamp discography
@@ -44,6 +49,32 @@ python3 main.py scrape https://dochakuso.net/release.html
 # Clean empty/non-music directories
 python3 main.py clean ./downloads --force
 ```
+
+---
+
+## 1. Artist Downloader & Auditor (`artist_downloader.py`)
+
+Automatically downloads as many songs as possible for a given artist using MusicBrainz catalog data and generates a comprehensive missing track report:
+
+```bash
+# Download artist discography and audit missing tracks
+python3 main.py artist "96-glass"
+
+# Download with preferred audio format (for free Bandcamp downloads: flac, mp3-320, wav, etc.)
+python3 main.py artist "Stellabee" -f flac
+
+# Cross-reference with existing music library (READ-ONLY) to verify missing tracks
+python3 main.py artist "96-glass" -d /mnt/music
+
+# Dry-run to inspect catalog and discovered download sources without downloading
+python3 main.py artist "96-glass" --dry-run
+```
+
+### Generated Reports:
+- `<artist>_audit_report.md`: Markdown document detailing downloaded tracks and full missing tracks checklist.
+- `<artist>_missing_tracks.txt`: Plain text list of missing tracks formatted for quick checking.
+- `<artist>_audit.json`: Structured JSON audit data.
+- `<artist>_audit.csv`: CSV spreadsheet of discography coverage.
 
 ---
 
