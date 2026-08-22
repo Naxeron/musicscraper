@@ -22,6 +22,9 @@ TOOL_SCRIPTS = {
     "bandcamp": ROOT_DIR / "bandcamp_scraper.py",
     "scrape": ROOT_DIR / "music_scraper.py",
     "clean": ROOT_DIR / "clean_empty_folders.py",
+    "tag": ROOT_DIR / "lastfm_genre_tagger.py",
+    "genre": ROOT_DIR / "lastfm_genre_tagger.py",
+    "lastfm": ROOT_DIR / "lastfm_genre_tagger.py",
 }
 
 
@@ -34,6 +37,11 @@ Usage:
   python3 main.py <command> [options]
 
 Commands:
+  tag       Apply intelligent genre tags to artists, albums, & tracks via Last.fm
+            (Cascades track->album->artist tags, filters noise, formats ID3/Vorbis)
+            Example: python3 main.py tag "/mnt/music/Library/goreshit" --dry-run
+            Example: python3 main.py tag "/mnt/music/Library" --skip-existing
+
   artist    Download & audit an artist's full discography using MusicBrainz data
             (Discovers Bandcamp, MediaFire, Archive.org & netlabel releases, unpacks archives,
             and generates comprehensive missing track reports)

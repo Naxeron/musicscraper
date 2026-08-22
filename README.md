@@ -1,13 +1,15 @@
 # MusicScraper
 
 A fast, versatile Python toolkit for music collectors and archivers:
-1. **Download & Audit Artist Discographies from MusicBrainz**: Automatically queries MusicBrainz for an artist's full catalog (primary releases, VA compilations, splits, and standalone recordings), discovers downloadable releases across Bandcamp, MediaFire, Archive.org, and netlabels, downloads & unpacks them into project folders, cross-references downloaded audio against MusicBrainz, and generates comprehensive missing-track audit reports.
-2. **Audit local music libraries** for missing tracks and albums against MusicBrainz discography data (supporting aliases, transliterations, VA compilations, and network/SSHFS libraries).
-3. **Download Bandcamp releases and artist discographies** natively (supporting high-resolution free downloads in FLAC/MP3-320/WAV, streaming fallback in MP3-128, automatic ID3 & artwork tagging, and zero-duplicate manifest tracking).
-4. **Scrape and download free music releases** from netlabels and websites without duplicates (supporting **Bandcamp**, **MediaFire**, **Archive.org**, and direct audio/archive links).
-5. **Clean up empty & non-music folders** automatically.
+1. **Apply Intelligent Last.fm Genre Tags**: Queries Last.fm community tags for tracks, albums, and artists, filters out non-genre noise, canonicalizes formatting/casing (`IDM`, `J-Core`, `Breakcore`, `Lo-Fi`, etc.), and tags audio files (`MP3`, `FLAC`, `M4A`, `OGG`, `WAV`) with SQLite caching and fast multithreading.
+2. **Download & Audit Artist Discographies from MusicBrainz**: Automatically queries MusicBrainz for an artist's full catalog (primary releases, VA compilations, splits, and standalone recordings), discovers downloadable releases across Bandcamp, MediaFire, Archive.org, and netlabels, downloads & unpacks them into project folders, cross-references downloaded audio against MusicBrainz, and generates comprehensive missing-track audit reports.
+3. **Audit local music libraries** for missing tracks and albums against MusicBrainz discography data (supporting aliases, transliterations, VA compilations, and network/SSHFS libraries).
+4. **Download Bandcamp releases and artist discographies** natively (supporting high-resolution free downloads in FLAC/MP3-320/WAV, streaming fallback in MP3-128, automatic ID3 & artwork tagging, and zero-duplicate manifest tracking).
+5. **Scrape and download free music releases** from netlabels and websites without duplicates (supporting **Bandcamp**, **MediaFire**, **Archive.org**, and direct audio/archive links).
+6. **Clean up empty & non-music folders** automatically.
 
 ### Dedicated Support Out-of-the-Box:
+- **[Last.fm Genre Tagger](https://www.last.fm)**: Multi-level genre resolution (track -> album -> artist cascading), noise blacklist filtering, canonical casing, and multi-format audio tagging.
 - **[MusicBrainz Artist Downloader & Auditor](https://musicbrainz.org)**: Complete discography discovery, multi-provider downloading (Bandcamp, MediaFire, Archive.org, Netlabels), archive unpacking, and missing track audit reporting.
 - **[Bandcamp](https://bandcamp.com)**: Full artist discographies, albums, and tracks with embedded metadata.
 - **[Dochakuso Records](https://dochakuso.net/release.html)** (MediaFire releases)
@@ -33,6 +35,10 @@ pip install -r requirements.txt
 Run any tool in the suite through a single clean command:
 
 ```bash
+# Tag music files with Last.fm genre tags (preview with dry-run)
+python3 main.py tag "/mnt/music/Library/goreshit" --dry-run
+python3 main.py tag "/mnt/music/Library" --skip-existing
+
 # Download and audit full artist discography using MusicBrainz
 python3 main.py artist "96-glass"
 python3 main.py artist "https://musicbrainz.org/artist/2a7276cf-e768-4e7e-bf71-be7468d3604f"
@@ -52,7 +58,69 @@ python3 main.py clean ./downloads --force
 
 ---
 
-## 1. Artist Downloader & Auditor (`artist_downloader.py`)
+## 1. Last.fm Intelligent Genre Tagger (`lastfm_genre_tagger.py`)
+
+Automatically queries Last.fm community metadata to accurately tag artists, albums, and tracks with clean, canonical genre tags.
+
+### Key Capabilities:
+- **Hierarchical Cascading**: Queries `Track Tags` -> `Album Tags` -> `Artist Tags`. If a track has specific tags, they take priority; otherwise, it smoothly falls back or supplements with album and artist genres.
+- **Tag Blending**: Supports `--strategy blend` to combine weighted scores from track, album, and artist tags.
+- **Smart Noise Filtering & Normalization**: Automatically strips subjective ratings (`favourite`, `guilty pleasure`), formats (`vinyl`, `flac`, `cd`), dates/years (`90s`, `2020`), emoticons (`:3`), and artist/title repeats.
+- **Canonical Formatting & Aliases**: Standardizes casing and naming for tricky genres (`IDM`, `EDM`, `J-Core`, `Breakcore`, `Speedcore`, `Happy Hardcore`, `Drum and Bass`, `Lo-Fi`, `R&B`, `Hip-Hop`, `Lolicore`, `Mashcore`, `Extratone`, `Synthwave`, `Vaporwave`, etc.).
+- **Multi-Format Audio Support**: MP3 (ID3v2 `TCON`), FLAC (Vorbis `GENRE`), M4A (`©gen`), OGG / Opus (`GENRE`), WAV / AIFF (`TCON`).
+- **High Performance**: Built-in persistent SQLite query caching (`~/.cache/musicscraper/lastfm_tags_cache.sqlite`) and multithreaded scanning.
+- **Safe Modes**: `--dry-run` preview, `--skip-existing` (only tag empty files), `--append` (combine with existing tags), or `--overwrite`.
+
+### Usage Examples
+
+#### Preview Genre Tags on an Artist Folder (Dry-Run)
+```bash
+python3 main.py tag "/mnt/music/Library/goreshit" --dry-run
+```
+
+#### Apply Genre Tags to Untagged Files Only
+```bash
+python3 main.py tag "/mnt/music/Library" --skip-existing
+```
+
+#### Append Last.fm Genres to Existing File Tags
+```bash
+python3 main.py tag "/mnt/music/Library/Wan Bushi" --append
+```
+
+#### Tag with Blended Weights and Custom Separator
+```bash
+python3 main.py tag "/mnt/music/Library/Nizikawa" --strategy blend --limit 4 --separator " / "
+```
+
+#### Direct Query Mode (Inspect Last.fm Tags Without Modifying Files)
+```bash
+python3 main.py tag --artist "goreshit" --album "dancefloor degrader" --track "all alone"
+```
+
+### Command-Line Options:
+| Flag | Default | Description |
+|---|---|---|
+| `path` | `None` | Path to audio file, album folder, artist folder, or library root |
+| `--dry-run`, `-d` | `False` | Preview proposed genre tag changes without modifying files |
+| `--skip-existing` | `False` | Only tag files that currently have no genre metadata |
+| `--append` | `False` | Preserve existing genres and append newly discovered Last.fm genres |
+| `--overwrite` | `True` | Overwrite existing genre tags with fresh Last.fm genres |
+| `--strategy`, `-s` | `cascade` | Tag resolution strategy: `cascade` (Track->Album->Artist), `blend`, `artist`, `album`, or `track` |
+| `--limit`, `-n` | `3` | Maximum number of genre tags to write per track |
+| `--min-count`, `-m` | `5` | Minimum Last.fm tag count/score to accept (1-100) |
+| `--separator` | `; ` | Separator string used when joining multiple genres |
+| `--multi-value` | `False` | Write multi-value genre tags instead of a joined string for FLAC/Vorbis/ID3 |
+| `--allow-nationality`| `False` | Allow nationality/country tags (e.g. Japanese, British, Belgian) |
+| `--allow-vocals` | `False` | Allow vocal classifiers (e.g. Female Vocalists, Male Vocalists) |
+| `--threads`, `-t` | `8` | Number of concurrent worker threads |
+| `--api-key` | `None` | Custom Last.fm API key (or set `LASTFM_API_KEY` env var) |
+| `--no-cache` | `False` | Bypass SQLite query cache |
+| `--clear-cache` | `False` | Clear local SQLite query cache |
+
+---
+
+## 2. Artist Downloader & Auditor (`artist_downloader.py`)
 
 Automatically downloads as many songs as possible for a given artist using MusicBrainz catalog data and generates a comprehensive missing track report:
 
@@ -78,7 +146,7 @@ python3 main.py artist "96-glass" --dry-run
 
 ---
 
-## 1. Bandcamp Scraper (`bandcamp_scraper.py`)
+## 3. Bandcamp Scraper (`bandcamp_scraper.py`)
 
 Fast, native Bandcamp release and discography downloader. Automatically extracts high-resolution downloads (FLAC, MP3-320, WAV, etc.) when free downloads are available, falls back to streaming audio (MP3-128) when enabled, fetches album artwork, writes ID3 metadata with `mutagen`, and tracks downloads in `manifest.json`.
 
@@ -140,7 +208,7 @@ python3 main.py bandcamp https://jwrecords.bandcamp.com/
 
 ---
 
-## 2. Missing Tracks Checker (`check_missing_tracks.py`)
+## 4. Missing Tracks Checker (`check_missing_tracks.py`)
 
 Cross-references your local music library (e.g. `/mnt/music`) against MusicBrainz discography data to detect missing tracks, albums, compilations, and standalone recordings for any artist. Discovers official Bandcamp pages and allows exporting URLs.
 
@@ -198,7 +266,7 @@ python3 check_missing_tracks.py "Stellabee" \
 
 ---
 
-## 3. Universal Music Scraper (`music_scraper.py`)
+## 5. Universal Music Scraper (`music_scraper.py`)
 
 Universal crawler and downloader supporting **Bandcamp**, **MediaFire**, **Archive.org**, and direct music release links.
 
@@ -231,12 +299,11 @@ python3 music_scraper.py https://example.com/releases --depth 2
 | Flag | Default | Description |
 |---|---|---|
 | `url` | `https://dochakuso.net/release.html` | Target website URL to scrape |
-| `-o`, `--output-dir` | `./downloads` | Directory to save downloaded files |
-| `-t`, `--threads` | `3` | Number of concurrent download workers |
-| `-d`, `--depth` | `1` | Max crawl depth for generic websites |
-| `-f`, `--format` | `mp3-320` | Preferred audio format for Bandcamp downloads (`flac`, `mp3-320`, `wav`, etc.) |
-| `--no-fallback` | `False` | Disable fallback to streaming MP3-128 for Bandcamp releases |
-| `--dry-run` | `False` | Discover and list links without downloading |
+| `-o`, `--output-dir` | `./downloads` | Destination directory for downloaded music |
+| `-f`, `--format` | `flac` | Preferred audio format for free Bandcamp downloads |
+| `-d`, `--depth` | `1` | Maximum link traversal depth |
+| `-t`, `--threads` | `4` | Number of concurrent download worker threads |
+| `--dry-run` | `False` | Discover links and releases without downloading files |
 | `--overwrite` | `False` | Redownload even if files already exist locally |
 | `--max-files` | `None` | Limit total number of files to download |
 | `--export-links` | `None` | Export found links to a file (`.json` or `.txt`) |
@@ -245,7 +312,7 @@ python3 music_scraper.py https://example.com/releases --depth 2
 
 ---
 
-## 4. Folder Cleaner (`clean_empty_folders.py`)
+## 6. Folder Cleaner (`clean_empty_folders.py`)
 
 Deletes any folders that contain no music files (e.g. empty directories, or folders containing only leftover `.txt`, `.url`, `.DS_Store`, or image files with no music).
 
