@@ -180,6 +180,7 @@ class ArtistDownloadOrchestrator:
         overwrite: bool = False,
         dry_run: bool = False,
         cache_dir: str = DEFAULT_CACHE_DIR,
+        bandcamp_email: Optional[str] = None,
     ):
         self.artist_query = artist_query.strip()
         self.output_dir = Path(output_dir).resolve()
@@ -200,6 +201,7 @@ class ArtistDownloadOrchestrator:
         self.overwrite = overwrite
         self.dry_run = dry_run
         self.cache_dir = cache_dir
+        self.bandcamp_email = bandcamp_email or os.environ.get("BANDCAMP_EMAIL")
 
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": DEFAULT_USER_AGENT})
@@ -571,7 +573,8 @@ class ArtistDownloadOrchestrator:
                 fallback=self.fallback,
                 max_workers=self.threads,
                 overwrite=self.overwrite,
-                session=self.session
+                session=self.session,
+                email=self.bandcamp_email
             )
 
             for bc_url in sorted(self.bandcamp_release_urls):
@@ -978,6 +981,12 @@ Examples:
         help="Concurrent worker threads for downloading & tag reading (default: 4)"
     )
     parser.add_argument(
+        "--bandcamp-email",
+        type=str,
+        default=os.environ.get("BANDCAMP_EMAIL"),
+        help="Email address for requesting high-res downloads on Name Your Price Bandcamp releases"
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Force re-downloading files even if they already exist on disk"
@@ -998,7 +1007,8 @@ Examples:
         fallback=not args.no_fallback,
         threads=args.threads,
         overwrite=args.overwrite,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        bandcamp_email=args.bandcamp_email
     )
 
     try:

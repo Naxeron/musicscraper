@@ -84,13 +84,19 @@ class BandcampEngine:
         fallback: bool = True,
         max_workers: int = 3,
         overwrite: bool = False,
-        session: Optional[requests.Session] = None
+        session: Optional[requests.Session] = None,
+        email: Optional[str] = None,
+        country: str = "US",
+        postcode: str = "90210"
     ):
         self.output_dir = Path(output_dir).resolve()
         self.audio_format = audio_format.lower()
         self.fallback = fallback
         self.max_workers = max_workers
         self.overwrite = overwrite
+        self.email = email or os.environ.get("BANDCAMP_EMAIL")
+        self.country = country or "US"
+        self.postcode = postcode or "90210"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.manifest_path = self.output_dir / "manifest.json"
 
@@ -121,7 +127,7 @@ class BandcampEngine:
     def normalize_target(target: str) -> Tuple[str, str]:
         """
         Normalizes artist name, subdomain, or URL into a full URL and target type.
-        Returns (normalized_url, target_type): 'artist', 'album', or 'track'.
+        Returns (normalized_url, target_type): 'artist', 'album', 'track', or 'download'.
         """
         target = target.strip()
         if not target.startswith("http://") and not target.startswith("https://"):
@@ -132,7 +138,9 @@ class BandcampEngine:
         parsed = urllib.parse.urlparse(target)
         path = parsed.path.rstrip("/")
 
-        if "/album/" in path:
+        if "/download" in path:
+            return target, "download"
+        elif "/album/" in path:
             return target, "album"
         elif "/track/" in path:
             return target, "track"
@@ -197,6 +205,48 @@ class BandcampEngine:
 
     def get_release_metadata(self, release_url: str) -> Optional[Dict[str, Any]]:
         """Fetches release page and extracts complete TralbumData and tracklist."""
+        # Check if URL is a direct Bandcamp download page
+        if "/download" in release_url:
+            try:
+                resp = self.session.get(release_url, timeout=15)
+                if resp.status_code == 200:
+                    soup = BeautifulSoup(resp.content, "html.parser")
+                    pagedata_tag = soup.find("div", id="pagedata")
+                    if pagedata_tag and "data-blob" in pagedata_tag.attrs:
+                        blob = json.loads(pagedata_tag["data-blob"])
+                        items = blob.get("download_items", [])
+                        if items:
+                            item = items[0]
+                            artist = item.get("artist", "Unknown Artist")
+                            title = item.get("title", "Unknown Title")
+                            item_type = item.get("item_type", "album")
+                            art_url = item.get("art_url")
+                            return {
+                                "url": release_url,
+                                "artist": artist,
+                                "title": title,
+                                "album": title if item_type == "album" else "",
+                                "year": "",
+                                "item_type": item_type,
+                                "item_id": item.get("id"),
+                                "art_url": art_url,
+                                "download_pref": 1,
+                                "free_download_page": release_url,
+                                "minimum_price": 0.0,
+                                "set_price": 0.0,
+                                "is_set_price": False,
+                                "is_free": True,
+                                "is_free_direct": True,
+                                "is_nyp": False,
+                                "require_email": False,
+                                "price_desc": "Free (Download Link)",
+                                "tracks": [],
+                                "key": f"bc_{FilenameUtils.sanitize(artist)}_{FilenameUtils.sanitize(title)}"
+                            }
+            except Exception as e:
+                logger.error(f"Failed to parse download page {release_url}: {e}")
+                return None
+
         try:
             resp = self.session.get(release_url, timeout=15)
             if resp.status_code != 200:
@@ -234,7 +284,8 @@ class BandcampEngine:
         artist = data.get("artist", "Unknown Artist")
         current = data.get("current", {})
         title = current.get("title", "Unknown Title")
-        item_type = data.get("item_type", "album")
+        item_type = data.get("item_type") or current.get("type", "album")
+        item_id = current.get("id") or data.get("id")
 
         # Determine album title
         album = title if item_type == "album" else ""
@@ -261,8 +312,30 @@ class BandcampEngine:
         if art_tag:
             art_url = art_tag.get("href") or art_tag.get("src")
 
-        # Free download page
+        # Free download page & pricing detection
+        download_pref = current.get("download_pref")
         free_dl_page = data.get("freeDownloadPage")
+        minimum_price = current.get("minimum_price")
+        set_price = current.get("set_price")
+        is_set_price = current.get("is_set_price") == 1
+        require_email = bool(current.get("require_email") or current.get("require_email_0"))
+
+        # Classification
+        is_free_direct = bool(free_dl_page) or (download_pref == 1)
+        is_nyp = (download_pref == 2) and (not is_set_price) and (minimum_price == 0.0 or minimum_price == 0 or minimum_price is None)
+        is_free = is_free_direct or is_nyp
+        is_paid = (download_pref == 2) and not is_nyp
+
+        # Format human-readable price description
+        if is_free_direct:
+            price_desc = "Free"
+        elif is_nyp:
+            price_desc = "NYP (Email)" if require_email else "NYP (Free)"
+        elif is_paid:
+            price_val = set_price if set_price is not None else minimum_price
+            price_desc = f"Paid ({price_val:.2f})" if isinstance(price_val, (int, float)) else "Paid"
+        else:
+            price_desc = "Stream"
 
         # Trackinfo
         tracks = []
@@ -287,12 +360,76 @@ class BandcampEngine:
             "album": album,
             "year": year,
             "item_type": item_type,
+            "item_id": item_id,
             "art_url": art_url,
+            "download_pref": download_pref,
             "free_download_page": free_dl_page,
+            "minimum_price": minimum_price,
+            "set_price": set_price,
+            "is_set_price": is_set_price,
+            "is_free": is_free,
+            "is_free_direct": is_free_direct,
+            "is_nyp": is_nyp,
+            "require_email": require_email,
+            "price_desc": price_desc,
             "tracks": tracks,
-            "require_email": bool(current.get("require_email")),
             "key": f"bc_{FilenameUtils.sanitize(artist)}_{FilenameUtils.sanitize(title)}"
         }
+
+    def request_email_download(
+        self,
+        meta: Dict[str, Any],
+        email: str,
+        country: str = "US",
+        postcode: str = "90210"
+    ) -> Tuple[bool, Optional[str], str]:
+        """
+        Submits email to Bandcamp's /email_download endpoint for Name Your Price releases.
+        Returns (success, download_url_if_any, message).
+        """
+        release_url = meta.get("url", "")
+        item_id = meta.get("item_id")
+        item_type = meta.get("item_type", "album")
+        if not item_id or not release_url:
+            return False, None, "Missing item ID or release URL"
+
+        parsed = urllib.parse.urlparse(release_url)
+        email_endpoint = f"{parsed.scheme}://{parsed.netloc}/email_download"
+
+        payload = {
+            "encoding_name": "none",
+            "item_id": str(item_id),
+            "item_type": item_type,
+            "address": email,
+            "country": country,
+            "postcode": postcode
+        }
+
+        try:
+            headers = {
+                "User-Agent": BANDCAMP_USER_AGENT,
+                "Referer": release_url,
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest"
+            }
+            resp = self.session.post(email_endpoint, data=payload, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                try:
+                    res_json = resp.json()
+                    if res_json.get("ok"):
+                        dl_url = res_json.get("download_url")
+                        if dl_url:
+                            return True, dl_url, "Direct download URL received"
+                        return True, None, f"Download link emailed to {email}"
+                    else:
+                        err = res_json.get("error") or res_json.get("errors") or "Unknown error"
+                        return False, None, f"Bandcamp error: {err}"
+                except Exception:
+                    return True, None, f"Download request submitted to {email}"
+            else:
+                return False, None, f"HTTP {resp.status_code}"
+        except Exception as e:
+            return False, None, f"Network error: {e}"
 
     def _resolve_free_download_url(self, free_page_url: str) -> Optional[Tuple[str, str]]:
         """
@@ -387,7 +524,7 @@ class BandcampEngine:
             logger.debug(f"Failed tagging {file_path.name}: {e}")
 
     def download_release(self, meta: Dict[str, Any], progress_callback=None) -> bool:
-        """Downloads a release using direct free download or streaming fallback."""
+        """Downloads a release using direct free download, email request, or streaming fallback."""
         artist = meta["artist"]
         album = meta["album"] or meta["title"]
         key = meta["key"]
@@ -462,7 +599,51 @@ class BandcampEngine:
                             self._save_manifest()
                             return True
                 except Exception as e:
-                    logger.warning(f"Free download failed for {meta['url']} ({e}), falling back to streams...")
+                    logger.warning(f"Free download failed for {meta['url']} ({e}), falling back...")
+
+        # 1b. If Name Your Price (no minimum) and requires email
+        if meta.get("is_nyp") and meta.get("require_email"):
+            if self.email:
+                ok, direct_dl, msg = self.request_email_download(meta, self.email, self.country, self.postcode)
+                if ok:
+                    if direct_dl:
+                        resolved = self._resolve_free_download_url(direct_dl)
+                        if resolved:
+                            dl_url, fmt_name = resolved
+                            logger.info(f"Free [{fmt_name.upper()}] download found via NYP link: {artist} - {album}")
+                            temp_zip = release_dir / f"temp_{int(time.time())}.zip"
+                            try:
+                                with self.session.get(dl_url, stream=True, timeout=30) as r:
+                                    r.raise_for_status()
+                                    with open(temp_zip, "wb") as f:
+                                        for chunk in r.iter_content(chunk_size=64 * 1024):
+                                            if chunk:
+                                                f.write(chunk)
+                                if temp_zip.exists() and temp_zip.suffix == ".zip":
+                                    with ZipFile(temp_zip, "r") as zf:
+                                        zf.extractall(release_dir)
+                                    temp_zip.unlink()
+                                    self.manifest[key] = {
+                                        "artist": artist,
+                                        "album": album,
+                                        "format": fmt_name,
+                                        "url": meta["url"],
+                                        "path": str(release_dir),
+                                        "downloaded_at": datetime.now().isoformat()
+                                    }
+                                    self._save_manifest()
+                                    return True
+                            except Exception as e:
+                                logger.warning(f"ZIP extraction failed ({e}), falling back to streams...")
+                    else:
+                        logger.info(f"📧 High-res ZIP download requested for {artist} - {album} ({msg})")
+                else:
+                    logger.warning(f"Could not request email download for {artist} - {album}: {msg}")
+            else:
+                logger.info(
+                    f"💡 [NYP] '{artist} - {album}' is Name Your Price ($0 min). High-res ZIP requires email "
+                    f"(pass --email <addr> to request lossless/320k links by email)."
+                )
 
         # 2. Fallback: Download individual stream tracks (MP3-128)
         if not self.fallback:
@@ -573,6 +754,24 @@ def main():
         help="Concurrent download worker threads (default: 3)"
     )
     parser.add_argument(
+        "--email",
+        type=str,
+        default=os.environ.get("BANDCAMP_EMAIL"),
+        help="Email address to request high-res download links for Name Your Price releases"
+    )
+    parser.add_argument(
+        "--country",
+        type=str,
+        default="US",
+        help="Country code for email download requests (default: US)"
+    )
+    parser.add_argument(
+        "--postcode",
+        type=str,
+        default="90210",
+        help="Postal code for email download requests (default: 90210)"
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Scan and list all found releases and metadata without downloading"
@@ -610,11 +809,12 @@ def main():
         parser.print_help()
         sys.exit(1)
 
+    email_info = f" | [dim]Email:[/dim] [cyan]{args.email}[/cyan]" if args.email else ""
     console.print(Panel.fit(
         "[bold cyan]BandcampScraper[/bold cyan] [bold white]- Native Bandcamp Downloader[/bold white]\n"
         f"[dim]Output Directory:[/dim] [green]{os.path.abspath(args.output_dir)}[/green] | "
         f"[dim]Preferred Format:[/dim] [yellow]{args.format}[/yellow] | "
-        f"[dim]Fallback:[/dim] [yellow]{not args.no_fallback}[/yellow]",
+        f"[dim]Fallback:[/dim] [yellow]{not args.no_fallback}[/yellow]{email_info}",
         border_style="cyan"
     ))
 
@@ -623,7 +823,10 @@ def main():
         audio_format=args.format,
         fallback=not args.no_fallback,
         max_workers=args.threads,
-        overwrite=args.overwrite
+        overwrite=args.overwrite,
+        email=args.email,
+        country=args.country,
+        postcode=args.postcode
     )
 
     # 1. Resolve all release URLs
@@ -666,17 +869,26 @@ def main():
     # Display releases table
     table = Table(title=f"Discovered Releases ({len(releases_meta)})", box=box.ROUNDED, expand=True)
     table.add_column("#", justify="right", style="dim", width=4)
-    table.add_column("Artist", style="cyan", no_wrap=True)
-    table.add_column("Release Title", style="bold white")
-    table.add_column("Type", style="yellow", justify="center", width=8)
+    table.add_column("Artist", style="cyan", min_width=16, ratio=2)
+    table.add_column("Release Title", style="bold white", min_width=22, ratio=3)
+    table.add_column("Type", style="yellow", justify="center", width=7)
     table.add_column("Year", style="green", justify="center", width=6)
-    table.add_column("Tracks", justify="right", width=7)
-    table.add_column("Free DL", justify="center", width=9)
+    table.add_column("Tracks", justify="right", width=6)
+    table.add_column("Download / Status", justify="center", width=18)
 
     for idx, meta in enumerate(releases_meta, 1):
-        free_status = "[green]Yes[/green]" if meta.get("free_download_page") else (
-            "[yellow]Stream[/yellow]" if any(t.get("has_stream") for t in meta.get("tracks", [])) else "[red]No[/red]"
-        )
+        if meta.get("is_free_direct"):
+            status_str = "[bold green]Free (ZIP)[/bold green]"
+        elif meta.get("is_nyp"):
+            if meta.get("require_email"):
+                status_str = "[bold cyan]Free (NYP Email)[/bold cyan]"
+            else:
+                status_str = "[bold cyan]Free (NYP)[/bold cyan]"
+        elif any(t.get("has_stream") for t in meta.get("tracks", [])):
+            status_str = f"[yellow]Stream ({meta.get('price_desc')})[/yellow]"
+        else:
+            status_str = f"[red]{meta.get('price_desc')}[/red]"
+
         table.add_row(
             str(idx),
             meta["artist"],
@@ -684,7 +896,7 @@ def main():
             meta["item_type"].upper(),
             meta.get("year", "-"),
             str(len(meta.get("tracks", []))),
-            free_status
+            status_str
         )
 
     console.print(table)

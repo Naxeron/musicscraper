@@ -112,14 +112,26 @@ python3 bandcamp_scraper.py goreshit -f flac
 python3 bandcamp_scraper.py goreshit --dry-run
 ```
 
+#### Download Name Your Price Releases via Email or Free Streaming Fallback
+```bash
+# Request high-res (FLAC/MP3-320) ZIP links to your email for Name Your Price releases:
+python3 main.py bandcamp https://jwrecords.bandcamp.com/ --email myemail@example.com
+
+# Direct download with MP3-128 stream fallback (default):
+python3 main.py bandcamp https://jwrecords.bandcamp.com/
+```
+
 ### CLI Options
 
 | Flag | Default | Description |
 |---|---|---|
-| `targets` | *(optional)* | Artist subdomains, artist URLs, album URLs, or track URLs |
+| `targets` | *(optional)* | Artist subdomains, artist URLs, album URLs, track URLs, or download URLs |
 | `-i`, `--input` | `None` | Text file containing Bandcamp URLs (one per line) |
 | `-o`, `--output-dir` | `./downloads` | Destination directory for downloads |
 | `-f`, `--format` | `mp3-320` | Preferred audio format for free downloads (`flac`, `mp3-320`, `wav`, etc.) |
+| `--email` | `BANDCAMP_EMAIL` | Email address to request high-res links for Name Your Price releases |
+| `--country` | `US` | Country code for email download requests |
+| `--postcode` | `90210` | Postal code for email download requests |
 | `--no-fallback` | `False` | Disable fallback to MP3-128 streams if direct free download is not offered |
 | `-t`, `--threads` | `3` | Concurrent worker threads |
 | `--dry-run` | `False` | Inspect metadata and list discovered releases without downloading |
