@@ -8,10 +8,11 @@ fetching, normalizing, and applying genre metadata to music collections
 
 Features:
 - Multi-level Tagging & Cascading: Track tags -> Album tags -> Artist tags (or blended weights)
+- Collaboration & Split Resolution: Automatically resolves primary artists (feat, vs, &, x)
 - Smart Genre Normalization: Filters non-genre noise (ratings, playlist tags, formats, years, duplicates)
   and canonicalizes casing/aliases (IDM, J-Core, Breakcore, Drum and Bass, Lo-Fi, R&B, etc.)
 - Multi-Format Mutagen Support: MP3 (ID3v2.3/v2.4 TCON), FLAC (Vorbis GENRE), M4A (©gen), OGG/Opus, WAV
-- SQLite Caching & Fast Concurrency: Local database cache minimizes API calls and accelerates batch tagging
+- Safe SQLite Caching & Rate Limiting: Polite request pacing, never poisons cache on rate limits
 - Tagging Modes: Overwrite, Skip Existing, Append, and Dry-Run preview
 - Rich Terminal Interface: Progress bars, before/after diff tables, and detailed summary statistics
 """
@@ -343,9 +344,7 @@ class GenreNormalizer:
     def clean_tag_name(self, raw_tag: str) -> str:
         """Strip extraneous symbols and whitespace."""
         t = raw_tag.strip().lower()
-        # Remove surrounding quotes, brackets, hyphens
         t = re.sub(r"^[\s\-_'\"`\[\]\(\)]+|[\s\-_'\"`\[\]\(\)]+$", "", t)
-        # Normalize multiple spaces or weird punctuation
         t = re.sub(r"\s+", " ", t)
         return t
 
@@ -359,24 +358,19 @@ class GenreNormalizer:
         if self.whitelist and t_clean in self.whitelist:
             return True
             
-        # Check blacklist
         if t_clean in self.blacklist:
             return False
             
-        # Check year / decade pattern
         if YEAR_DECADE_REGEX.match(t_clean):
             return False
             
-        # Check nationality tags
         if not self.allow_nationality and t_clean in self.nationality_tags:
             return False
             
-        # Check vocal tags
         if not self.allow_vocals and ("vocal" in t_clean or "female" in t_clean or "male" in t_clean):
             if t_clean not in {"vocaloid", "vocal trance", "vocal house"}:
                 return False
                 
-        # Check if tag is essentially the artist name, album name, or track title
         if artist:
             art_clean = self.clean_tag_name(artist)
             if t_clean == art_clean or (len(art_clean) > 3 and art_clean in t_clean):
@@ -392,7 +386,6 @@ class GenreNormalizer:
             if t_clean == trk_clean or (len(trk_clean) > 3 and trk_clean in t_clean):
                 return False
 
-        # Filter pure punctuation/emoticons
         if not re.search(r"[a-zA-Z0-9\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uff9f\u4e00-\u9faf]", t_clean):
             return False
 
@@ -404,7 +397,6 @@ class GenreNormalizer:
         if t_clean in CANONICAL_GENRES:
             return CANONICAL_GENRES[t_clean]
             
-        # Custom Title Casing with preservation of special short words
         words = t_clean.split(" ")
         title_words = []
         for i, word in enumerate(words):
@@ -458,8 +450,24 @@ class GenreNormalizer:
 
 
 # ---------------------------------------------------------------------------
-# Last.fm API Client with SQLite Caching
+# Last.fm API Client with SQLite Caching & Rate Limiting
 # ---------------------------------------------------------------------------
+
+class RateLimiter:
+    """Thread-safe polite rate limiter."""
+    def __init__(self, min_interval: float = 0.12):
+        self.min_interval = min_interval
+        self.last_call = 0.0
+        self.lock = threading.Lock()
+
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_call
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self.last_call = time.time()
+
 
 class LastFMClient:
     """Handles requests to Last.fm API with local SQLite caching, rate limiting, and retries."""
@@ -472,6 +480,7 @@ class LastFMClient:
     ):
         self.api_key = api_key or os.environ.get("LASTFM_API_KEY") or DEFAULT_API_KEY
         self.use_cache = use_cache
+        self.rate_limiter = RateLimiter(min_interval=0.10)
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "MusicScraperGenreTagger/1.0 (https://github.com/naxeron/musicscraper)"
@@ -562,12 +571,21 @@ class LastFMClient:
         req_params.update(params)
 
         tags: List[Dict[str, Any]] = []
-        max_retries = 3
+        success = False
+        max_retries = 4
+
         for attempt in range(max_retries):
+            self.rate_limiter.wait()
             try:
                 resp = self.session.get(LASTFM_API_URL, params=req_params, timeout=12.0)
                 if resp.status_code == 200:
                     data = resp.json()
+                    # Check for Last.fm API error json e.g. {"error": 6, "message": "..."}
+                    if "error" in data and "toptags" not in data:
+                        # Legitimate "not found" response -> safe to cache empty
+                        success = True
+                        break
+
                     raw_tags = data.get("toptags", {}).get("tag", [])
                     if isinstance(raw_tags, dict):
                         raw_tags = [raw_tags]
@@ -578,23 +596,45 @@ class LastFMClient:
                                 "name": str(t.get("name", "")).strip(),
                                 "count": t.get("count", 0)
                             })
+                    success = True
                     break
                 elif resp.status_code in (429, 500, 502, 503, 504):
-                    time.sleep(1.0 * (attempt + 1))
+                    # Rate limit or server error - back off and retry
+                    time.sleep(1.5 * (attempt + 1))
+                elif resp.status_code == 404:
+                    success = True
+                    break
                 else:
-                    # 404 or missing entry
                     break
             except Exception:
-                time.sleep(0.8 * (attempt + 1))
+                time.sleep(1.0 * (attempt + 1))
 
-        self._save_to_cache(cache_key, tags)
+        # ONLY cache if request was legitimately successful or 404/not found.
+        # DO NOT cache failed/timed out attempts as empty!
+        if success:
+            self._save_to_cache(cache_key, tags)
+            
         return tags
 
     def get_artist_tags(self, artist: str) -> List[Dict[str, Any]]:
-        """Fetch top tags for an artist."""
+        """Fetch top tags for an artist, with collaboration fallback."""
         if not artist or not artist.strip():
             return []
-        return self._api_request("artist.gettoptags", artist=artist.strip())
+        
+        art_clean = artist.strip()
+        tags = self._api_request("artist.gettoptags", artist=art_clean)
+        if tags:
+            return tags
+
+        # Fallback: if collaboration/split (e.g. "Artist A & Artist B", "Artist A feat. XYZ", "Artist A vs Artist B")
+        # query the primary artist
+        primary = re.split(r"\s+(?:feat\.?|ft\.?|vs\.?|x|&|with|\+|/|_)\s+", art_clean, flags=re.IGNORECASE)[0].strip()
+        if primary and primary.lower() != art_clean.lower():
+            primary_tags = self._api_request("artist.gettoptags", artist=primary)
+            if primary_tags:
+                return primary_tags
+
+        return []
 
     def get_album_tags(self, artist: str, album: str) -> List[Dict[str, Any]]:
         """Fetch top tags for an album."""
@@ -671,7 +711,6 @@ class AudioMetadataHandler:
 
         genres = []
         for item in raw_list:
-            # Split on standard delimiters
             parts = re.split(r"[;/]|\s{2,}", item)
             for p in parts:
                 p_clean = p.strip()
@@ -755,12 +794,9 @@ class AudioMetadataHandler:
         # 1. Clean track title
         if not meta.title:
             stem = file_path.stem
-            # Strip trailing site/track ids like [377219936] or (2128296399)
             cleaned_stem = re.sub(r"\s*[\[\(]\d{6,}[\]\)]\s*$", "", stem).strip()
-            # Strip leading track numbers e.g. "01 - Title", "01. Title", "01 Title"
             cleaned_title = re.sub(r"^\d+[\s\.\-_]+", "", cleaned_stem).strip()
             
-            # If filename looks like "Artist - Title", split it
             if " - " in cleaned_title:
                 parts_split = cleaned_title.split(" - ", 1)
                 if not meta.artist:
@@ -777,18 +813,15 @@ class AudioMetadataHandler:
                 
         if lib_idx != -1 and len(parts) > lib_idx + 1:
             rel_parts = parts[lib_idx + 1:]
-            # If 2 parts: Artist / File.mp3
             if len(rel_parts) == 2:
                 if not meta.artist:
                     meta.artist = rel_parts[0].strip()
-            # If 3+ parts: Artist / Album / (Subdir) / File.mp3
             elif len(rel_parts) >= 3:
                 if not meta.artist:
                     meta.artist = rel_parts[0].strip()
                 if not meta.album:
                     meta.album = re.sub(r"^\[.*?\]\s*", "", rel_parts[1]).strip()
         else:
-            # Fallback if outside recognized library root:
             parent = file_path.parent
             grandparent = parent.parent
             if not meta.album and parent.name:
@@ -818,7 +851,6 @@ class AudioMetadataHandler:
         try:
             audio = mutagen.File(file_path)
             if audio is None:
-                # Try creating MP3 ID3 header if none exists
                 if file_path.suffix.lower() == ".mp3":
                     try:
                         audio = mutagen.mp3.MP3(file_path)
@@ -828,7 +860,6 @@ class AudioMetadataHandler:
                 else:
                     return False
 
-            # Determine final genre list based on mode
             current_meta = cls.read_metadata(file_path)
             final_genres = []
             
@@ -855,7 +886,6 @@ class AudioMetadataHandler:
                     except Exception:
                         pass
                 if audio.tags is not None:
-                    # Write ID3v2 TCON frame
                     text_val = final_genres if multi_value else [genre_string]
                     audio.tags["TCON"] = TCON(encoding=3, text=text_val)
                     audio.tags.save(file_path)
