@@ -51,10 +51,34 @@ DEFAULT_USER_AGENT = (
 
 # Audio and archive extensions recognized for direct links
 AUDIO_ARCHIVE_EXTENSIONS = {
-    ".zip", ".rar", ".7z", ".tar", ".gz", ".tar.gz",
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".tar.gz", ".tgz",
     ".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus",
-    ".alac", ".aiff", ".wma", ".mid", ".midi"
+    ".alac", ".aiff", ".aif", ".wma", ".mid", ".midi", ".ape",
+    ".wv", ".dsf", ".dff", ".mka", ".mod", ".xm", ".it", ".s3m"
 }
+
+# Image extensions that must NEVER be downloaded as music releases
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg",
+    ".ico", ".tiff", ".tif", ".avif", ".heic", ".heif", ".psd",
+    ".raw", ".cr2", ".nef", ".jfif"
+}
+
+
+def is_image_url_or_filename(url_or_name: str) -> bool:
+    """Checks if a URL or filename ends with an image extension."""
+    if not url_or_name:
+        return False
+    path = urllib.parse.urlsplit(str(url_or_name)).path.lower()
+    return any(path.endswith(ext) for ext in IMAGE_EXTENSIONS)
+
+
+def is_audio_or_archive_url_or_filename(url_or_name: str) -> bool:
+    """Checks if a URL or filename ends with a recognized audio or archive format."""
+    if not url_or_name:
+        return False
+    path = urllib.parse.urlsplit(str(url_or_name)).path.lower()
+    return any(path.endswith(ext) for ext in AUDIO_ARCHIVE_EXTENSIONS)
 
 # Logging configuration
 logging.basicConfig(
@@ -176,6 +200,10 @@ class MediaFireResolver:
             else:
                 filename = f"mediafire_{file_key or 'file'}.zip"
 
+            if is_image_url_or_filename(filename) or is_image_url_or_filename(direct_url):
+                logger.debug(f"MediaFire item {mediafire_url} is an image ({filename}), skipping.")
+                return None
+
             return {
                 "direct_url": direct_url,
                 "filename": filename,
@@ -231,6 +259,9 @@ class ArchiveOrgResolver:
 
         # Case 1: Direct file download URL (/download/<item>/<file>)
         if item_id and filename:
+            if is_image_url_or_filename(filename) or is_image_url_or_filename(archive_url):
+                logger.debug(f"Skipping direct image download from Archive.org: {filename}")
+                return None
             decoded_filename = FilenameUtils.decode(filename)
             decoded_filename = FilenameUtils.sanitize(decoded_filename)
             return {
@@ -254,10 +285,12 @@ class ArchiveOrgResolver:
                     for f in files:
                         fname = f.get("name", "")
                         fmt = f.get("format", "").lower()
-                        if fname.lower().endswith(".zip") or "zip" in fmt:
+                        if is_image_url_or_filename(fname):
+                            continue
+                        if fname.lower().endswith((".zip", ".tar", ".gz", ".7z", ".rar", ".tar.gz", ".tgz")) or "zip" in fmt:
                             best_file = fname
                             break
-                        elif fname.lower().endswith((".flac", ".mp3", ".ogg")):
+                        elif fname.lower().endswith(tuple(AUDIO_ARCHIVE_EXTENSIONS)):
                             if not best_file:
                                 best_file = fname
 
@@ -272,13 +305,17 @@ class ArchiveOrgResolver:
                             "host": "archive.org",
                             "original_url": archive_url
                         }
+                    else:
+                        logger.debug(f"No audio/archive files found in Archive.org metadata for {item_id}")
+                        return None
             except Exception as e:
                 logger.error(f"Error querying Archive.org metadata for {item_id}: {e}")
+                return None
 
-        # Fallback to direct URL if path contains a filename
+        # Fallback to direct URL ONLY if path contains a valid audio/archive filename
         parsed = urllib.parse.urlparse(archive_url)
         fname = os.path.basename(parsed.path)
-        if fname:
+        if fname and is_audio_or_archive_url_or_filename(fname) and not is_image_url_or_filename(fname):
             fname = FilenameUtils.decode(fname)
             fname = FilenameUtils.sanitize(fname)
             return {
@@ -316,6 +353,8 @@ class UniversalLinkResolver:
         return url
 
     def resolve(self, url: str) -> Optional[Dict[str, str]]:
+        if is_image_url_or_filename(url):
+            return None
         if "mediafire.com" in url:
             return self.mf_resolver.resolve(url)
         elif "archive.org" in url:
@@ -332,8 +371,8 @@ class UniversalLinkResolver:
             # Direct link
             parsed = urllib.parse.urlparse(url)
             fname = os.path.basename(parsed.path)
-            if not fname:
-                fname = f"download_{int(time.time())}.bin"
+            if not fname or is_image_url_or_filename(fname) or not is_audio_or_archive_url_or_filename(fname):
+                return None
             fname = FilenameUtils.decode(fname)
             fname = FilenameUtils.sanitize(fname)
             return {
@@ -388,7 +427,7 @@ class UniversalScraper:
         mf_matches = re.findall(r"https?://(?:www\.)?mediafire\.com/[^\s\"\'<>]+", text)
         for m in mf_matches:
             c = m.rstrip(".,;)>'\"]")
-            if c not in found:
+            if not is_image_url_or_filename(c) and c not in found:
                 found.append(c)
 
         # 2. Archive.org
@@ -397,21 +436,23 @@ class UniversalScraper:
             if a.startswith("//"):
                 a = "https:" + a
             c = a.rstrip(".,;)>'\"]")
-            if c not in found:
+            if not is_image_url_or_filename(c) and c not in found:
                 found.append(c)
 
         # 3. Bandcamp (album and track URLs)
         bc_matches = re.findall(r"https?://[a-zA-Z0-9_-]+\.bandcamp\.com/(?:album|track)/[^\s\"\'<>]+", text)
         for b in bc_matches:
             c = b.rstrip(".,;)>'\"]")
-            if c not in found:
+            if not is_image_url_or_filename(c) and c not in found:
                 found.append(c)
 
         # 4. Direct audio/archive links
-        direct_matches = re.findall(r"href=[\"\'](https?://[^\s\"\'<>]+\.(?:zip|rar|7z|tar\.gz|mp3|flac|wav))[\"\']", text, re.IGNORECASE)
+        ext_pattern = "|".join(re.escape(ext.lstrip(".")) for ext in AUDIO_ARCHIVE_EXTENSIONS)
+        direct_matches = re.findall(rf"https?://[^\s\"\'<>]+\.(?:{ext_pattern})", text, re.IGNORECASE)
         for d in direct_matches:
-            if d not in found:
-                found.append(d)
+            c = d.rstrip(".,;)>'\"]")
+            if not is_image_url_or_filename(c) and c not in found:
+                found.append(c)
 
         return found
 
@@ -447,8 +488,8 @@ class UniversalScraper:
                 "title": title,
                 "page_url": sub_url,
                 "download_url": lnk,
-                "host": "mediafire" if "mediafire" in lnk else ("archive.org" if "archive.org" in lnk else "direct")
-            } for lnk in links]
+                "host": "mediafire" if "mediafire" in lnk else ("archive.org" if "archive.org" in lnk else ("bandcamp" if "bandcamp.com" in lnk else "direct"))
+            } for lnk in links if not is_image_url_or_filename(lnk)]
 
         with ThreadPoolExecutor(max_workers=self.crawl_workers) as executor:
             futures = [executor.submit(_scrape_page, it) for it in release_items]
@@ -490,7 +531,7 @@ class UniversalScraper:
                 found = self.find_all_music_links_in_text(text)
                 archive_url = found[0] if found else None
 
-            if not archive_url:
+            if not archive_url or is_image_url_or_filename(archive_url):
                 return None
 
             if archive_url.startswith("//"):
@@ -537,12 +578,14 @@ class UniversalScraper:
 
             links = self.find_all_music_links_in_text(html)
             for lnk in links:
+                if is_image_url_or_filename(lnk):
+                    continue
                 if not any(r["download_url"] == lnk for r in results):
                     results.append({
                         "title": current_url,
                         "page_url": current_url,
                         "download_url": lnk,
-                        "host": "mediafire" if "mediafire" in lnk else ("archive.org" if "archive.org" in lnk else "direct")
+                        "host": "mediafire" if "mediafire" in lnk else ("archive.org" if "archive.org" in lnk else ("bandcamp" if "bandcamp.com" in lnk else "direct"))
                     })
 
             if depth < max_depth:
@@ -552,6 +595,8 @@ class UniversalScraper:
                     if href.startswith(("#", "javascript:", "mailto:", "tel:")):
                         continue
                     full_link = urllib.parse.urljoin(current_url, href)
+                    if is_image_url_or_filename(full_link) or is_audio_or_archive_url_or_filename(full_link):
+                        continue
                     parsed_link = urllib.parse.urlparse(full_link)
 
                     if parsed_link.netloc == self.parsed_base.netloc:
@@ -647,6 +692,8 @@ class MusicDownloader:
         unique = []
         for item in items:
             raw_url = item["download_url"]
+            if is_image_url_or_filename(raw_url):
+                continue
             key = self.resolver.extract_key(raw_url)
             if key not in seen:
                 seen.add(key)
@@ -656,6 +703,10 @@ class MusicDownloader:
     def download_item(self, item: Dict[str, str], progress_position: int = 0) -> bool:
         url = item["download_url"]
         title = item.get("title", "")
+        if is_image_url_or_filename(url):
+            logger.debug(f"Skipping image download: {url}")
+            return True
+
         key = self.resolver.extract_key(url)
 
         # Handle Bandcamp items
@@ -682,6 +733,11 @@ class MusicDownloader:
 
         direct_url = resolved["direct_url"]
         filename = resolved["filename"]
+
+        if is_image_url_or_filename(filename) or is_image_url_or_filename(direct_url):
+            logger.debug(f"Skipping image file: {filename}")
+            return True
+
         target_path = os.path.join(self.output_dir, filename)
         part_path = target_path + ".part"
 
@@ -709,12 +765,21 @@ class MusicDownloader:
         try:
             resp = self.session.get(direct_url, headers=headers, stream=True, timeout=25)
 
+            # Check Content-Type header on stream response
+            content_type = resp.headers.get("Content-Type", "").lower()
+            if content_type.startswith("image/"):
+                logger.warning(f"Skipping image content ({content_type}) for {direct_url}")
+                return True
+
             # Check Content-Disposition for filename
             cd = resp.headers.get("Content-Disposition", "")
             if "filename=" in cd:
                 cd_fname = cd.split("filename=")[-1].strip("\"' ")
                 cd_fname = FilenameUtils.decode(cd_fname)
                 cd_fname = FilenameUtils.sanitize(cd_fname)
+                if is_image_url_or_filename(cd_fname):
+                    logger.warning(f"Skipping Content-Disposition image file: {cd_fname}")
+                    return True
                 if cd_fname and cd_fname != filename:
                     filename = cd_fname
                     target_path = os.path.join(self.output_dir, filename)

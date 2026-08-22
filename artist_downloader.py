@@ -63,6 +63,9 @@ from music_scraper import (
     UniversalLinkResolver,
     MusicDownloader,
     DEFAULT_USER_AGENT,
+    IMAGE_EXTENSIONS,
+    is_image_url_or_filename,
+    is_audio_or_archive_url_or_filename,
 )
 
 # Initialize Rich Console
@@ -453,6 +456,9 @@ class ArtistDownloadOrchestrator:
         if not raw_url or not raw_url.startswith("http"):
             return
 
+        if is_image_url_or_filename(raw_url):
+            return
+
         # Check for Bandcamp (including known custom domains like suckpuck.com)
         if "bandcamp.com" in raw_url or "suckpuck.com" in raw_url:
             norm_url, target_type = BandcampEngine.normalize_target(raw_url)
@@ -461,10 +467,12 @@ class ArtistDownloadOrchestrator:
             else:
                 self.bandcamp_release_urls.add(norm_url)
         elif "mediafire.com" in raw_url:
-            self.mediafire_urls.add(raw_url)
+            if not is_image_url_or_filename(raw_url):
+                self.mediafire_urls.add(raw_url)
         elif "archive.org" in raw_url:
-            self.archive_urls.add(raw_url)
-        elif any(raw_url.lower().endswith(ext) for ext in AUDIO_EXTENSIONS | {".zip", ".rar", ".7z", ".tar.gz"}):
+            if not is_image_url_or_filename(raw_url):
+                self.archive_urls.add(raw_url)
+        elif any(raw_url.lower().endswith(ext) for ext in AUDIO_EXTENSIONS | {".zip", ".rar", ".7z", ".tar.gz", ".tgz"}):
             self.direct_urls.add(raw_url)
         elif "soundcloud.com" in raw_url:
             self.unresolved_promo_urls.append({
@@ -515,12 +523,16 @@ class ArtistDownloadOrchestrator:
             # Check for MediaFire links embedded in script / text
             mf_matches = re.findall(r"https?://(?:www\.)?mediafire\.com/[^\s\"\'<>]+", html)
             for mf in mf_matches:
-                self.mediafire_urls.add(mf.rstrip(".,;)>'\"]"))
+                clean_mf = mf.rstrip(".,;)>'\"]")
+                if not is_image_url_or_filename(clean_mf):
+                    self.mediafire_urls.add(clean_mf)
 
             # Check for Archive.org links embedded
             arch_matches = re.findall(r"https?://(?:www\.)?archive\.org/[^\s\"\'<>]+", html)
             for ar in arch_matches:
-                self.archive_urls.add(ar.rstrip(".,;)>'\"]"))
+                clean_ar = ar.rstrip(".,;)>'\"]")
+                if not is_image_url_or_filename(clean_ar):
+                    self.archive_urls.add(clean_ar)
 
             # Check if this was a promo page with no downloadable links found
             new_found = (len(self.mediafire_urls) - prev_mf) + (len(self.bandcamp_release_urls) - prev_bc) + (len(self.archive_urls) - prev_ar) + (len(self.direct_urls) - prev_dir)
