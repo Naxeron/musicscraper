@@ -72,6 +72,85 @@ def clean_tokens(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", norm)
 
 
+def tokenize_words(text: str) -> List[str]:
+    """Extracts lowercase alphanumeric words with unidecode transliteration."""
+    if not text:
+        return []
+    norm = unidecode(text.lower())
+    return re.findall(r"[a-z0-9]+", norm)
+
+
+def is_track_title_match(
+    exp_title: str,
+    candidate_filename: str,
+    artist_aliases: Set[str],
+    rel_title: str = "",
+    dir_path: str = ""
+) -> bool:
+    """
+    Strictly verifies if candidate_filename matches expected track title:
+    - Uses exact word token / phrase matching to avoid substring false positives (e.g. 'Hip' vs 'Worship').
+    - For short or generic titles (<= 4 chars or <= 2 words), enforces contextual validation
+      (requires artist name or release title in the file/directory path).
+    """
+    exp_words = tokenize_words(exp_title)
+    if not exp_words:
+        return False
+
+    clean_exp_title = strip_track_number_and_artist(exp_title)
+    clean_exp_words = tokenize_words(clean_exp_title) or exp_words
+
+    file_words = tokenize_words(candidate_filename)
+    clean_file_words = tokenize_words(strip_track_number_and_artist(candidate_filename)) or file_words
+    full_path_words = set(tokenize_words(f"{dir_path} {candidate_filename}"))
+
+    # 1. Word token / phrase match
+    exp_str = " ".join(exp_words)
+    clean_exp_str = " ".join(clean_exp_words)
+    file_str = " ".join(file_words)
+    clean_file_str = " ".join(clean_file_words)
+
+    phrase_match = (
+        (exp_str and exp_str in file_str) or
+        (clean_exp_str and clean_exp_str in clean_file_str) or
+        all(w in file_words for w in clean_exp_words)
+    )
+
+    if not phrase_match:
+        return False
+
+    # 2. Context verification
+    has_artist_context = any(
+        tokenize_words(a) and all(w in full_path_words for w in tokenize_words(a))
+        for a in artist_aliases
+        if len(a) > 2
+    )
+
+    has_release_context = False
+    if rel_title:
+        rel_words = tokenize_words(rel_title)
+        clean_rel_words = [
+            w for w in rel_words
+            if w not in ("various", "artists", "va", "compilation", "album", "ep", "vol", "the", "a", "of", "and")
+        ]
+        if clean_rel_words:
+            has_release_context = (
+                any(len(w) >= 4 and w in full_path_words for w in clean_rel_words) or
+                " ".join(clean_rel_words[:2]) in " ".join(tokenize_words(dir_path))
+            )
+
+    # For short titles (e.g. single word <= 4 chars like 'Hip', 'EMO', 'hd'):
+    if len(clean_exp_words) == 1 and len(clean_exp_words[0]) <= 4:
+        if not (has_artist_context or has_release_context):
+            return False
+
+    # For compilation tracks where artist is featured among others, enforce context if filename doesn't contain artist
+    if not (has_artist_context or has_release_context) and len(clean_exp_words) <= 2:
+        return False
+
+    return True
+
+
 def clean_search_query(artist: str, title: str) -> str:
     """Prepares a clean, punctuation-free search query for Soulseek."""
     raw = f"{artist} {title}"
@@ -463,8 +542,6 @@ class SlskdArtistScraper:
 
         for exp in expected_tracks:
             exp_title = exp.get("title", "")
-            exp_token = clean_tokens(exp_title)
-            clean_exp_token = clean_tokens(strip_track_number_and_artist(exp_title))
 
             matched_file = None
             for sf in search_files:
@@ -472,10 +549,8 @@ class SlskdArtistScraper:
                 base = extract_dir_and_filename(fn)[1]
                 if not is_audio_file(base):
                     continue
-                file_token = clean_tokens(base)
-                clean_file_token = clean_tokens(strip_track_number_and_artist(base))
 
-                if (exp_token and exp_token in file_token) or (clean_exp_token and clean_exp_token in clean_file_token) or (clean_file_token and clean_file_token in clean_exp_token):
+                if is_track_title_match(exp_title, base, set(self.catalog.aliases), rel_title, dir_name):
                     matched_file = sf
                     break
 
@@ -564,8 +639,6 @@ class SlskdArtistScraper:
             for tt in target_tracks:
                 t_title = tt.get("title", "")
                 norm_t = tt.get("norm_title", "")
-                token_t = tt.get("token_title", "")
-                clean_token_t = clean_tokens(strip_track_number_and_artist(t_title))
 
                 if norm_t in self.local_found_map:
                     continue
@@ -575,10 +648,8 @@ class SlskdArtistScraper:
                 for user, dir_name, sf, dir_info in all_discovered_audio_files:
                     fn = sf.get("filename", "")
                     base = extract_dir_and_filename(fn)[1]
-                    file_tok = clean_tokens(base)
-                    clean_file_tok = clean_tokens(strip_track_number_and_artist(base))
 
-                    if (token_t and token_t in file_tok) or (clean_token_t and clean_token_t in clean_file_tok) or (clean_file_tok and clean_file_tok in clean_token_t):
+                    if is_track_title_match(t_title, base, set(self.catalog.aliases), rel_title, dir_name):
                         fmt_label, fmt_score = determine_audio_quality(sf)
                         queue = dir_info.get("queue", 0)
                         speed = dir_info.get("speed", 0)
@@ -671,10 +742,24 @@ class SlskdArtistScraper:
             if dir_key in queued_dirs_set:
                 continue
 
-            dir_files = self._get_or_fetch_full_directory(user, dir_name)
+            # Check if remote directory matches compilation release title
+            dir_matches_compilation = False
+            rel_title = item.get("release_title", "")
+            if rel_title:
+                clean_rel_words = [
+                    w for w in tokenize_words(rel_title)
+                    if w not in ("various", "artists", "va", "compilation", "album", "ep", "vol", "the", "a", "of", "and")
+                ]
+                if clean_rel_words:
+                    dir_matches_compilation = (
+                        any(len(w) >= 4 and w in set(tokenize_words(dir_name)) for w in clean_rel_words) or
+                        " ".join(clean_rel_words[:2]) in " ".join(tokenize_words(dir_name))
+                    )
+
+            dir_files = self._get_or_fetch_full_directory(user, dir_name) if dir_matches_compilation else []
             if not dir_files:
                 full_fn = match.get("full_filename")
-                files_to_enqueue = [{"filename": full_fn, "size": match.get("size", 0)}] if full_fn not in queued_files_set else []
+                files_to_enqueue = [{"filename": full_fn, "size": match.get("size", 0)}] if full_fn and full_fn not in queued_files_set else []
             else:
                 files_to_enqueue = []
                 for f in dir_files:
