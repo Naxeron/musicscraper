@@ -64,20 +64,47 @@ SUPPORTING_EXTENSIONS = {
 }
 
 
+def katakana_to_hiragana(text: str) -> str:
+    """Converts Katakana characters to Hiragana for uniform Japanese phonetic matching."""
+    res = []
+    for ch in text:
+        code = ord(ch)
+        if 0x30A1 <= code <= 0x30F6:
+            res.append(chr(code - 0x60))
+        else:
+            res.append(ch)
+    return "".join(res)
+
+
 def clean_tokens(text: str) -> str:
     """Strips all punctuation and whitespace for fuzzy token comparison."""
     if not text:
         return ""
-    norm = unidecode(text.lower())
+    norm = katakana_to_hiragana(text.lower())
+    norm = unidecode(norm)
     return re.sub(r"[^a-z0-9]", "", norm)
 
 
 def tokenize_words(text: str) -> List[str]:
-    """Extracts lowercase alphanumeric words with unidecode transliteration."""
+    """Extracts lowercase alphanumeric words with unidecode transliteration and number splitting."""
     if not text:
         return []
-    norm = unidecode(text.lower())
+    norm = katakana_to_hiragana(text.lower())
+    norm = unidecode(norm)
+    norm = re.sub(r"([a-zA-Z])([0-9])", r"\1 \2", norm)
+    norm = re.sub(r"([0-9])([a-zA-Z])", r"\1 \2", norm)
     return re.findall(r"[a-z0-9]+", norm)
+
+
+def is_sublist(sub: List[str], full: List[str]) -> bool:
+    """Checks if sub is an exact contiguous sub-sequence of full word tokens."""
+    if not sub or not full or len(sub) > len(full):
+        return False
+    sub_len = len(sub)
+    for i in range(len(full) - sub_len + 1):
+        if full[i:i + sub_len] == sub:
+            return True
+    return False
 
 
 def is_track_title_match(
@@ -89,7 +116,7 @@ def is_track_title_match(
 ) -> bool:
     """
     Strictly verifies if candidate_filename matches expected track title:
-    - Uses exact word token / phrase matching to avoid substring false positives (e.g. 'Hip' vs 'Worship').
+    - Uses exact whole-word token sub-sequence matching to avoid substring false positives.
     - For short or generic titles (<= 4 chars or <= 2 words), enforces contextual validation
       (requires artist name or release title in the file/directory path).
     """
@@ -102,51 +129,40 @@ def is_track_title_match(
 
     file_words = tokenize_words(candidate_filename)
     clean_file_words = tokenize_words(strip_track_number_and_artist(candidate_filename)) or file_words
-    full_path_words = set(tokenize_words(f"{dir_path} {candidate_filename}"))
 
-    # 1. Word token / phrase match
-    exp_str = " ".join(exp_words)
-    clean_exp_str = " ".join(clean_exp_words)
-    file_str = " ".join(file_words)
-    clean_file_str = " ".join(clean_file_words)
-
-    phrase_match = (
-        (exp_str and exp_str in file_str) or
-        (clean_exp_str and clean_exp_str in clean_file_str) or
-        all(w in file_words for w in clean_exp_words)
+    # Check for direct token sequence match
+    exact_match = (
+        is_sublist(exp_words, file_words) or
+        is_sublist(clean_exp_words, clean_file_words) or
+        is_sublist(clean_exp_words, file_words)
     )
 
-    if not phrase_match:
+    # Check concatenated tokens (e.g. FBD vs F>B>D, SSSS vs $S$S$, mugenuingu vs むげん☆ういんぐ)
+    exp_concat = "".join(exp_words)
+    file_concat = "".join(file_words)
+    if not exact_match and len(exp_concat) >= 3:
+        if exp_concat in file_concat or file_concat in exp_concat:
+            exact_match = True
+
+    if not exact_match:
         return False
 
-    # 2. Context verification
-    has_artist_context = any(
-        tokenize_words(a) and all(w in full_path_words for w in tokenize_words(a))
-        for a in artist_aliases
-        if len(a) > 2
-    )
+    # For short/generic titles, require context
+    if len(clean_exp_words) <= 2 or len(exp_concat) <= 4:
+        dir_norm = clean_tokens(dir_path)
+        file_norm = clean_tokens(candidate_filename)
+        has_artist_context = any(clean_tokens(alias) in dir_norm or clean_tokens(alias) in file_norm for alias in artist_aliases if len(alias) >= 3)
+        has_rel_context = False
+        if rel_title:
+            rel_words = [w for w in tokenize_words(rel_title) if w not in ("various", "artists", "va", "compilation", "album", "ep", "vol")]
+            if rel_words:
+                has_rel_context = (
+                    is_sublist(rel_words[:3], tokenize_words(dir_path)) or
+                    any(w in dir_norm for w in rel_words if len(w) >= 4)
+                )
 
-    has_release_context = False
-    if rel_title:
-        rel_words = tokenize_words(rel_title)
-        clean_rel_words = [
-            w for w in rel_words
-            if w not in ("various", "artists", "va", "compilation", "album", "ep", "vol", "the", "a", "of", "and")
-        ]
-        if clean_rel_words:
-            has_release_context = (
-                any(len(w) >= 4 and w in full_path_words for w in clean_rel_words) or
-                " ".join(clean_rel_words[:2]) in " ".join(tokenize_words(dir_path))
-            )
-
-    # For short titles (e.g. single word <= 4 chars like 'Hip', 'EMO', 'hd'):
-    if len(clean_exp_words) == 1 and len(clean_exp_words[0]) <= 4:
-        if not (has_artist_context or has_release_context):
+        if not has_artist_context and not has_rel_context:
             return False
-
-    # For compilation tracks where artist is featured among others, enforce context if filename doesn't contain artist
-    if not (has_artist_context or has_release_context) and len(clean_exp_words) <= 2:
-        return False
 
     return True
 
@@ -157,6 +173,77 @@ def clean_search_query(artist: str, title: str) -> str:
     clean = re.sub(r"[\-_:\(\)\[\]\{\}\.\,\+\?\!\~\"\'\/\\\|\@\#\$\%\^\&\*]+", " ", raw)
     words = [w for w in clean.split() if w.lower() not in ("va", "various", "artists", "feat", "ft")]
     return " ".join(words[:6])
+
+
+def clean_compilation_queries(title: str) -> List[str]:
+    """Generates clean, targeted search queries for a compilation album."""
+    queries = []
+    # 1. Main prefix before subtitle separator (e.g. 'GACHIHOMO HARDCORE' from 'GACHIHOMO HARDCORE -IS MR. XYSTRAN A GAY?-')
+    prefix = re.split(r"[-~:]", title)[0].strip()
+    prefix_clean = re.sub(r"[\(\[\{].*?[\)\]\}]", "", prefix)
+    prefix_clean = re.sub(r"[^a-zA-Z0-9\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\s]", " ", prefix_clean)
+    prefix_clean = re.sub(r"\s+", " ", prefix_clean).strip()
+    if prefix_clean and len(prefix_clean) > 3:
+        queries.append(prefix_clean)
+
+    # If title starts with Re: (e.g. Re:厨弐病), also query without Re:
+    if title.lower().startswith("re:"):
+        no_re = re.sub(r"^re:\s*", "", title, flags=re.IGNORECASE).strip()
+        no_re_clean = re.sub(r"[^a-zA-Z0-9\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\s]", " ", no_re).strip()
+        if no_re_clean and no_re_clean not in queries:
+            queries.append(no_re_clean)
+
+    # 2. Full title stripped of symbols
+    full_clean = re.sub(r"[\(\[\{].*?[\)\]\}]", "", title)
+    full_clean = re.sub(r"[^a-zA-Z0-9\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\s]", " ", full_clean)
+    full_clean = re.sub(r"\s+", " ", full_clean).strip()
+    words = [w for w in full_clean.split() if w.lower() not in ("va", "various", "artists", "compilation")]
+    if words:
+        clean_s = " ".join(words[:6])
+        if clean_s and clean_s not in queries:
+            queries.append(clean_s)
+
+    return list(dict.fromkeys(queries))
+
+
+def clean_track_queries(title: str, artist_credit: str = "", primary_artist: str = "") -> List[str]:
+    """Generates targeted search queries for a standalone or featured track."""
+    queries = []
+
+    # Clean title
+    clean_t = strip_track_number_and_artist(title)
+    clean_t = re.sub(r"[\(\[\{].*?[\)\]\}]", "", clean_t)
+    clean_t = re.sub(r"[^a-zA-Z0-9\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\s]", " ", clean_t)
+    clean_t = re.sub(r"\s+", " ", clean_t).strip()
+
+    # Extract collaborator/lead artist if credit contains 'feat', 'vs', '×', '&', '-'
+    collabs = []
+    if artist_credit:
+        m = re.split(r"(?:feat\.?|featuring|vs\.?|×|&|-|\+)", artist_credit, flags=re.IGNORECASE)
+        for part in m:
+            clean_part = part.strip()
+            if clean_part and clean_part.lower() != primary_artist.lower():
+                cp = re.sub(r"[^a-zA-Z0-9\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\s]", " ", clean_part).strip()
+                if cp:
+                    collabs.append(cp)
+
+    for collab in collabs:
+        if clean_t:
+            queries.append(f"{collab} {clean_t}".strip())
+
+    if primary_artist and clean_t and len(clean_t) > 3:
+        queries.append(f"{primary_artist} {clean_t}".strip())
+
+    if clean_t and len(clean_t) >= 4:
+        queries.append(clean_t)
+
+    # Sub-phrase for complex titles (e.g. TheAmenZa from 珍宝的-TheAmenZa-menson1MIX-)
+    sub_words = re.findall(r"[A-Za-z0-9\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]{4,}", title)
+    for sw in sub_words:
+        if sw.lower() not in (primary_artist.lower(), "remix", "mix", "edit", "ver", "feat"):
+            queries.append(sw)
+
+    return list(dict.fromkeys(queries))
 
 
 def sanitize_remote_path(path_str: str) -> str:
@@ -227,6 +314,7 @@ class SlskdArtistScraper:
         min_match_ratio: float = 0.70,
         search_timeout: float = 8.0,
         dry_run: bool = False,
+        singles_only: bool = False,
         cache_dir: str = DEFAULT_CACHE_DIR,
         threads: int = 4,
     ):
@@ -236,6 +324,7 @@ class SlskdArtistScraper:
         self.min_match_ratio = min_match_ratio
         self.search_timeout = search_timeout
         self.dry_run = dry_run
+        self.singles_only = singles_only
         self.cache_dir = cache_dir
         self.threads = threads
 
@@ -268,6 +357,8 @@ class SlskdArtistScraper:
         self.unresolved_releases: List[Dict[str, Any]] = []
         self.verified_compilation_tracks: List[Dict[str, Any]] = []
         self.unresolved_compilation_tracks: List[Dict[str, Any]] = []
+        self.verified_standalone_tracks: List[Dict[str, Any]] = []
+        self.unresolved_standalone_tracks: List[Dict[str, Any]] = []
 
     def run(self) -> Dict[str, Any]:
         """Runs the complete Soulseek discography discovery and queueing pipeline."""
@@ -307,16 +398,19 @@ class SlskdArtistScraper:
         # 5. Verify & Reconcile Primary Releases
         self._reconcile_primary_releases()
 
-        # 6. Verify & Reconcile Compilation / VA Tracks
+        # 6. Verify & Reconcile Compilation / VA Tracks (with targeted compilation searches)
         self._reconcile_compilation_tracks()
 
-        # 7. Queue Verified Directories in slskd
+        # 7. Verify & Reconcile Standalone & Non-Album Tracks (with collaborator searches)
+        self._reconcile_standalone_tracks()
+
+        # 8. Queue Verified Directories & Tracks in slskd
         if not self.dry_run:
             self._queue_downloads()
         else:
             console.print("\n[yellow]--dry-run enabled: Showing matched directories without enqueuing transfers.[/yellow]")
 
-        # 8. Print Summary & Reports
+        # 9. Print Summary & Reports
         self._print_summary()
 
         return {
@@ -327,6 +421,8 @@ class SlskdArtistScraper:
             "unresolved_releases": self.unresolved_releases,
             "verified_compilation_tracks": self.verified_compilation_tracks,
             "unresolved_compilation_tracks": self.unresolved_compilation_tracks,
+            "verified_standalone_tracks": self.verified_standalone_tracks,
+            "unresolved_standalone_tracks": self.unresolved_standalone_tracks,
         }
 
     def _prescan_library(self):
@@ -598,7 +694,7 @@ class SlskdArtistScraper:
         }
 
     def _reconcile_compilation_tracks(self):
-        """Verifies candidate tracks on compilation / VA releases."""
+        """Verifies candidate tracks on compilation / VA releases with multi-tier targeted queries."""
         comp_releases = self.raw_mb_data.get("releases_track_artist", [])
         console.print(f"\n[bold cyan]Verifying Compilation & Split Tracks ({len(comp_releases)} releases)...[/bold cyan]")
 
@@ -627,22 +723,42 @@ class SlskdArtistScraper:
                         target_tracks.append({
                             "title": t_title,
                             "norm_title": normalize_text(t_title),
-                            "token_title": clean_tokens(t_title),
+                            "artist_credit": " ".join(rec_artists),
                         })
 
             if not target_tracks:
                 target_tracks = [
-                    {"title": t.get("title"), "norm_title": t.get("norm_title"), "token_title": clean_tokens(t.get("title", ""))}
+                    {"title": t.get("title"), "norm_title": t.get("norm_title"), "artist_credit": t.get("artist_credit", "")}
                     for t in self.catalog.tracks if t.get("norm_release") == norm_rel
                 ]
 
-            for tt in target_tracks:
+            missing_tracks = [tt for tt in target_tracks if tt["norm_title"] not in self.local_found_map]
+            if not missing_tracks:
+                continue
+
+            # Check if any missing track can already be matched from peer directories
+            has_candidate = any(
+                any(is_track_title_match(tt["title"], extract_dir_and_filename(sf.get("filename", ""))[1], set(self.catalog.aliases), rel_title, d)
+                    for _, d, sf, _ in all_discovered_audio_files)
+                for tt in missing_tracks
+            )
+
+            # If not found, execute targeted search for compilation
+            if not has_candidate and len(self.searches_performed) < 45:
+                comp_queries = clean_compilation_queries(rel_title)
+                for q in comp_queries[:2]:
+                    new_res = self._execute_search(q)
+                    if new_res:
+                        for (u, d), d_info in self.peer_directories.items():
+                            for sf in d_info.get("matched_search_files", []):
+                                fn = sf.get("filename", "")
+                                base = extract_dir_and_filename(fn)[1]
+                                if is_audio_file(base) and (u, d, sf, d_info) not in all_discovered_audio_files:
+                                    all_discovered_audio_files.append((u, d, sf, d_info))
+
+            for tt in missing_tracks:
                 t_title = tt.get("title", "")
                 norm_t = tt.get("norm_title", "")
-
-                if norm_t in self.local_found_map:
-                    continue
-
                 candidate_matches: List[Dict[str, Any]] = []
 
                 for user, dir_name, sf, dir_info in all_discovered_audio_files:
@@ -686,8 +802,117 @@ class SlskdArtistScraper:
                         "release_artist": artist_credit
                     })
 
+    def _reconcile_standalone_tracks(self):
+        """Discovers and verifies standalone singles, remixes, collaborations, and non-album tracks."""
+        console.print(f"\n[bold cyan]Verifying Standalone & Non-Album Tracks...[/bold cyan]")
+
+        # Identify all tracks in catalog not on verified primary or compilation releases
+        all_covered_titles = set(self.local_found_map.keys())
+        for vr in self.verified_releases:
+            for mt in vr["best_match"].get("matched_tracks", []):
+                all_covered_titles.add(normalize_text(mt.get("expected", "")))
+        for vc in self.verified_compilation_tracks:
+            all_covered_titles.add(normalize_text(vc.get("track_title", "")))
+
+        standalone_candidates = [
+            t for t in self.catalog.tracks
+            if t.get("norm_title") not in all_covered_titles
+        ]
+
+        if not standalone_candidates:
+            return
+
+        all_discovered_audio_files: List[Tuple[str, str, Dict[str, Any], Dict[str, Any]]] = []
+        for (user, dir_name), dir_info in self.peer_directories.items():
+            for sf in dir_info.get("matched_search_files", []):
+                fn = sf.get("filename", "")
+                base = extract_dir_and_filename(fn)[1]
+                if is_audio_file(base):
+                    all_discovered_audio_files.append((user, dir_name, sf, dir_info))
+
+        for t in standalone_candidates:
+            t_title = t.get("title", "")
+            norm_t = t.get("norm_title", "")
+            artist_credit = t.get("artist_credit", "")
+
+            if norm_t in all_covered_titles:
+                continue
+
+            matched_candidates: List[Dict[str, Any]] = []
+
+            for user, dir_name, sf, dir_info in all_discovered_audio_files:
+                fn = sf.get("filename", "")
+                base = extract_dir_and_filename(fn)[1]
+                if is_track_title_match(t_title, base, set(self.catalog.aliases), t.get("release_title", ""), dir_name):
+                    fmt_label, fmt_score = determine_audio_quality(sf)
+                    queue = dir_info.get("queue", 0)
+                    speed = dir_info.get("speed", 0)
+                    has_slot = dir_info.get("has_slot", True)
+                    matched_candidates.append({
+                        "user": user,
+                        "directory": dir_name,
+                        "matched_file": base,
+                        "full_filename": fn,
+                        "size": sf.get("size", 0),
+                        "format_label": fmt_label,
+                        "format_score": fmt_score,
+                        "queue": queue,
+                        "speed": speed,
+                        "has_slot": has_slot,
+                        "total_score": fmt_score + (20 if has_slot else 0) + min(speed / 500_000, 20) - min(queue, 50),
+                        "dir_info": dir_info
+                    })
+
+            # If no candidate found, execute targeted track searches!
+            if not matched_candidates and len(self.searches_performed) < 60:
+                track_queries = clean_track_queries(t_title, artist_credit, self.catalog.name)
+                for q in track_queries[:2]:
+                    new_res = self._execute_search(q)
+                    if new_res:
+                        for (u, d), d_info in self.peer_directories.items():
+                            for sf in d_info.get("matched_search_files", []):
+                                fn = sf.get("filename", "")
+                                base = extract_dir_and_filename(fn)[1]
+                                if is_audio_file(base):
+                                    if (u, d, sf, d_info) not in all_discovered_audio_files:
+                                        all_discovered_audio_files.append((u, d, sf, d_info))
+                                    if is_track_title_match(t_title, base, set(self.catalog.aliases), t.get("release_title", ""), d):
+                                        fmt_label, fmt_score = determine_audio_quality(sf)
+                                        queue = d_info.get("queue", 0)
+                                        speed = d_info.get("speed", 0)
+                                        has_slot = d_info.get("has_slot", True)
+                                        matched_candidates.append({
+                                            "user": u,
+                                            "directory": d,
+                                            "matched_file": base,
+                                            "full_filename": fn,
+                                            "size": sf.get("size", 0),
+                                            "format_label": fmt_label,
+                                            "format_score": fmt_score,
+                                            "queue": queue,
+                                            "speed": speed,
+                                            "has_slot": has_slot,
+                                            "total_score": fmt_score + (20 if has_slot else 0) + min(speed / 500_000, 20) - min(queue, 50),
+                                            "dir_info": d_info
+                                        })
+
+            if matched_candidates:
+                matched_candidates.sort(key=lambda x: x["total_score"], reverse=True)
+                best_match = matched_candidates[0]
+                self.verified_standalone_tracks.append({
+                    "track_title": t_title,
+                    "artist_credit": artist_credit or self.catalog.name,
+                    "best_match": best_match
+                })
+                all_covered_titles.add(norm_t)
+            else:
+                self.unresolved_standalone_tracks.append({
+                    "track_title": t_title,
+                    "artist_credit": artist_credit or self.catalog.name
+                })
+
     def _queue_downloads(self):
-        """Enqueues verified primary release directories and compilation tracks into slskd."""
+        """Enqueues verified primary release directories, compilation tracks, and standalone tracks into slskd."""
         queued_dirs_set = set()
         queued_files_set = set(self.already_downloading_files)
 
@@ -732,6 +957,56 @@ class SlskdArtistScraper:
                 except Exception as e:
                     console.print(f"[red]Failed to enqueue directory '{dir_name}' from {user}: {e}[/red]")
 
+    def _queue_downloads(self):
+        """Enqueues verified primary release directories, compilation tracks, and standalone tracks into slskd."""
+        queued_dirs_set = set()
+        queued_files_set = set(self.already_downloading_files)
+
+        def is_loose_dump(d_path: str) -> bool:
+            parts = [p.strip().lower() for p in sanitize_remote_path(d_path).split("\\") if p.strip()]
+            last = parts[-1] if parts else ""
+            return any(k in last for k in ("soundcloud singles", "loose tracks", "random singles", "singles", "various singles"))
+
+        # 1. Queue Primary Release Directories
+        for item in self.verified_releases:
+            match = item["best_match"]
+            user = match["user"]
+            dir_name = match["directory"]
+            dir_key = (user, dir_name)
+
+            if dir_key in queued_dirs_set:
+                continue
+
+            dir_files = self._get_or_fetch_full_directory(user, dir_name)
+            if not dir_files:
+                dir_files = match.get("dir_info", {}).get("matched_search_files", [])
+
+            files_to_enqueue = []
+            for f in dir_files:
+                base = f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1]
+                if is_audio_file(base) or is_supporting_file(base):
+                    full_fn = f.get("full_filename") or f.get("filename")
+                    if full_fn and full_fn not in queued_files_set:
+                        files_to_enqueue.append({"filename": full_fn, "size": f.get("size", 0)})
+                        queued_files_set.add(full_fn)
+
+            if files_to_enqueue:
+                try:
+                    self.client.enqueue_download(user, files_to_enqueue)
+                    queued_dirs_set.add(dir_key)
+                    self.queued_directories.append({
+                        "type": "Primary Release",
+                        "title": item["release_title"],
+                        "user": user,
+                        "directory": dir_name,
+                        "format": match["format_label"],
+                        "files_count": len(files_to_enqueue),
+                        "total_size": sum(f["size"] for f in files_to_enqueue),
+                        "status": "Enqueued"
+                    })
+                except Exception as e:
+                    console.print(f"[red]Failed to enqueue directory '{dir_name}' from {user}: {e}[/red]")
+
         # 2. Queue Compilation / Split Release Directories
         for item in self.verified_compilation_tracks:
             match = item["best_match"]
@@ -742,21 +1017,14 @@ class SlskdArtistScraper:
             if dir_key in queued_dirs_set:
                 continue
 
-            # Check if remote directory matches compilation release title
-            dir_matches_compilation = False
-            rel_title = item.get("release_title", "")
-            if rel_title:
-                clean_rel_words = [
-                    w for w in tokenize_words(rel_title)
-                    if w not in ("various", "artists", "va", "compilation", "album", "ep", "vol", "the", "a", "of", "and")
-                ]
-                if clean_rel_words:
-                    dir_matches_compilation = (
-                        any(len(w) >= 4 and w in set(tokenize_words(dir_name)) for w in clean_rel_words) or
-                        " ".join(clean_rel_words[:2]) in " ".join(tokenize_words(dir_name))
-                    )
+            # By default, download full compilation folder unless --singles-only is set or folder is a loose dump
+            download_full_dir = not self.singles_only and not is_loose_dump(dir_name)
+            dir_files = self._get_or_fetch_full_directory(user, dir_name) if download_full_dir else []
 
-            dir_files = self._get_or_fetch_full_directory(user, dir_name) if dir_matches_compilation else []
+            # Safety check: avoid directories with > 100 files if it's an accidental root share
+            if dir_files and len(dir_files) > 100:
+                dir_files = []
+
             if not dir_files:
                 full_fn = match.get("full_filename")
                 files_to_enqueue = [{"filename": full_fn, "size": match.get("size", 0)}] if full_fn and full_fn not in queued_files_set else []
@@ -775,7 +1043,7 @@ class SlskdArtistScraper:
                     self.client.enqueue_download(user, files_to_enqueue)
                     queued_dirs_set.add(dir_key)
                     self.queued_directories.append({
-                        "type": "Compilation",
+                        "type": "Compilation Album" if len(files_to_enqueue) > 1 else "Compilation Track",
                         "title": f"{item['release_title']} (feat. {item['track_title']})",
                         "user": user,
                         "directory": dir_name,
@@ -787,16 +1055,64 @@ class SlskdArtistScraper:
                 except Exception as e:
                     console.print(f"[red]Failed to enqueue compilation '{dir_name}' from {user}: {e}[/red]")
 
+        # 3. Queue Standalone / Guest Track Releases
+        for item in self.verified_standalone_tracks:
+            match = item["best_match"]
+            user = match["user"]
+            dir_name = match["directory"]
+            dir_key = (user, dir_name)
+
+            if dir_key in queued_dirs_set:
+                continue
+
+            # By default, download full release folder for guest features / collaborative albums
+            download_full_dir = not self.singles_only and not is_loose_dump(dir_name)
+            dir_files = self._get_or_fetch_full_directory(user, dir_name) if download_full_dir else []
+
+            # Safety check: avoid directories with > 80 files
+            if dir_files and len(dir_files) > 80:
+                dir_files = []
+
+            if not dir_files:
+                full_fn = match.get("full_filename")
+                files_to_enqueue = [{"filename": full_fn, "size": match.get("size", 0)}] if full_fn and full_fn not in queued_files_set else []
+            else:
+                files_to_enqueue = []
+                for f in dir_files:
+                    base = f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1]
+                    if is_audio_file(base) or is_supporting_file(base):
+                        full_fn = f.get("full_filename") or f.get("filename")
+                        if full_fn and full_fn not in queued_files_set:
+                            files_to_enqueue.append({"filename": full_fn, "size": f.get("size", 0)})
+                            queued_files_set.add(full_fn)
+
+            if files_to_enqueue:
+                try:
+                    self.client.enqueue_download(user, files_to_enqueue)
+                    queued_dirs_set.add(dir_key)
+                    self.queued_directories.append({
+                        "type": "Featured / Collab Album" if len(files_to_enqueue) > 1 else "Standalone Track",
+                        "title": item["track_title"],
+                        "user": user,
+                        "directory": match["directory"],
+                        "format": match["format_label"],
+                        "files_count": len(files_to_enqueue),
+                        "total_size": sum(f["size"] for f in files_to_enqueue),
+                        "status": "Enqueued"
+                    })
+                except Exception as e:
+                    console.print(f"[red]Failed to enqueue standalone item '{item['track_title']}' from {user}: {e}[/red]")
+
     def _print_summary(self):
         """Displays rich formatted summary tables of all verified releases and queued downloads."""
-        if self.verified_releases or self.verified_compilation_tracks:
+        if self.verified_releases or self.verified_compilation_tracks or self.verified_standalone_tracks:
             table = Table(
-                title=f"Soulseek / slskd Verified Releases for {self.catalog.name}",
+                title=f"Soulseek / slskd Verified Releases & Tracks for {self.catalog.name}",
                 box=box.ROUNDED,
                 header_style="bold cyan"
             )
             table.add_column("#", style="dim", justify="right", width=4)
-            table.add_column("Type", style="bold magenta", width=12)
+            table.add_column("Type", style="bold magenta", width=14)
             table.add_column("Release / Track Title", style="bold white")
             table.add_column("Format", style="green", width=18)
             table.add_column("Peer", style="cyan", width=14)
@@ -831,6 +1147,19 @@ class SlskdArtistScraper:
                 )
                 idx += 1
 
+            for s in self.verified_standalone_tracks:
+                bm = s["best_match"]
+                table.add_row(
+                    str(idx),
+                    "Standalone",
+                    f"{s['track_title']}\n[dim]↳ Credit: {s['artist_credit']}[/dim]",
+                    bm["format_label"],
+                    bm["user"],
+                    "[green]100%[/green]",
+                    bm["directory"]
+                )
+                idx += 1
+
             console.print("\n", table)
 
         if self.queued_directories:
@@ -840,7 +1169,7 @@ class SlskdArtistScraper:
                 header_style="bold green"
             )
             q_table.add_column("#", style="dim", justify="right", width=4)
-            q_table.add_column("Category", style="magenta", width=14)
+            q_table.add_column("Category", style="magenta", width=22)
             q_table.add_column("Release Title", style="white")
             q_table.add_column("Peer", style="cyan", width=14)
             q_table.add_column("Files", justify="right", width=8)
@@ -860,12 +1189,12 @@ class SlskdArtistScraper:
                 )
             console.print("\n", q_table)
 
-        tot_verified = len(self.verified_releases) + len(self.verified_compilation_tracks)
-        tot_unresolved = len(self.unresolved_releases) + len(self.unresolved_compilation_tracks)
+        tot_verified = len(self.verified_releases) + len(self.verified_compilation_tracks) + len(self.verified_standalone_tracks)
+        tot_unresolved = len(self.unresolved_releases) + len(self.unresolved_compilation_tracks) + len(self.unresolved_standalone_tracks)
         console.print(Panel.fit(
             f"[bold green]✔ Discography Reconciliation Complete[/bold green]\n"
             f"• Verified on Soulseek: [bold cyan]{tot_verified}[/bold cyan] releases/tracks\n"
-            f"• Queued in slskd: [bold green]{len(self.queued_directories)}[/bold green] album directories\n"
+            f"• Queued in slskd: [bold green]{len(self.queued_directories)}[/bold green] album directories / files\n"
             f"• Unresolved on Soulseek: [yellow]{tot_unresolved}[/yellow] items",
             border_style="green"
         ))
@@ -879,6 +1208,7 @@ def main():
 Examples:
   python3 slskd_scraper.py "kyou1110"
   python3 slskd_scraper.py "kyou1110" --dry-run
+  python3 slskd_scraper.py "kyou1110" --singles-only
   python3 slskd_scraper.py "Stellabee" --format flac --min-match 0.8
         """
     )
@@ -888,6 +1218,7 @@ Examples:
     parser.add_argument("--min-match", type=float, default=0.70, help="Minimum track match ratio for albums (default: 0.70)")
     parser.add_argument("--timeout", type=float, default=8.0, help="Soulseek search timeout in seconds (default: 8)")
     parser.add_argument("--dry-run", action="store_true", help="Discover and verify matches without enqueuing downloads")
+    parser.add_argument("--singles-only", action="store_true", default=False, help="Only download single matching tracks for compilations/features instead of full releases")
     parser.add_argument("-t", "--threads", type=int, default=4, help="Worker threads for local scanning")
 
     args = parser.parse_args()
@@ -899,6 +1230,7 @@ Examples:
         min_match_ratio=args.min_match,
         search_timeout=args.timeout,
         dry_run=args.dry_run,
+        singles_only=args.singles_only,
         threads=args.threads
     )
 

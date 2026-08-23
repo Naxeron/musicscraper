@@ -70,20 +70,36 @@ DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/musicscraper/mb_cache")
 # STRING NORMALIZATION & FUZZY MATCHING HELPERS
 # ==============================================================================
 
+def katakana_to_hiragana(text: str) -> str:
+    """Converts Katakana characters to Hiragana for uniform Japanese phonetic matching."""
+    res = []
+    for ch in text:
+        code = ord(ch)
+        if 0x30A1 <= code <= 0x30F6:
+            res.append(chr(code - 0x60))
+        else:
+            res.append(ch)
+    return "".join(res)
+
+
 def normalize_text(text: Optional[str]) -> str:
     """
     Normalizes text for robust comparison:
-    - Lowercases
+    - Lowercases & unifies Katakana/Hiragana
     - Transliterates unicode (e.g. Japanese to ASCII Romaji approximations)
+    - Separates number-letter boundaries (e.g. menson1mix -> menson 1 mix)
     - Replaces punctuation and special symbols with spaces
     - Collapses consecutive whitespace
     """
     if not text:
         return ""
-    text = text.lower()
+    text = katakana_to_hiragana(text.lower())
     text = unidecode(text)
+    # Separate letter-number boundaries
+    text = re.sub(r'([a-zA-Z])([0-9])', r'\1 \2', text)
+    text = re.sub(r'([0-9])([a-zA-Z])', r'\1 \2', text)
     # Remove punctuation and special symbols
-    text = re.sub(r'[\(\)\[\]\{\}\-_,.\'\"!?:;~`+*#&/\\|]', ' ', text)
+    text = re.sub(r'[\(\)\[\]\{\}\-_,.\'\"!?:;~`+*#&/\\|><$%^@=]', ' ', text)
     # Collapse multiple whitespaces
     text = re.sub(r'\s+', ' ', text).strip()
     return text
@@ -645,22 +661,23 @@ class AudioFileScanner:
         if progress and task_id:
             progress.update(task_id, description="[cyan]Stage 1: Discovering audio files on disk...")
 
-        # Prepare matching lookups
-        known_releases = {t["norm_release"] for t in self.catalog.tracks if t["norm_release"]}
-        known_tracks = {t["norm_title"] for t in self.catalog.tracks if len(t["norm_title"]) >= 3}
-        artist_aliases = self.catalog.aliases
+        # Prepare fast substring matching lookups
+        raw_aliases = [a.lower() for a in self.catalog.aliases if len(a) >= 2]
+        uni_aliases = [unidecode(a).lower() for a in raw_aliases]
+        norm_aliases = [normalize_text(a) for a in self.catalog.aliases if len(a) >= 2]
+        
+        raw_tracks = [t["title"].lower() for t in self.catalog.tracks if t.get("title") and len(t["title"]) >= 3]
+        uni_tracks = [unidecode(t).lower() for t in raw_tracks]
+        norm_tracks = [t["norm_title"] for t in self.catalog.tracks if t.get("norm_title") and len(t["norm_title"]) >= 3]
 
         all_audio_paths = []
         candidate_paths = []
 
-        # Stage 1: Walk directory structure
+        # Stage 1: Walk directory structure (Fast scan)
         for root, dirs, files in os.walk(self.music_dir):
             root_lower = root.lower()
-            root_uni = unidecode(root_lower)
-
-            dir_matches_artist = any(a in root_lower or a in root_uni for a in artist_aliases)
-            dir_matches_release = any(r in root_lower or r in root_uni for r in known_releases)
-            dir_is_va = any(vm in root_lower or vm in root_uni for vm in VA_DIR_MARKERS)
+            dir_matches_artist = any(a in root_lower for a in raw_aliases) or any(u in root_lower for u in uni_aliases)
+            dir_is_va = any(vm in root_lower for vm in VA_DIR_MARKERS)
 
             for f in files:
                 ext = os.path.splitext(f)[1].lower()
@@ -670,16 +687,16 @@ class AudioFileScanner:
                 full_path = os.path.join(root, f)
                 all_audio_paths.append(full_path)
 
-                if self.full_scan:
+                if self.full_scan or dir_matches_artist or dir_is_va:
                     candidate_paths.append(full_path)
                 else:
                     f_lower = f.lower()
-                    f_uni = unidecode(f_lower)
-                    f_matches_artist = any(a in f_lower or a in f_uni for a in artist_aliases)
-                    f_matches_track = any(t in f_lower or t in f_uni for t in known_tracks)
-
-                    if dir_matches_artist or dir_matches_release or f_matches_artist or f_matches_track or (dir_is_va and (f_matches_artist or f_matches_track)):
+                    if any(a in f_lower for a in raw_aliases) or any(u in f_lower for u in uni_aliases) or any(t in f_lower for t in raw_tracks) or any(ut in f_lower for ut in uni_tracks):
                         candidate_paths.append(full_path)
+                    else:
+                        f_norm = normalize_text(f)
+                        if any(t in f_norm for t in norm_tracks):
+                            candidate_paths.append(full_path)
 
         total_audio = len(all_audio_paths)
         total_candidates = len(candidate_paths)

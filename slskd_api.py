@@ -269,3 +269,11 @@ class SlskdClient:
                     if fn:
                         queued.add(fn)
         return queued
+
+    def delete_download(self, username: str, transfer_id: Optional[str] = None) -> bool:
+        """Cancels and removes download(s) from a user."""
+        path = f"/api/v0/transfers/downloads/{username}"
+        if transfer_id:
+            path += f"/{transfer_id}"
+        resp = self._request("DELETE", path)
+        return resp.status_code in (200, 204)

@@ -185,6 +185,7 @@ class ArtistDownloadOrchestrator:
         bandcamp_email: Optional[str] = None,
         slskd: bool = False,
         slskd_format: str = "flac",
+        slskd_singles_only: bool = False,
     ):
         self.artist_query = artist_query.strip()
         self.output_dir = Path(output_dir).resolve()
@@ -208,6 +209,7 @@ class ArtistDownloadOrchestrator:
         self.bandcamp_email = bandcamp_email or os.environ.get("BANDCAMP_EMAIL")
         self.slskd = slskd
         self.slskd_format = slskd_format
+        self.slskd_singles_only = slskd_singles_only
         self.slskd_results: Optional[Dict[str, Any]] = None
         self.slskd_found_releases: Set[str] = set()
         self.slskd_found_tracks: Dict[str, Dict[str, Any]] = {}
@@ -311,6 +313,7 @@ class ArtistDownloadOrchestrator:
                 music_dir=str(self.music_dir) if self.music_dir else None,
                 preferred_format=self.slskd_format,
                 dry_run=self.dry_run,
+                singles_only=self.slskd_singles_only,
                 cache_dir=self.cache_dir,
                 threads=self.threads,
             )
@@ -347,8 +350,24 @@ class ArtistDownloadOrchestrator:
                     "format": bm.get("format_label")
                 }
 
+            # Register verified standalone tracks
+            for s in self.slskd_results.get("verified_standalone_tracks", []):
+                track_title = s.get("track_title", "")
+                norm_t = normalize_text(track_title)
+                bm = s.get("best_match", {})
+                self.slskd_found_tracks[norm_t] = {
+                    "source": "Soulseek (slskd)",
+                    "peer": bm.get("user"),
+                    "directory": bm.get("directory"),
+                    "format": bm.get("format_label")
+                }
+
             queued_count = len(self.slskd_results.get("queued_directories", []))
-            verified_count = len(self.slskd_results.get("verified_releases", [])) + len(self.slskd_results.get("verified_compilation_tracks", []))
+            verified_count = (
+                len(self.slskd_results.get("verified_releases", [])) +
+                len(self.slskd_results.get("verified_compilation_tracks", [])) +
+                len(self.slskd_results.get("verified_standalone_tracks", []))
+            )
             console.print(f"[green]✔ Soulseek Priority Complete:[/green] Verified [bold]{verified_count}[/bold] release(s)/track(s) on Soulseek. (Queued: {queued_count})")
             if verified_count > 0:
                 console.print(f"[dim]Bandcamp and web scrapers will now only target remaining missing releases.[/dim]")
@@ -1085,6 +1104,12 @@ Examples:
         choices=["flac", "mp3-320", "any"],
         help="Preferred audio format for Soulseek downloads (default: flac)"
     )
+    parser.add_argument(
+        "--slskd-singles-only",
+        action="store_true",
+        default=False,
+        help="Only download single matching tracks for compilations/features via Soulseek instead of full releases"
+    )
 
     args = parser.parse_args()
 
@@ -1099,7 +1124,8 @@ Examples:
         dry_run=args.dry_run,
         bandcamp_email=args.bandcamp_email,
         slskd=args.slskd,
-        slskd_format=args.slskd_format
+        slskd_format=args.slskd_format,
+        slskd_singles_only=args.slskd_singles_only
     )
 
     try:
