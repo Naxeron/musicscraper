@@ -13,7 +13,9 @@ Features:
 """
 
 import os
+import re
 import time
+import urllib.parse
 from typing import Dict, List, Optional, Any, Union, Tuple, Set
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -257,7 +259,6 @@ class SlskdClient:
                 q_lower = q.lower()
                 if q_lower in existing_by_text:
                     matches = existing_by_text[q_lower]
-                    # Select the match with highest file count
                     best_s = max(matches, key=lambda x: (x.get("fileCount", 0), 1 if "Completed" in x.get("state", "") else 0))
                     sid = best_s.get("id")
                     st = best_s.get("state", "")
@@ -270,77 +271,82 @@ class SlskdClient:
                                 continue
                         except Exception:
                             pass
+                    elif is_done and best_s.get("fileCount", 0) == 0:
+                        # Stale 0-file search, delete it to allow fresh search
+                        try:
+                            self.delete_search(sid)
+                        except Exception:
+                            pass
                     elif not is_done and sid:
                         query_to_search_id[q] = sid
-                        continue
 
                 pending_queries.append(q)
         else:
             pending_queries = list(clean_queries)
 
-        # 2. Initiate searches for remaining queries concurrently
-        queries_to_init = [q for q in pending_queries if q not in query_to_search_id]
+        # 2. Dispatch remaining searches in controlled chunks
+        chunk_size = max(1, min(max_concurrent, 4))
+        for i in range(0, len(pending_queries), chunk_size):
+            chunk = pending_queries[i:i + chunk_size]
+            chunk_query_ids: Dict[str, str] = {}
 
-        def _init_single(q_str: str) -> Tuple[str, Optional[str]]:
-            try:
-                resp = self._request("POST", "/api/v0/searches", json={"searchText": q_str})
-                if resp.status_code in (200, 201):
-                    return q_str, resp.json().get("id")
-            except Exception:
-                pass
-            return q_str, None
+            def _init_single(q_str: str) -> Tuple[str, Optional[str]]:
+                # Reuse in-progress search ID if available
+                if q_str in query_to_search_id:
+                    return q_str, query_to_search_id[q_str]
+                try:
+                    resp = self._request("POST", "/api/v0/searches", json={"searchText": q_str})
+                    if resp.status_code in (200, 201):
+                        return q_str, resp.json().get("id")
+                except Exception:
+                    pass
+                return q_str, None
 
-        if queries_to_init:
-            with ThreadPoolExecutor(max_workers=min(len(queries_to_init), max_concurrent)) as executor:
-                futures = [executor.submit(_init_single, q) for q in queries_to_init]
+            with ThreadPoolExecutor(max_workers=len(chunk)) as executor:
+                futures = [executor.submit(_init_single, q) for q in chunk]
                 for fut in as_completed(futures):
                     q_str, sid = fut.result()
                     if sid:
-                        query_to_search_id[q_str] = sid
+                        chunk_query_ids[q_str] = sid
 
-        active_searches: Dict[str, str] = {q: sid for q, sid in query_to_search_id.items() if sid}
-        if not active_searches:
-            return results
+            # Poll chunk searches concurrently
+            active_chunk = dict(chunk_query_ids)
+            start_time = time.time()
 
-        # 3. Concurrently poll all active search IDs
-        start_time = time.time()
-        completed_searches: Set[str] = set()
+            while active_chunk and (time.time() - start_time < timeout):
+                time.sleep(poll_interval)
+                for q_str, sid in list(active_chunk.items()):
+                    try:
+                        poll_resp = self._request("GET", f"/api/v0/searches/{sid}?includeResponses=true")
+                        if poll_resp.status_code == 200:
+                            s_data = poll_resp.json()
+                            is_complete = s_data.get("isComplete", False)
+                            state = s_data.get("state", "")
+                            resp_count = s_data.get("responseCount", 0)
+                            file_count = s_data.get("fileCount", 0)
 
-        while active_searches and (time.time() - start_time < timeout):
-            time.sleep(poll_interval)
-            for q_str, sid in list(active_searches.items()):
-                try:
-                    poll_resp = self._request("GET", f"/api/v0/searches/{sid}?includeResponses=true")
-                    if poll_resp.status_code == 200:
-                        s_data = poll_resp.json()
-                        is_complete = s_data.get("isComplete", False)
-                        state = s_data.get("state", "")
-                        resp_count = s_data.get("responseCount", 0)
-                        file_count = s_data.get("fileCount", 0)
+                            if file_count > 0 and len(s_data.get("responses", [])) > 0:
+                                results[q_str] = s_data
 
-                        if is_complete or "Completed" in state:
-                            results[q_str] = s_data
-                            completed_searches.add(q_str)
-                            del active_searches[q_str]
-                        elif resp_count >= 10 and file_count > 0 and (time.time() - start_time) >= 8.0:
-                            results[q_str] = s_data
-                            completed_searches.add(q_str)
-                            del active_searches[q_str]
-                        else:
-                            # Update latest snapshot
-                            results[q_str] = s_data
-                except Exception:
-                    pass
+                            if is_complete or "Completed" in state:
+                                if q_str not in results or results[q_str].get("fileCount", 0) == 0:
+                                    results[q_str] = s_data
+                                del active_chunk[q_str]
+                            elif resp_count >= 8 and file_count > 0 and (time.time() - start_time) >= 6.0:
+                                results[q_str] = s_data
+                                del active_chunk[q_str]
+                    except Exception:
+                        pass
 
-        # Final pass for any remaining searches
-        for q_str, sid in active_searches.items():
-            if q_str not in results:
-                try:
-                    poll_resp = self._request("GET", f"/api/v0/searches/{sid}?includeResponses=true")
-                    if poll_resp.status_code == 200:
-                        results[q_str] = poll_resp.json()
-                except Exception:
-                    pass
+            # Final pass for chunk
+            for q_str, sid in active_chunk.items():
+                if q_str not in results or results[q_str].get("fileCount", 0) == 0:
+                    try:
+                        poll_resp = self._request("GET", f"/api/v0/searches/{sid}?includeResponses=true")
+                        if poll_resp.status_code == 200:
+                            results[q_str] = poll_resp.json()
+                    except Exception:
+                        pass
 
         return results
 
@@ -424,6 +430,11 @@ class SlskdClient:
         if not files:
             return {"status": "skipped", "count": 0}
 
+        import urllib.parse
+        # Clean username from any trailing IP/port info (e.g. "NxHx]||||[xNxP (178.234.127.195:51726)")
+        clean_user = re.sub(r"\s*\(.*?\)$", "", username).strip()
+        encoded_user = urllib.parse.quote(clean_user, safe="")
+
         payload = [
             {"filename": f.get("filename"), "size": f.get("size", 0)}
             for f in files
@@ -433,11 +444,15 @@ class SlskdClient:
         if not payload:
             return {"status": "skipped", "count": 0}
 
-        resp = self._request("POST", f"/api/v0/transfers/downloads/{username}", json=payload)
-        if resp.status_code not in (200, 201, 202):
-            raise SlskdAPIError(f"Failed to enqueue download from {username} (HTTP {resp.status_code}): {resp.text}")
+        # Chunk large lists (max 50 files per call) with extended timeout
+        chunk_size = 50
+        for i in range(0, len(payload), chunk_size):
+            chunk = payload[i:i + chunk_size]
+            resp = self._request("POST", f"/api/v0/transfers/downloads/{encoded_user}", json=chunk, timeout=30.0)
+            if resp.status_code not in (200, 201, 202):
+                raise SlskdAPIError(f"Failed to enqueue download from {clean_user} (HTTP {resp.status_code}): {resp.text}")
 
-        return {"status": "enqueued", "username": username, "files_count": len(payload)}
+        return {"status": "enqueued", "username": clean_user, "files_count": len(payload)}
 
     def get_downloads(self) -> List[Dict[str, Any]]:
         """Gets all download transfer states and queues."""

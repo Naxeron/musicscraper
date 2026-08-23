@@ -282,6 +282,19 @@ def clean_search_phrase(text: str, max_words: int = 6) -> str:
     return " ".join(words[:max_words]).strip()
 
 
+def is_dir_name_match(rel_title: str, dir_name: str) -> bool:
+    """Verifies whether a directory path corresponds to a specific release title."""
+    clean_rel = clean_tokens(rel_title)
+    clean_dir = clean_tokens(dir_name)
+    if clean_rel and (clean_rel in clean_dir or clean_dir in clean_rel):
+        return True
+    rel_words = [w for w in tokenize_words(rel_title) if w not in ("various", "artists", "va", "compilation", "album", "ep", "vol", "part", "records", "crew", "part1", "part2")]
+    if not rel_words:
+        return False
+    matches = sum(1 for w in rel_words if len(w) >= 3 and w in clean_dir)
+    return matches >= min(2, len(rel_words))
+
+
 class SlskdArtistScraper:
     """Orchestrates parallel Soulseek discovery, directory expansion, reconciliation, and download queueing."""
 
@@ -468,32 +481,30 @@ class SlskdArtistScraper:
             if alias.lower() != self.catalog.name.lower():
                 queries.append(alias)
 
-        # Tier 2: Primary Releases (Artist + Title & Clean Title)
+        # Tier 2: Primary Releases Missing from Local Library
+        rel_added = 0
         for rel in self.catalog.releases:
+            if rel_added >= 4:
+                break
             rel_title = rel.get("title", "")
-            if not rel_title:
+            norm_rel = normalize_text(rel_title)
+            if not rel_title or norm_rel in self.local_found_releases:
                 continue
 
             q1 = clean_search_phrase(f"{self.catalog.name} {rel_title}")
             if q1:
                 queries.append(q1)
+                rel_added += 1
 
-            # Standalone release title if distinct from artist
-            q2 = clean_search_phrase(rel_title)
-            if q2 and len(q2) >= 4 and q2.lower() != self.catalog.name.lower():
-                queries.append(q2)
-
-            # Diacritic-free variation (e.g. Dlonie)
-            unidecode_title = unidecode(rel_title)
-            if unidecode_title != rel_title:
-                queries.append(clean_search_phrase(f"{self.catalog.name} {unidecode_title}"))
-                queries.append(clean_search_phrase(unidecode_title))
-
-        # Tier 3: Major Compilations & Split Releases
+        # Tier 3: Major Compilations & Split Releases Missing from Local Library
         comp_releases = self.raw_mb_data.get("releases_track_artist", [])
+        comp_added = 0
         for rel in comp_releases:
+            if comp_added >= 6:
+                break
             rel_title = rel.get("title", "")
-            if not rel_title:
+            norm_rel = normalize_text(rel_title)
+            if not rel_title or norm_rel in self.local_found_releases:
                 continue
 
             clean_t = re.sub(r"[\(\[\{].*?[\)\]\}]", "", rel_title)
@@ -501,25 +512,7 @@ class SlskdArtistScraper:
             q = clean_search_phrase(clean_t)
             if q and len(q) >= 4:
                 queries.append(q)
-
-            queries.append(clean_search_phrase(f"{self.catalog.name} {clean_t}"))
-
-        # Tier 4: Missing Standalone Tracks (Top notable titles)
-        standalone_added = 0
-        for t in self.catalog.tracks:
-            if standalone_added >= 10:
-                break
-            t_title = t.get("title", "")
-            norm_t = t.get("norm_title", "")
-            if not t_title or norm_t in self.local_found_map:
-                continue
-
-            clean_t = strip_track_number_and_artist(t_title)
-            clean_t = re.sub(r"[\(\[\{].*?[\)\]\}]", "", clean_t).strip()
-            if clean_t and len(clean_t) >= 4:
-                queries.append(clean_search_phrase(f"{self.catalog.name} {clean_t}"))
-                queries.append(clean_search_phrase(clean_t))
-                standalone_added += 1
+                comp_added += 1
 
         # Deduplicate preserving order
         return list(dict.fromkeys(q for q in queries if q and len(q) >= 3))
@@ -609,22 +602,22 @@ class SlskdArtistScraper:
 
             # 1. Fast in-memory evaluation against candidate directories
             for (user, dir_name), dir_tokens in dir_token_map.items():
-                is_candidate = (
-                    token_rel and (token_rel in dir_tokens or any(len(w) >= 4 and w in dir_tokens for w in token_rel.split()))
-                )
-                if not is_candidate:
-                    dir_files = self.peer_directories[(user, dir_name)].get("matched_search_files", [])
-                    matched_cnt = sum(
-                        1 for exp in expected_tracks
-                        if any(is_track_title_match(exp.get("title", ""), extract_dir_and_filename(sf.get("filename", ""))[1], self.all_artist_aliases, rel_title, dir_name) for sf in dir_files)
-                    )
-                    if matched_cnt >= 2 or (len(expected_tracks) <= 2 and matched_cnt >= 1):
-                        is_candidate = True
+                dir_matches = is_dir_name_match(rel_title, dir_name)
+                if not dir_matches:
+                    # For releases with >= 3 expected tracks, allow track-level candidate match if >= 2 tracks match and high ratio
+                    if len(expected_tracks) >= 3:
+                        dir_files = self.peer_directories[(user, dir_name)].get("matched_search_files", [])
+                        matched_cnt = sum(
+                            1 for exp in expected_tracks
+                            if any(is_track_title_match(exp.get("title", ""), extract_dir_and_filename(sf.get("filename", ""))[1], self.all_artist_aliases, rel_title, dir_name) for sf in dir_files)
+                        )
+                        if matched_cnt >= 2 and (matched_cnt / len(expected_tracks) >= 0.60):
+                            dir_matches = True
 
-                if is_candidate:
+                if dir_matches:
                     dir_info = self.peer_directories.get((user, dir_name), {})
                     match_data = self._evaluate_directory_in_memory(user, dir_name, dir_info, expected_tracks, rel_title)
-                    if match_data:
+                    if match_data and match_data["match_ratio"] >= (0.60 if len(expected_tracks) >= 3 else 0.99):
                         candidate_matches.append(match_data)
 
             if candidate_matches:
@@ -931,7 +924,11 @@ class SlskdArtistScraper:
         def is_loose_dump(d_path: str) -> bool:
             parts = [p.strip().lower() for p in sanitize_remote_path(d_path).split("\\") if p.strip()]
             last = parts[-1] if parts else ""
-            return any(k in last for k in ("soundcloud singles", "loose tracks", "random singles", "singles", "various singles"))
+            if len(parts) <= 1:
+                return True
+            if any(k == last for k in ("dump", "archive", "tracks", "music", "songs", "shared", "root", "audio")):
+                return True
+            return any(k in last for k in ("soundcloud singles", "loose tracks", "random singles", "singles", "various singles", "dump", "archive"))
 
         # 1. Queue Primary Release Directories (Full Folders)
         for item in self.verified_releases:
