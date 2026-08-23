@@ -67,6 +67,8 @@ from music_scraper import (
     is_image_url_or_filename,
     is_audio_or_archive_url_or_filename,
 )
+from slskd_scraper import SlskdArtistScraper
+from slskd_api import SlskdClient
 
 # Initialize Rich Console
 console = Console()
@@ -181,6 +183,8 @@ class ArtistDownloadOrchestrator:
         dry_run: bool = False,
         cache_dir: str = DEFAULT_CACHE_DIR,
         bandcamp_email: Optional[str] = None,
+        slskd: bool = False,
+        slskd_format: str = "flac",
     ):
         self.artist_query = artist_query.strip()
         self.output_dir = Path(output_dir).resolve()
@@ -202,6 +206,11 @@ class ArtistDownloadOrchestrator:
         self.dry_run = dry_run
         self.cache_dir = cache_dir
         self.bandcamp_email = bandcamp_email or os.environ.get("BANDCAMP_EMAIL")
+        self.slskd = slskd
+        self.slskd_format = slskd_format
+        self.slskd_results: Optional[Dict[str, Any]] = None
+        self.slskd_found_releases: Set[str] = set()
+        self.slskd_found_tracks: Dict[str, Dict[str, Any]] = {}
 
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": DEFAULT_USER_AGENT})
@@ -256,21 +265,25 @@ class ArtistDownloadOrchestrator:
         # 2. Pre-Scan Server Library (Read-Only) to identify existing tracks/releases
         self._prescan_server_library()
 
-        # 3. Discover Download Endpoints
+        # 3. PRIORITY SOURCE: Soulseek (slskd) Search & Verification (Runs FIRST)
+        if self.slskd:
+            self._execute_slskd_discovery()
+
+        # 4. FALLBACK SOURCES: Discover Bandcamp & Web Endpoints (only for remaining missing items)
         self._discover_endpoints()
 
-        # 4. Download Discovered Releases (Skipping items already satisfied on server)
+        # 5. Download Discovered Fallback Releases (Skipping items satisfied on Server / Soulseek)
         if not self.dry_run:
             self._execute_downloads()
-            # 5. Unpack archives inside project output dir
+            # 6. Unpack archives inside project output dir
             self._unpack_archives()
         else:
             console.print("\n[yellow]--dry-run enabled: Skipping downloads and archive unpacking.[/yellow]")
 
-        # 6. Audit Library vs MusicBrainz
+        # 7. Audit Library vs MusicBrainz
         audit_results = self._audit_library()
 
-        # 7. Print Report & Export
+        # 8. Print Report & Export
         self._generate_reports(audit_results)
 
         return {
@@ -284,6 +297,64 @@ class ArtistDownloadOrchestrator:
             "failed_downloads": self.failed_downloads,
             "unresolved_promo_urls": self.unresolved_promo_urls,
         }
+
+    def _execute_slskd_discovery(self):
+        """
+        Executes Soulseek searches via slskd as the FIRST and highest-priority download source.
+        Verified matching directories are queued in slskd, and their releases/tracks are registered
+        so Bandcamp and web mirrors only process remaining unresolved items.
+        """
+        console.print(f"\n[bold cyan]Stage 1: Searching Soulseek (slskd) for discography (Priority Source)...[/bold cyan]")
+        try:
+            slskd_scraper = SlskdArtistScraper(
+                artist_query=self.artist_query,
+                music_dir=str(self.music_dir) if self.music_dir else None,
+                preferred_format=self.slskd_format,
+                dry_run=self.dry_run,
+                cache_dir=self.cache_dir,
+                threads=self.threads,
+            )
+            self.slskd_results = slskd_scraper.run()
+
+            # Register verified primary releases
+            for r in self.slskd_results.get("verified_releases", []):
+                rel_title = r.get("release_title", "")
+                norm_rel = normalize_text(rel_title)
+                self.slskd_found_releases.add(norm_rel)
+                bm = r.get("best_match", {})
+                for mt in bm.get("matched_tracks", []):
+                    exp_t = mt.get("expected", "")
+                    norm_t = normalize_text(exp_t)
+                    self.slskd_found_tracks[norm_t] = {
+                        "source": "Soulseek (slskd)",
+                        "peer": bm.get("user"),
+                        "directory": bm.get("directory"),
+                        "format": bm.get("format_label")
+                    }
+
+            # Register verified compilation tracks
+            for c in self.slskd_results.get("verified_compilation_tracks", []):
+                rel_title = c.get("release_title", "")
+                track_title = c.get("track_title", "")
+                norm_rel = normalize_text(rel_title)
+                norm_t = normalize_text(track_title)
+                self.slskd_found_releases.add(norm_rel)
+                bm = c.get("best_match", {})
+                self.slskd_found_tracks[norm_t] = {
+                    "source": "Soulseek (slskd)",
+                    "peer": bm.get("user"),
+                    "directory": bm.get("directory"),
+                    "format": bm.get("format_label")
+                }
+
+            queued_count = len(self.slskd_results.get("queued_directories", []))
+            verified_count = len(self.slskd_results.get("verified_releases", [])) + len(self.slskd_results.get("verified_compilation_tracks", []))
+            console.print(f"[green]✔ Soulseek Priority Complete:[/green] Verified [bold]{verified_count}[/bold] release(s)/track(s) on Soulseek. (Queued: {queued_count})")
+            if verified_count > 0:
+                console.print(f"[dim]Bandcamp and web scrapers will now only target remaining missing releases.[/dim]")
+
+        except Exception as e:
+            console.print(f"[bold red]slskd priority discovery error:[/bold red] {e}")
 
     def _prescan_server_library(self):
         """Scans the existing server library (Read-Only) to detect tracks and releases already present."""
@@ -330,8 +401,8 @@ class ArtistDownloadOrchestrator:
         console.print(f"[green]✔ Server Library Status:[/green] [bold]{len(found_items)}[/bold] artist tracks / [bold]{len(self.server_found_releases)}[/bold] releases already present on server.")
 
     def _should_skip_bandcamp_release(self, meta: Dict[str, Any], bc_url: str) -> Tuple[bool, str]:
-        """Determines if a Bandcamp release can be skipped because all its artist tracks are already on the server."""
-        if self.overwrite or not self.server_found_map:
+        """Determines if a Bandcamp release can be skipped because all its artist tracks are on server or queued in slskd."""
+        if self.overwrite:
             return False, ""
 
         title = meta.get("title", "")
@@ -340,9 +411,11 @@ class ArtistDownloadOrchestrator:
         artist = meta.get("artist", "").lower()
         tracks = meta.get("tracks", [])
 
-        # Check if entire release was marked satisfied
+        # Check if entire release was satisfied on server or Soulseek
         if norm_album in self.server_found_releases:
-            return True, f"Release '{album or title}' is already fully present on server"
+            return True, f"Release '{album or title}' is already fully present on server library"
+        if norm_album in self.slskd_found_releases:
+            return True, f"Release '{album or title}' is already verified & queued via Soulseek (slskd)"
 
         # Check tracks by target artist
         is_target_artist_rel = any(a in artist or a in unidecode(artist) for a in self.catalog.aliases)
@@ -361,7 +434,6 @@ class ArtistDownloadOrchestrator:
             all_present = True
             for t in artist_tracks:
                 norm_t = normalize_text(t.get("title", ""))
-                # Strip track number or artist prefix if any
                 clean_t = strip_track_number_and_artist(t.get("title", ""))
                 norm_clean = normalize_text(clean_t)
 
@@ -370,18 +442,23 @@ class ArtistDownloadOrchestrator:
                     norm_clean in self.server_found_map or
                     any(norm_clean == k or norm_clean in k for k in self.server_found_map)
                 )
-                if not track_on_server:
+                track_on_slsk = (
+                    norm_t in self.slskd_found_tracks or
+                    norm_clean in self.slskd_found_tracks or
+                    any(norm_clean == k or norm_clean in k for k in self.slskd_found_tracks)
+                )
+                if not (track_on_server or track_on_slsk):
                     all_present = False
                     break
 
             if all_present:
-                return True, f"All {len(artist_tracks)} artist track(s) from '{title}' are already present on server"
+                return True, f"All {len(artist_tracks)} artist track(s) from '{title}' are already satisfied (Server / Soulseek)"
 
         return False, ""
 
     def _should_skip_archive_item(self, item: Dict[str, str]) -> Tuple[bool, str]:
         """Determines if an archive or direct download item can be skipped."""
-        if self.overwrite or not self.server_found_map:
+        if self.overwrite:
             return False, ""
 
         url = item.get("download_url", "")
@@ -393,17 +470,18 @@ class ArtistDownloadOrchestrator:
         if m:
             code = m.group(0).lower()
             if code in self.server_dcks_codes:
-                # Find if artist track for this DCKS release is on server
                 rel_tracks = [t for t in self.catalog.tracks if code in t.get("norm_release", "") or code in normalize_text(t.get("release_title", ""))]
                 if not rel_tracks or all(t.get("norm_title") in self.server_found_map for t in rel_tracks):
-                    return True, f"Catalog code [{code.upper()}] is already present on server"
+                    return True, f"Catalog code [{code.upper()}] is already present on server library"
 
-        # Check if matching release tracks are already satisfied
+        # Check if matching release tracks are already satisfied on server or Soulseek
         for rel in self.catalog.releases:
             norm_rel = normalize_text(rel.get("title", ""))
             if norm_rel and norm_rel in normalize_text(combined):
                 if norm_rel in self.server_found_releases:
-                    return True, f"Release '{rel.get('title')}' is already on server"
+                    return True, f"Release '{rel.get('title')}' is already on server library"
+                if norm_rel in self.slskd_found_releases:
+                    return True, f"Release '{rel.get('title')}' is already verified & queued via Soulseek (slskd)"
 
         return False, ""
 
@@ -996,6 +1074,17 @@ Examples:
         action="store_true",
         help="Only discover and audit releases without downloading audio files"
     )
+    parser.add_argument(
+        "--slskd",
+        action="store_true",
+        help="Search Soulseek via slskd for missing releases/tracks, verify tracklists, and queue directories for download"
+    )
+    parser.add_argument(
+        "--slskd-format",
+        default="flac",
+        choices=["flac", "mp3-320", "any"],
+        help="Preferred audio format for Soulseek downloads (default: flac)"
+    )
 
     args = parser.parse_args()
 
@@ -1008,7 +1097,9 @@ Examples:
         threads=args.threads,
         overwrite=args.overwrite,
         dry_run=args.dry_run,
-        bandcamp_email=args.bandcamp_email
+        bandcamp_email=args.bandcamp_email,
+        slskd=args.slskd,
+        slskd_format=args.slskd_format
     )
 
     try:

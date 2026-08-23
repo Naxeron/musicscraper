@@ -30,6 +30,12 @@ from typing import Dict, List, Set, Tuple, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import requests
 import mutagen
 from mutagen.id3 import ID3, TCON, ID3NoHeaderError
