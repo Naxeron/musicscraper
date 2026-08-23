@@ -5,17 +5,19 @@ Soulseek / slskd Artist Discography Scraper & Tracklist Reconciler
 Automates the search, tracklist verification, and directory download queueing
 for an artist's full discography on Soulseek via slskd.
 
-Workflow:
+Features:
 1. Queries MusicBrainz to build the complete artist catalog (primary releases, EPs,
-   split releases, compilations, and individual recordings).
+   split releases, compilations, alter-egos, and standalone recordings).
 2. Pre-scans the local/server music library (Read-Only) to detect existing tracks.
-3. Performs intelligent Soulseek searches across the Soulseek network via slskd.
-4. Aggregates results by peer and remote directory, browsing full directory contents.
-5. Reconciles and verifies candidate directories against MusicBrainz tracklists
-   (checking track names, numbering, audio formats, and durations).
-6. Prioritizes lossless (FLAC) and high-bitrate (MP3-320) releases with low peer queues.
-7. Automatically queues complete verified directories (audio + artwork/cue/log) in slskd.
-8. Generates rich terminal reports and exports audit summaries.
+3. Multi-tier parallel batch searching across the Soulseek network via slskd REST API.
+4. Fast in-memory candidate reconciliation across all discovered peer files.
+5. Selective remote peer directory expansion (discovers complete album contents,
+   bonus tracks, artwork, cue sheets, and logs for top candidates).
+6. Comprehensive tracklist reconciler with diacritics normalization (Polish/Unicode),
+   alter-ego matching, multi-artist split handling, and subtitle variants.
+7. Prioritizes lossless (FLAC 24-bit/16-bit) and MP3-320 with low peer queues.
+8. Automatically queues complete verified directories in slskd.
+9. Generates rich terminal reports and exports audit summaries.
 """
 
 import os
@@ -47,6 +49,7 @@ from check_missing_tracks import (
     ReportGenerator,
     normalize_text,
     strip_track_number_and_artist,
+    calculate_similarity,
     DEFAULT_CACHE_DIR,
     AUDIO_EXTENSIONS,
 )
@@ -55,13 +58,15 @@ console = Console()
 
 SUPPORTED_AUDIO_EXTENSIONS = {
     ".flac", ".mp3", ".m4a", ".mp4", ".ogg", ".opus", ".wav",
-    ".aif", ".aiff", ".wma", ".ape", ".wv"
+    ".aif", ".aiff", ".wma", ".ape", ".wv", ".dsf", ".dff"
 }
 
 SUPPORTING_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".webp", ".gif",
-    ".cue", ".log", ".nfo"
+    ".cue", ".log", ".nfo", ".txt", ".m3u", ".m3u8"
 }
+
+POLISH_DIACRITICS_MAP = str.maketrans("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ", "acelnoszzACELNOSZZ")
 
 
 def katakana_to_hiragana(text: str) -> str:
@@ -76,12 +81,31 @@ def katakana_to_hiragana(text: str) -> str:
     return "".join(res)
 
 
-def clean_tokens(text: str) -> str:
-    """Strips all punctuation and whitespace for fuzzy token comparison."""
+def normalize_track_title(text: Optional[str]) -> str:
+    """
+    Comprehensive string normalization:
+    - Katakana to Hiragana conversion
+    - Polish & European diacritic translation before unidecode
+    - Transliterates unicode to ASCII
+    - Splits number-letter boundaries
+    - Strips punctuation and symbols
+    """
     if not text:
         return ""
     norm = katakana_to_hiragana(text.lower())
+    norm = norm.translate(POLISH_DIACRITICS_MAP)
     norm = unidecode(norm)
+    norm = re.sub(r"([a-zA-Z])([0-9])", r"\1 \2", norm)
+    norm = re.sub(r"([0-9])([a-zA-Z])", r"\1 \2", norm)
+    norm = re.sub(r"[\-_:\(\)\[\]\{\}\.\,\+\?\!\~\"\'\/\\\|\@\#\$\%\^\&\*\=\`\<\>\;]", " ", norm)
+    return re.sub(r"\s+", " ", norm).strip()
+
+
+def clean_tokens(text: str) -> str:
+    """Strips all punctuation and whitespace for compressed token comparison."""
+    if not text:
+        return ""
+    norm = normalize_track_title(text)
     return re.sub(r"[^a-z0-9]", "", norm)
 
 
@@ -89,10 +113,7 @@ def tokenize_words(text: str) -> List[str]:
     """Extracts lowercase alphanumeric words with unidecode transliteration and number splitting."""
     if not text:
         return []
-    norm = katakana_to_hiragana(text.lower())
-    norm = unidecode(norm)
-    norm = re.sub(r"([a-zA-Z])([0-9])", r"\1 \2", norm)
-    norm = re.sub(r"([0-9])([a-zA-Z])", r"\1 \2", norm)
+    norm = normalize_track_title(text)
     return re.findall(r"[a-z0-9]+", norm)
 
 
@@ -107,6 +128,26 @@ def is_sublist(sub: List[str], full: List[str]) -> bool:
     return False
 
 
+def extract_catalog_codes(text: str) -> List[str]:
+    """Extracts netlabel release / catalog codes (e.g. SKRD-074, MISO-001, TANOCD-0013, OTMN070)."""
+    if not text:
+        return []
+    patterns = [
+        r"\b([A-Za-z0-9!]{2,10}[-_]\d{2,6})\b",
+        r"\b([A-Za-z]{2,6}\d{2,5})\b",
+        r"\[([A-Za-z0-9!#\-_ ]{3,15})\]",
+    ]
+    codes = []
+    for pat in patterns:
+        for m in re.finditer(pat, text):
+            code = m.group(1).strip()
+            if re.match(r"^(mp3|flac|wav|cda|web|vol|cd\d|disc\d|\d{4})", code, re.IGNORECASE):
+                continue
+            if len(code) >= 4:
+                codes.append(code)
+    return list(dict.fromkeys(codes))
+
+
 def is_track_title_match(
     exp_title: str,
     candidate_filename: str,
@@ -115,10 +156,12 @@ def is_track_title_match(
     dir_path: str = ""
 ) -> bool:
     """
-    Strictly verifies if candidate_filename matches expected track title:
-    - Uses exact whole-word token sub-sequence matching to avoid substring false positives.
-    - For short or generic titles (<= 4 chars or <= 2 words), enforces contextual validation
-      (requires artist name or release title in the file/directory path).
+    Robustly verifies if candidate_filename matches expected track title:
+    - Uses whole-word token sub-sequence matching.
+    - Tests compressed tokens (handles symbols like F>B>D, $S$S$, むげん☆ういんぐ).
+    - Checks fuzzy similarity for minor tagging variances.
+    - Handles subtitle / remix differences.
+    - For short titles (<= 3 chars or 1 common word), validates directory or artist context.
     """
     exp_words = tokenize_words(exp_title)
     if not exp_words:
@@ -130,25 +173,34 @@ def is_track_title_match(
     file_words = tokenize_words(candidate_filename)
     clean_file_words = tokenize_words(strip_track_number_and_artist(candidate_filename)) or file_words
 
-    # Check for direct token sequence match
+    # 1. Direct token sequence match
     exact_match = (
         is_sublist(exp_words, file_words) or
         is_sublist(clean_exp_words, clean_file_words) or
-        is_sublist(clean_exp_words, file_words)
+        is_sublist(clean_exp_words, file_words) or
+        is_sublist(exp_words, clean_file_words)
     )
 
-    # Check concatenated tokens (e.g. FBD vs F>B>D, SSSS vs $S$S$, mugenuingu vs むげん☆ういんぐ)
-    exp_concat = "".join(exp_words)
-    file_concat = "".join(file_words)
+    # 2. Check concatenated tokens
+    exp_concat = "".join(clean_exp_words)
+    file_concat = "".join(clean_file_words)
     if not exact_match and len(exp_concat) >= 3:
         if exp_concat in file_concat or file_concat in exp_concat:
+            exact_match = True
+
+    # 3. Fuzzy similarity fallback
+    if not exact_match and len(exp_concat) >= 4:
+        norm_exp = normalize_track_title(clean_exp_title)
+        norm_file = normalize_track_title(strip_track_number_and_artist(candidate_filename))
+        sim = calculate_similarity(norm_exp, norm_file)
+        if sim >= 0.82:
             exact_match = True
 
     if not exact_match:
         return False
 
-    # For short/generic titles, require context
-    if len(clean_exp_words) <= 2 or len(exp_concat) <= 4:
+    # 4. Contextual validation for very short titles
+    if len(clean_exp_words) <= 1 or len(exp_concat) <= 3:
         dir_norm = clean_tokens(dir_path)
         file_norm = clean_tokens(candidate_filename)
         has_artist_context = any(clean_tokens(alias) in dir_norm or clean_tokens(alias) in file_norm for alias in artist_aliases if len(alias) >= 3)
@@ -167,87 +219,8 @@ def is_track_title_match(
     return True
 
 
-def clean_search_query(artist: str, title: str) -> str:
-    """Prepares a clean, punctuation-free search query for Soulseek."""
-    raw = f"{artist} {title}"
-    clean = re.sub(r"[\-_:\(\)\[\]\{\}\.\,\+\?\!\~\"\'\/\\\|\@\#\$\%\^\&\*]+", " ", raw)
-    words = [w for w in clean.split() if w.lower() not in ("va", "various", "artists", "feat", "ft")]
-    return " ".join(words[:6])
-
-
-def clean_compilation_queries(title: str) -> List[str]:
-    """Generates clean, targeted search queries for a compilation album."""
-    queries = []
-    # 1. Main prefix before subtitle separator (e.g. 'GACHIHOMO HARDCORE' from 'GACHIHOMO HARDCORE -IS MR. XYSTRAN A GAY?-')
-    prefix = re.split(r"[-~:]", title)[0].strip()
-    prefix_clean = re.sub(r"[\(\[\{].*?[\)\]\}]", "", prefix)
-    prefix_clean = re.sub(r"[^a-zA-Z0-9\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\s]", " ", prefix_clean)
-    prefix_clean = re.sub(r"\s+", " ", prefix_clean).strip()
-    if prefix_clean and len(prefix_clean) > 3:
-        queries.append(prefix_clean)
-
-    # If title starts with Re: (e.g. Re:厨弐病), also query without Re:
-    if title.lower().startswith("re:"):
-        no_re = re.sub(r"^re:\s*", "", title, flags=re.IGNORECASE).strip()
-        no_re_clean = re.sub(r"[^a-zA-Z0-9\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\s]", " ", no_re).strip()
-        if no_re_clean and no_re_clean not in queries:
-            queries.append(no_re_clean)
-
-    # 2. Full title stripped of symbols
-    full_clean = re.sub(r"[\(\[\{].*?[\)\]\}]", "", title)
-    full_clean = re.sub(r"[^a-zA-Z0-9\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\s]", " ", full_clean)
-    full_clean = re.sub(r"\s+", " ", full_clean).strip()
-    words = [w for w in full_clean.split() if w.lower() not in ("va", "various", "artists", "compilation")]
-    if words:
-        clean_s = " ".join(words[:6])
-        if clean_s and clean_s not in queries:
-            queries.append(clean_s)
-
-    return list(dict.fromkeys(queries))
-
-
-def clean_track_queries(title: str, artist_credit: str = "", primary_artist: str = "") -> List[str]:
-    """Generates targeted search queries for a standalone or featured track."""
-    queries = []
-
-    # Clean title
-    clean_t = strip_track_number_and_artist(title)
-    clean_t = re.sub(r"[\(\[\{].*?[\)\]\}]", "", clean_t)
-    clean_t = re.sub(r"[^a-zA-Z0-9\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\s]", " ", clean_t)
-    clean_t = re.sub(r"\s+", " ", clean_t).strip()
-
-    # Extract collaborator/lead artist if credit contains 'feat', 'vs', '×', '&', '-'
-    collabs = []
-    if artist_credit:
-        m = re.split(r"(?:feat\.?|featuring|vs\.?|×|&|-|\+)", artist_credit, flags=re.IGNORECASE)
-        for part in m:
-            clean_part = part.strip()
-            if clean_part and clean_part.lower() != primary_artist.lower():
-                cp = re.sub(r"[^a-zA-Z0-9\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\s]", " ", clean_part).strip()
-                if cp:
-                    collabs.append(cp)
-
-    for collab in collabs:
-        if clean_t:
-            queries.append(f"{collab} {clean_t}".strip())
-
-    if primary_artist and clean_t and len(clean_t) > 3:
-        queries.append(f"{primary_artist} {clean_t}".strip())
-
-    if clean_t and len(clean_t) >= 4:
-        queries.append(clean_t)
-
-    # Sub-phrase for complex titles (e.g. TheAmenZa from 珍宝的-TheAmenZa-menson1MIX-)
-    sub_words = re.findall(r"[A-Za-z0-9\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]{4,}", title)
-    for sw in sub_words:
-        if sw.lower() not in (primary_artist.lower(), "remix", "mix", "edit", "ver", "feat"):
-            queries.append(sw)
-
-    return list(dict.fromkeys(queries))
-
-
 def sanitize_remote_path(path_str: str) -> str:
-    """Normalizes backslashes/slashes for Soulseek paths."""
+    """Normalizes slashes for Soulseek paths."""
     return path_str.replace("/", "\\")
 
 
@@ -274,7 +247,7 @@ def is_supporting_file(filename: str) -> bool:
 
 def determine_audio_quality(file_item: Dict[str, Any]) -> Tuple[str, int]:
     """
-    Evaluates audio format and bitrate/bitdepth from slskd file attributes.
+    Evaluates audio format, bit depth, sample rate, and bitrate from slskd file attributes.
     Returns (format_label, quality_score).
     """
     fn = file_item.get("filename", "") or file_item.get("base_filename", "")
@@ -283,12 +256,12 @@ def determine_audio_quality(file_item: Dict[str, Any]) -> Tuple[str, int]:
     bit_depth = file_item.get("bitDepth", 0)
     sample_rate = file_item.get("sampleRate", 0)
 
-    if ext in (".flac", ".wav", ".aif", ".aiff", ".ape", ".wv"):
+    if ext in (".flac", ".wav", ".aif", ".aiff", ".ape", ".wv", ".dsf", ".dff"):
         if bit_depth and bit_depth > 16:
-            return f"FLAC {bit_depth}-bit/{sample_rate or 44100}Hz", 110
+            return f"FLAC {bit_depth}-bit/{sample_rate or 44100}Hz", 115
         return "FLAC (Lossless)", 100
 
-    if ext in (".mp3", ".m4a", ".ogg", ".opus"):
+    if ext in (".mp3", ".m4a", ".ogg", ".opus", ".mp4", ".wma"):
         if bit_rate >= 320:
             return "MP3 320kbps", 80
         elif bit_rate >= 240:
@@ -302,8 +275,15 @@ def determine_audio_quality(file_item: Dict[str, Any]) -> Tuple[str, int]:
     return "Audio File", 40
 
 
+def clean_search_phrase(text: str, max_words: int = 6) -> str:
+    """Cleans punctuation and prepares a search phrase."""
+    raw = re.sub(r"[\-_:\(\)\[\]\{\}\.\,\+\?\!\~\"\'\/\\\|\@\#\$\%\^\&\*\=\`\<\>\;]+", " ", text)
+    words = [w for w in raw.split() if w.lower() not in ("va", "various", "artists", "feat", "ft", "compilation")]
+    return " ".join(words[:max_words]).strip()
+
+
 class SlskdArtistScraper:
-    """Orchestrates Soulseek searches, directory verification, and download queueing."""
+    """Orchestrates parallel Soulseek discovery, directory expansion, reconciliation, and download queueing."""
 
     def __init__(
         self,
@@ -312,11 +292,11 @@ class SlskdArtistScraper:
         music_dir: Optional[str] = None,
         preferred_format: str = "flac",
         min_match_ratio: float = 0.70,
-        search_timeout: float = 8.0,
+        search_timeout: float = 14.0,
         dry_run: bool = False,
         singles_only: bool = False,
         cache_dir: str = DEFAULT_CACHE_DIR,
-        threads: int = 4,
+        threads: int = 6,
     ):
         self.artist_query = artist_query.strip()
         self.client = slskd_client or SlskdClient()
@@ -328,7 +308,7 @@ class SlskdArtistScraper:
         self.cache_dir = cache_dir
         self.threads = threads
 
-        # Auto-detect server music library
+        # Auto-detect local/server music library
         if music_dir:
             self.music_dir = Path(music_dir).resolve()
         else:
@@ -341,6 +321,7 @@ class SlskdArtistScraper:
         self.mb_client = MusicBrainzClient(cache_dir=self.cache_dir)
         self.catalog: Optional[ArtistCatalog] = None
         self.raw_mb_data: Dict[str, Any] = {}
+        self.all_artist_aliases: Set[str] = set()
 
         # Local library scan state
         self.local_found_map: Dict[str, Dict[str, Any]] = {}
@@ -384,6 +365,22 @@ class SlskdArtistScraper:
         self.raw_mb_data = self.mb_client.fetch_full_discography(mbid)
         self.catalog = ArtistCatalog(self.raw_mb_data)
 
+        # Collect all artist aliases, sort names, alter-egos, and romanized variations
+        self.all_artist_aliases = set(self.catalog.aliases)
+        self.all_artist_aliases.add(self.catalog.name)
+        for a in list(self.all_artist_aliases):
+            self.all_artist_aliases.add(unidecode(a))
+            self.all_artist_aliases.add(a.translate(POLISH_DIACRITICS_MAP))
+
+        # Extract alter-ego / collaborator names from track artist credits (e.g. soniacz, sonnie, SyndraSound)
+        for t in self.catalog.tracks:
+            ac = t.get("artist_credit", "")
+            if ac:
+                for part in re.split(r"(?:feat\.?|featuring|vs\.?|×|&|-|\+)", ac, flags=re.IGNORECASE):
+                    clean_p = part.strip()
+                    if clean_p and len(clean_p) >= 3 and len(clean_p) <= 25:
+                        self.all_artist_aliases.add(clean_p)
+
         console.print(f"[green]✔ Canonical Name:[/green] [bold]{self.catalog.name}[/bold] (MBID: {self.catalog.mbid})")
         primary_rels = self.catalog.releases
         comp_tracks = self.raw_mb_data.get("releases_track_artist", [])
@@ -392,16 +389,16 @@ class SlskdArtistScraper:
         # 3. Pre-Scan Local Music Library (Read-Only)
         self._prescan_library()
 
-        # 4. Search Soulseek & Aggregate Candidate Directories
+        # 4. Multi-Tier Parallel Batch Search on Soulseek
         self._discover_soulseek_candidates()
 
         # 5. Verify & Reconcile Primary Releases
         self._reconcile_primary_releases()
 
-        # 6. Verify & Reconcile Compilation / VA Tracks (with targeted compilation searches)
+        # 6. Verify & Reconcile Compilation / VA Tracks
         self._reconcile_compilation_tracks()
 
-        # 7. Verify & Reconcile Standalone & Non-Album Tracks (with collaborator searches)
+        # 7. Verify & Reconcile Standalone & Non-Album Tracks
         self._reconcile_standalone_tracks()
 
         # 8. Queue Verified Directories & Tracks in slskd
@@ -458,46 +455,100 @@ class SlskdArtistScraper:
 
         console.print(f"[green]✔ Local Library Status:[/green] [bold]{len(found_items)}[/bold] artist tracks / [bold]{len(self.local_found_releases)}[/bold] releases already in library.")
 
-    def _execute_search(self, query: str) -> List[Dict[str, Any]]:
-        """Executes a Soulseek search and registers candidate peer directories."""
-        clean_q = query.strip()
-        if not clean_q or clean_q.lower() in self.searches_performed:
-            return []
+    def _generate_all_search_queries(self) -> List[str]:
+        """Generates comprehensive multi-tier search queries across the artist catalog."""
+        queries: List[str] = []
 
-        self.searches_performed.add(clean_q.lower())
-        try:
-            search_res = self.client.search(clean_q, timeout=self.search_timeout, min_responses=5)
-            responses = search_res.get("responses", [])
-            for resp in responses:
-                user = resp.get("username")
-                speed = resp.get("uploadSpeed", 0)
-                queue = resp.get("queueLength", 0)
-                has_slot = resp.get("hasFreeUploadSlot", True)
-                for f in resp.get("files", []):
-                    fn = f.get("filename", "")
-                    if not fn or f.get("isLocked", False):
-                        continue
-                    dir_name, file_name = extract_dir_and_filename(fn)
-                    if not dir_name:
-                        continue
-                    key = (user, dir_name)
-                    if key not in self.peer_directories:
-                        self.peer_directories[key] = {
-                            "user": user,
-                            "directory": dir_name,
-                            "speed": speed,
-                            "queue": queue,
-                            "has_slot": has_slot,
-                            "matched_search_files": [],
-                            "full_directory_files": None
-                        }
-                    self.peer_directories[key]["matched_search_files"].append(f)
-            return responses
-        except Exception as e:
-            return []
+        # Tier 1: Artist & Primary Aliases
+        queries.append(self.catalog.name)
+        for alias in self.catalog.aliases:
+            if alias.lower() != self.catalog.name.lower() and len(alias) >= 3:
+                queries.append(alias)
+
+        # Tier 2: Primary Releases
+        for rel in self.catalog.releases:
+            rel_title = rel.get("title", "")
+            if not rel_title:
+                continue
+
+            # Artist + Release
+            q1 = clean_search_phrase(f"{self.catalog.name} {rel_title}")
+            if q1:
+                queries.append(q1)
+
+            # Standalone Release Title
+            q2 = clean_search_phrase(rel_title)
+            if q2 and len(q2) >= 4 and q2.lower() != self.catalog.name.lower():
+                queries.append(q2)
+
+            # Subtitle split (e.g. 'Polska Ja Wersyja' from 'Polska Ja Wersyja: Polcore To Stan Umysłu')
+            prefix = re.split(r"[-~:]", rel_title)[0].strip()
+            if prefix and prefix != rel_title and len(prefix) >= 4:
+                queries.append(clean_search_phrase(f"{self.catalog.name} {prefix}"))
+                queries.append(clean_search_phrase(prefix))
+
+            # Diacritic variants (e.g. Dlonie vs Dłonie)
+            unidecode_title = unidecode(rel_title)
+            if unidecode_title != rel_title:
+                queries.append(clean_search_phrase(f"{self.catalog.name} {unidecode_title}"))
+                queries.append(clean_search_phrase(unidecode_title))
+
+            # Extract catalog codes
+            for code in extract_catalog_codes(rel_title):
+                queries.append(code)
+
+        # Tier 3: Compilations / Split Releases
+        comp_releases = self.raw_mb_data.get("releases_track_artist", [])
+        for rel in comp_releases:
+            rel_title = rel.get("title", "")
+            if not rel_title:
+                continue
+
+            clean_t = re.sub(r"[\(\[\{].*?[\)\]\}]", "", rel_title)
+            clean_t = re.sub(r"^(?:re:\s*|v\.a\.?\s*|various\s*artists\s*)", "", clean_t, flags=re.IGNORECASE).strip()
+            q = clean_search_phrase(clean_t)
+            if q and len(q) >= 4:
+                queries.append(q)
+
+            prefix = re.split(r"[-~:]", rel_title)[0].strip()
+            if prefix and len(prefix) >= 4:
+                queries.append(clean_search_phrase(prefix))
+
+            queries.append(clean_search_phrase(f"{self.catalog.name} {clean_t}"))
+
+            for code in extract_catalog_codes(rel_title):
+                queries.append(code)
+
+        # Tier 4: Specific Missing Tracks & Collaborations
+        for t in self.catalog.tracks:
+            t_title = t.get("title", "")
+            norm_t = t.get("norm_title", "")
+            if not t_title or norm_t in self.local_found_map:
+                continue
+
+            clean_t = strip_track_number_and_artist(t_title)
+            clean_t = re.sub(r"[\(\[\{].*?[\)\]\}]", "", clean_t).strip()
+            if not clean_t:
+                continue
+
+            if len(clean_t) >= 4:
+                queries.append(clean_search_phrase(f"{self.catalog.name} {clean_t}"))
+                queries.append(clean_search_phrase(clean_t))
+
+            ac = t.get("artist_credit", "")
+            if ac:
+                for part in re.split(r"(?:feat\.?|featuring|vs\.?|×|&|-|\+)", ac, flags=re.IGNORECASE):
+                    cp = part.strip()
+                    if cp and cp.lower() != self.catalog.name.lower() and len(cp) >= 3:
+                        queries.append(clean_search_phrase(f"{cp} {clean_t}"))
+
+        return list(dict.fromkeys(q for q in queries if q and len(q) >= 3))
 
     def _discover_soulseek_candidates(self):
-        """Runs broad and targeted searches across Soulseek."""
+        """Runs parallel batch searches across Soulseek for all catalog items."""
+        all_queries = self._generate_all_search_queries()
+        console.print(f"\n[cyan]Executing parallel Soulseek searches ({len(all_queries)} targeted queries)...[/cyan]")
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -505,54 +556,55 @@ class SlskdArtistScraper:
             TimeElapsedColumn(),
             console=console
         ) as progress:
-            task = progress.add_task(f"Searching Soulseek for {self.catalog.name}...", total=None)
+            task = progress.add_task(f"Searching Soulseek P2P network...", total=len(all_queries))
 
-            # 1. Broad Artist Name Search
-            self._execute_search(self.catalog.name)
+            batch_results = self.client.batch_search(
+                all_queries,
+                timeout=self.search_timeout,
+                poll_interval=1.0,
+                max_concurrent=8,
+                use_existing=True
+            )
 
-            # Also check artist aliases if any
-            for alias in list(self.catalog.aliases)[:2]:
-                if alias.lower() != self.catalog.name.lower() and len(alias) > 3:
-                    self._execute_search(alias)
+            progress.update(task, completed=len(all_queries), description="Processing Soulseek peer responses...")
 
-            progress.update(task, description=f"Discovered {len(self.peer_directories)} peer directories from artist search.")
+            total_discovered_files = 0
+            for query_str, s_data in batch_results.items():
+                self.searches_performed.add(query_str.lower())
+                responses = s_data.get("responses", [])
+                for resp in responses:
+                    user = resp.get("username")
+                    speed = resp.get("uploadSpeed", 0)
+                    queue = resp.get("queueLength", 0)
+                    has_slot = resp.get("hasFreeUploadSlot", True)
+                    for f in resp.get("files", []):
+                        fn = f.get("filename", "")
+                        if not fn or f.get("isLocked", False):
+                            continue
+                        dir_name, file_name = extract_dir_and_filename(fn)
+                        if not dir_name:
+                            continue
+                        key = (user, dir_name)
+                        if key not in self.peer_directories:
+                            self.peer_directories[key] = {
+                                "user": user,
+                                "directory": dir_name,
+                                "speed": speed,
+                                "queue": queue,
+                                "has_slot": has_slot,
+                                "matched_search_files": [],
+                                "full_directory_files": None
+                            }
+                        self.peer_directories[key]["matched_search_files"].append(f)
+                        total_discovered_files += 1
 
-        console.print(f"[green]✔ Soulseek Discovery:[/green] Found [bold]{len(self.peer_directories)}[/bold] candidate directories across peers.")
-
-    def _get_or_fetch_full_directory(self, user: str, dir_name: str) -> List[Dict[str, Any]]:
-        """Retrieves and caches the complete file list of a remote directory."""
-        key = (user, dir_name)
-        cached_info = self.peer_directories.get(key)
-        if cached_info and cached_info.get("full_directory_files") is not None:
-            return cached_info["full_directory_files"]
-
-        try:
-            nodes = self.client.browse_directory(user, dir_name)
-            files = []
-            for node in nodes:
-                node_name = node.get("name", dir_name)
-                for f in node.get("files", []):
-                    fn = f.get("filename", "")
-                    if "\\" in fn or "/" in fn:
-                        full_fn = fn
-                    else:
-                        full_fn = f"{node_name}\\{fn}"
-                    f_copy = dict(f)
-                    f_copy["full_filename"] = full_fn
-                    f_copy["base_filename"] = fn
-                    files.append(f_copy)
-
-            if cached_info:
-                cached_info["full_directory_files"] = files
-            return files
-        except Exception:
-            return []
+        console.print(f"[green]✔ Soulseek Discovery:[/green] Found [bold]{len(self.peer_directories)}[/bold] candidate directories ([dim]{total_discovered_files} candidate files[/dim]) across peers.")
 
     def _reconcile_primary_releases(self):
         """Verifies candidate directories against all primary releases from MusicBrainz."""
         console.print(f"\n[bold cyan]Verifying Primary Releases ({len(self.catalog.releases)} releases)...[/bold cyan]")
 
-        # Index peer directories by clean path tokens for instant lookup
+        # Index peer directories by clean path tokens
         dir_token_map: Dict[Tuple[str, str], str] = {
             (user, d): clean_tokens(d)
             for (user, d) in self.peer_directories.keys()
@@ -563,7 +615,6 @@ class SlskdArtistScraper:
             norm_rel = normalize_text(rel_title)
             token_rel = clean_tokens(rel_title)
 
-            # Check if already present on server/local library
             if norm_rel in self.local_found_releases:
                 continue
 
@@ -576,31 +627,57 @@ class SlskdArtistScraper:
 
             candidate_matches: List[Dict[str, Any]] = []
 
-            # 1. Match against discovered directories
+            # 1. Fast in-memory evaluation against candidate directories
             for (user, dir_name), dir_tokens in dir_token_map.items():
-                if token_rel and (token_rel in dir_tokens or any(len(w) >= 4 and w in dir_tokens for w in token_rel.split())):
+                is_candidate = (
+                    token_rel and (token_rel in dir_tokens or any(len(w) >= 4 and w in dir_tokens for w in token_rel.split()))
+                )
+                if not is_candidate:
+                    dir_files = self.peer_directories[(user, dir_name)].get("matched_search_files", [])
+                    matched_cnt = sum(
+                        1 for exp in expected_tracks
+                        if any(is_track_title_match(exp.get("title", ""), extract_dir_and_filename(sf.get("filename", ""))[1], self.all_artist_aliases, rel_title, dir_name) for sf in dir_files)
+                    )
+                    if matched_cnt >= 2 or (len(expected_tracks) <= 2 and matched_cnt >= 1):
+                        is_candidate = True
+
+                if is_candidate:
                     dir_info = self.peer_directories.get((user, dir_name), {})
-                    match_data = self._verify_directory_against_release(user, dir_name, dir_info, expected_tracks, rel_title)
+                    match_data = self._evaluate_directory_in_memory(user, dir_name, dir_info, expected_tracks, rel_title)
                     if match_data:
                         candidate_matches.append(match_data)
-
-            # 2. If no candidate found from broad search, run a clean targeted search
-            if not candidate_matches and len(self.searches_performed) < 25:
-                q = clean_search_query(self.catalog.name, rel_title)
-                self._execute_search(q)
-                # Check new entries
-                for (user, dir_name), dir_info in list(self.peer_directories.items()):
-                    if (user, dir_name) not in dir_token_map:
-                        dir_token_map[(user, dir_name)] = clean_tokens(dir_name)
-                    dir_tokens = dir_token_map[(user, dir_name)]
-                    if token_rel and (token_rel in dir_tokens or any(len(w) >= 4 and w in dir_tokens for w in token_rel.split())):
-                        match_data = self._verify_directory_against_release(user, dir_name, dir_info, expected_tracks, rel_title)
-                        if match_data:
-                            candidate_matches.append(match_data)
 
             if candidate_matches:
                 candidate_matches.sort(key=lambda x: x["total_score"], reverse=True)
                 best_match = candidate_matches[0]
+
+                # If best candidate is missing full directory files, fetch full folder listing for top candidate
+                if best_match.get("match_ratio", 0) >= 0.50:
+                    top_user = best_match["user"]
+                    top_dir = best_match["directory"]
+                    top_dir_info = self.peer_directories.get((top_user, top_dir), {})
+                    if top_dir_info.get("full_directory_files") is None:
+                        try:
+                            nodes = self.client.browse_directory(top_user, top_dir)
+                            if nodes:
+                                files = []
+                                for node in nodes:
+                                    node_name = node.get("name", top_dir)
+                                    for f in node.get("files", []):
+                                        fn = f.get("filename", "")
+                                        full_fn = fn if ("\\" in fn or "/" in fn) else f"{node_name}\\{fn}"
+                                        f_copy = dict(f)
+                                        f_copy["full_filename"] = full_fn
+                                        f_copy["base_filename"] = fn
+                                        files.append(f_copy)
+                                top_dir_info["full_directory_files"] = files
+                                # Re-evaluate with complete files
+                                updated_match = self._evaluate_directory_in_memory(top_user, top_dir, top_dir_info, expected_tracks, rel_title)
+                                if updated_match:
+                                    best_match = updated_match
+                        except Exception:
+                            pass
+
                 self.verified_releases.append({
                     "release_title": rel_title,
                     "release_type": rel.get("type", "Release"),
@@ -618,7 +695,7 @@ class SlskdArtistScraper:
                     "expected_tracks": [t.get("title") for t in expected_tracks]
                 })
 
-    def _verify_directory_against_release(
+    def _evaluate_directory_in_memory(
         self,
         user: str,
         dir_name: str,
@@ -626,35 +703,34 @@ class SlskdArtistScraper:
         expected_tracks: List[Dict[str, Any]],
         rel_title: str
     ) -> Optional[Dict[str, Any]]:
-        """Compares directory contents against expected release tracklist."""
-        # Check files from search responses first
-        search_files = dir_info.get("matched_search_files", [])
-        if not search_files:
+        """Fast in-memory comparison of directory files against expected release tracklist."""
+        dir_files = dir_info.get("full_directory_files") or dir_info.get("matched_search_files", [])
+        if not dir_files:
             return None
 
-        # Build tracklist
+        audio_files = [f for f in dir_files if is_audio_file(f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1])]
+        if not audio_files:
+            return None
+
         matched_tracks: List[Dict[str, Any]] = []
         unmatched_expected: List[Dict[str, Any]] = []
 
         for exp in expected_tracks:
             exp_title = exp.get("title", "")
-
             matched_file = None
-            for sf in search_files:
-                fn = sf.get("filename", "")
-                base = extract_dir_and_filename(fn)[1]
-                if not is_audio_file(base):
-                    continue
 
-                if is_track_title_match(exp_title, base, set(self.catalog.aliases), rel_title, dir_name):
-                    matched_file = sf
+            for f in audio_files:
+                base = f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1]
+                if is_track_title_match(exp_title, base, self.all_artist_aliases, rel_title, dir_name):
+                    matched_file = f
                     break
 
             if matched_file:
                 matched_tracks.append({
                     "expected": exp_title,
-                    "matched_file": extract_dir_and_filename(matched_file.get("filename", ""))[1],
-                    "size": matched_file.get("size")
+                    "matched_file": matched_file.get("base_filename") or extract_dir_and_filename(matched_file.get("filename", ""))[1],
+                    "full_filename": matched_file.get("full_filename") or matched_file.get("filename"),
+                    "size": matched_file.get("size", 0)
                 })
             else:
                 unmatched_expected.append(exp)
@@ -664,19 +740,27 @@ class SlskdArtistScraper:
         if match_ratio < self.min_match_ratio and len(matched_tracks) == 0:
             return None
 
-        # Evaluate quality
-        primary_audio = search_files[0]
+        has_bonus = len(audio_files) > len(expected_tracks) and match_ratio >= 0.70
+
+        primary_audio = audio_files[0]
         format_label, format_score = determine_audio_quality(primary_audio)
 
         queue = dir_info.get("queue", 0)
         speed = dir_info.get("speed", 0)
         has_slot = dir_info.get("has_slot", True)
+        has_artwork = any(is_supporting_file(f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1]) for f in dir_files)
 
-        queue_penalty = min(queue, 50)
+        queue_penalty = min(queue / 2, 40)
         speed_bonus = min(speed / 500_000, 20)
         slot_bonus = 20 if has_slot else 0
+        art_bonus = 10 if has_artwork else 0
+        bonus_ver_bonus = 15 if has_bonus else 0
 
-        total_score = (match_ratio * 100) + format_score + slot_bonus + speed_bonus - queue_penalty
+        format_weight = format_score
+        if self.preferred_format == "flac" and "FLAC" in format_label:
+            format_weight += 25
+
+        total_score = (match_ratio * 100) + format_weight + slot_bonus + speed_bonus + art_bonus + bonus_ver_bonus - queue_penalty
 
         return {
             "user": user,
@@ -690,20 +774,22 @@ class SlskdArtistScraper:
             "matched_tracks": matched_tracks,
             "unmatched_expected": [u.get("title") for u in unmatched_expected],
             "total_score": total_score,
-            "dir_info": dir_info
+            "has_artwork": has_artwork,
+            "dir_info": dir_info,
+            "all_dir_files": dir_files
         }
 
     def _reconcile_compilation_tracks(self):
-        """Verifies candidate tracks on compilation / VA releases with multi-tier targeted queries."""
+        """Verifies candidate tracks on compilation / VA releases."""
         comp_releases = self.raw_mb_data.get("releases_track_artist", [])
         console.print(f"\n[bold cyan]Verifying Compilation & Split Tracks ({len(comp_releases)} releases)...[/bold cyan]")
 
-        # Index all audio files across candidate directories for fast lookups
         all_discovered_audio_files: List[Tuple[str, str, Dict[str, Any], Dict[str, Any]]] = []
         for (user, dir_name), dir_info in self.peer_directories.items():
-            for sf in dir_info.get("matched_search_files", []):
-                fn = sf.get("filename", "")
-                base = extract_dir_and_filename(fn)[1]
+            dir_files = dir_info.get("full_directory_files") or dir_info.get("matched_search_files", [])
+            for sf in dir_files:
+                fn = sf.get("full_filename") or sf.get("filename", "")
+                base = sf.get("base_filename") or extract_dir_and_filename(fn)[1]
                 if is_audio_file(base):
                     all_discovered_audio_files.append((user, dir_name, sf, dir_info))
 
@@ -712,14 +798,13 @@ class SlskdArtistScraper:
             artist_credit = rel.get("artist-credit-phrase", "Various Artists")
             norm_rel = normalize_text(rel_title)
 
-            # Target tracks on this release attributed to artist
             target_tracks = []
             for m in rel.get("medium-list", []):
                 for t in m.get("track-list", []):
                     rec = t.get("recording", {})
                     rec_artists = [ac.get("artist", {}).get("name", "").lower() for ac in rec.get("artist-credit", []) if isinstance(ac, dict)]
                     t_title = rec.get("title", t.get("title", ""))
-                    if any(a in " ".join(rec_artists) or a in t_title.lower() for a in self.catalog.aliases):
+                    if any(a.lower() in " ".join(rec_artists) or a.lower() in t_title.lower() for a in self.all_artist_aliases):
                         target_tracks.append({
                             "title": t_title,
                             "norm_title": normalize_text(t_title),
@@ -736,36 +821,16 @@ class SlskdArtistScraper:
             if not missing_tracks:
                 continue
 
-            # Check if any missing track can already be matched from peer directories
-            has_candidate = any(
-                any(is_track_title_match(tt["title"], extract_dir_and_filename(sf.get("filename", ""))[1], set(self.catalog.aliases), rel_title, d)
-                    for _, d, sf, _ in all_discovered_audio_files)
-                for tt in missing_tracks
-            )
-
-            # If not found, execute targeted search for compilation
-            if not has_candidate and len(self.searches_performed) < 45:
-                comp_queries = clean_compilation_queries(rel_title)
-                for q in comp_queries[:2]:
-                    new_res = self._execute_search(q)
-                    if new_res:
-                        for (u, d), d_info in self.peer_directories.items():
-                            for sf in d_info.get("matched_search_files", []):
-                                fn = sf.get("filename", "")
-                                base = extract_dir_and_filename(fn)[1]
-                                if is_audio_file(base) and (u, d, sf, d_info) not in all_discovered_audio_files:
-                                    all_discovered_audio_files.append((u, d, sf, d_info))
-
             for tt in missing_tracks:
                 t_title = tt.get("title", "")
                 norm_t = tt.get("norm_title", "")
                 candidate_matches: List[Dict[str, Any]] = []
 
                 for user, dir_name, sf, dir_info in all_discovered_audio_files:
-                    fn = sf.get("filename", "")
-                    base = extract_dir_and_filename(fn)[1]
+                    fn = sf.get("full_filename") or sf.get("filename", "")
+                    base = sf.get("base_filename") or extract_dir_and_filename(fn)[1]
 
-                    if is_track_title_match(t_title, base, set(self.catalog.aliases), rel_title, dir_name):
+                    if is_track_title_match(t_title, base, self.all_artist_aliases, rel_title, dir_name):
                         fmt_label, fmt_score = determine_audio_quality(sf)
                         queue = dir_info.get("queue", 0)
                         speed = dir_info.get("speed", 0)
@@ -782,7 +847,7 @@ class SlskdArtistScraper:
                             "queue": queue,
                             "speed": speed,
                             "has_slot": has_slot,
-                            "total_score": fmt_score + (20 if has_slot else 0) + min(speed / 500_000, 20) - min(queue, 50),
+                            "total_score": fmt_score + (20 if has_slot else 0) + min(speed / 500_000, 20) - min(queue / 2, 40),
                             "dir_info": dir_info
                         })
 
@@ -806,7 +871,6 @@ class SlskdArtistScraper:
         """Discovers and verifies standalone singles, remixes, collaborations, and non-album tracks."""
         console.print(f"\n[bold cyan]Verifying Standalone & Non-Album Tracks...[/bold cyan]")
 
-        # Identify all tracks in catalog not on verified primary or compilation releases
         all_covered_titles = set(self.local_found_map.keys())
         for vr in self.verified_releases:
             for mt in vr["best_match"].get("matched_tracks", []):
@@ -824,9 +888,10 @@ class SlskdArtistScraper:
 
         all_discovered_audio_files: List[Tuple[str, str, Dict[str, Any], Dict[str, Any]]] = []
         for (user, dir_name), dir_info in self.peer_directories.items():
-            for sf in dir_info.get("matched_search_files", []):
-                fn = sf.get("filename", "")
-                base = extract_dir_and_filename(fn)[1]
+            dir_files = dir_info.get("full_directory_files") or dir_info.get("matched_search_files", [])
+            for sf in dir_files:
+                fn = sf.get("full_filename") or sf.get("filename", "")
+                base = sf.get("base_filename") or extract_dir_and_filename(fn)[1]
                 if is_audio_file(base):
                     all_discovered_audio_files.append((user, dir_name, sf, dir_info))
 
@@ -841,9 +906,9 @@ class SlskdArtistScraper:
             matched_candidates: List[Dict[str, Any]] = []
 
             for user, dir_name, sf, dir_info in all_discovered_audio_files:
-                fn = sf.get("filename", "")
-                base = extract_dir_and_filename(fn)[1]
-                if is_track_title_match(t_title, base, set(self.catalog.aliases), t.get("release_title", ""), dir_name):
+                fn = sf.get("full_filename") or sf.get("filename", "")
+                base = sf.get("base_filename") or extract_dir_and_filename(fn)[1]
+                if is_track_title_match(t_title, base, self.all_artist_aliases, t.get("release_title", ""), dir_name):
                     fmt_label, fmt_score = determine_audio_quality(sf)
                     queue = dir_info.get("queue", 0)
                     speed = dir_info.get("speed", 0)
@@ -859,42 +924,9 @@ class SlskdArtistScraper:
                         "queue": queue,
                         "speed": speed,
                         "has_slot": has_slot,
-                        "total_score": fmt_score + (20 if has_slot else 0) + min(speed / 500_000, 20) - min(queue, 50),
+                        "total_score": fmt_score + (20 if has_slot else 0) + min(speed / 500_000, 20) - min(queue / 2, 40),
                         "dir_info": dir_info
                     })
-
-            # If no candidate found, execute targeted track searches!
-            if not matched_candidates and len(self.searches_performed) < 60:
-                track_queries = clean_track_queries(t_title, artist_credit, self.catalog.name)
-                for q in track_queries[:2]:
-                    new_res = self._execute_search(q)
-                    if new_res:
-                        for (u, d), d_info in self.peer_directories.items():
-                            for sf in d_info.get("matched_search_files", []):
-                                fn = sf.get("filename", "")
-                                base = extract_dir_and_filename(fn)[1]
-                                if is_audio_file(base):
-                                    if (u, d, sf, d_info) not in all_discovered_audio_files:
-                                        all_discovered_audio_files.append((u, d, sf, d_info))
-                                    if is_track_title_match(t_title, base, set(self.catalog.aliases), t.get("release_title", ""), d):
-                                        fmt_label, fmt_score = determine_audio_quality(sf)
-                                        queue = d_info.get("queue", 0)
-                                        speed = d_info.get("speed", 0)
-                                        has_slot = d_info.get("has_slot", True)
-                                        matched_candidates.append({
-                                            "user": u,
-                                            "directory": d,
-                                            "matched_file": base,
-                                            "full_filename": fn,
-                                            "size": sf.get("size", 0),
-                                            "format_label": fmt_label,
-                                            "format_score": fmt_score,
-                                            "queue": queue,
-                                            "speed": speed,
-                                            "has_slot": has_slot,
-                                            "total_score": fmt_score + (20 if has_slot else 0) + min(speed / 500_000, 20) - min(queue, 50),
-                                            "dir_info": d_info
-                                        })
 
             if matched_candidates:
                 matched_candidates.sort(key=lambda x: x["total_score"], reverse=True)
@@ -916,58 +948,12 @@ class SlskdArtistScraper:
         queued_dirs_set = set()
         queued_files_set = set(self.already_downloading_files)
 
-        # 1. Queue Primary Release Directories
-        for item in self.verified_releases:
-            match = item["best_match"]
-            user = match["user"]
-            dir_name = match["directory"]
-            dir_key = (user, dir_name)
-
-            if dir_key in queued_dirs_set:
-                continue
-
-            # Fetch complete folder from peer
-            dir_files = self._get_or_fetch_full_directory(user, dir_name)
-            if not dir_files:
-                dir_files = match.get("dir_info", {}).get("matched_search_files", [])
-
-            files_to_enqueue = []
-            for f in dir_files:
-                base = f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1]
-                if is_audio_file(base) or is_supporting_file(base):
-                    full_fn = f.get("full_filename") or f.get("filename")
-                    if full_fn and full_fn not in queued_files_set:
-                        files_to_enqueue.append({"filename": full_fn, "size": f.get("size", 0)})
-                        queued_files_set.add(full_fn)
-
-            if files_to_enqueue:
-                try:
-                    self.client.enqueue_download(user, files_to_enqueue)
-                    queued_dirs_set.add(dir_key)
-                    self.queued_directories.append({
-                        "type": "Primary Release",
-                        "title": item["release_title"],
-                        "user": user,
-                        "directory": dir_name,
-                        "format": match["format_label"],
-                        "files_count": len(files_to_enqueue),
-                        "total_size": sum(f["size"] for f in files_to_enqueue),
-                        "status": "Enqueued"
-                    })
-                except Exception as e:
-                    console.print(f"[red]Failed to enqueue directory '{dir_name}' from {user}: {e}[/red]")
-
-    def _queue_downloads(self):
-        """Enqueues verified primary release directories, compilation tracks, and standalone tracks into slskd."""
-        queued_dirs_set = set()
-        queued_files_set = set(self.already_downloading_files)
-
         def is_loose_dump(d_path: str) -> bool:
             parts = [p.strip().lower() for p in sanitize_remote_path(d_path).split("\\") if p.strip()]
             last = parts[-1] if parts else ""
             return any(k in last for k in ("soundcloud singles", "loose tracks", "random singles", "singles", "various singles"))
 
-        # 1. Queue Primary Release Directories
+        # 1. Queue Primary Release Directories (Full Folders)
         for item in self.verified_releases:
             match = item["best_match"]
             user = match["user"]
@@ -977,9 +963,27 @@ class SlskdArtistScraper:
             if dir_key in queued_dirs_set:
                 continue
 
-            dir_files = self._get_or_fetch_full_directory(user, dir_name)
-            if not dir_files:
-                dir_files = match.get("dir_info", {}).get("matched_search_files", [])
+            dir_files = match.get("all_dir_files") or match.get("dir_info", {}).get("matched_search_files", [])
+
+            # Expand if full folder listing was not fetched
+            if not any(is_supporting_file(f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1]) for f in dir_files):
+                try:
+                    nodes = self.client.browse_directory(user, dir_name)
+                    if nodes:
+                        files = []
+                        for node in nodes:
+                            node_name = node.get("name", dir_name)
+                            for f in node.get("files", []):
+                                fn = f.get("filename", "")
+                                full_fn = fn if ("\\" in fn or "/" in fn) else f"{node_name}\\{fn}"
+                                f_copy = dict(f)
+                                f_copy["full_filename"] = full_fn
+                                f_copy["base_filename"] = fn
+                                files.append(f_copy)
+                        if files:
+                            dir_files = files
+                except Exception:
+                    pass
 
             files_to_enqueue = []
             for f in dir_files:
@@ -1017,13 +1021,8 @@ class SlskdArtistScraper:
             if dir_key in queued_dirs_set:
                 continue
 
-            # By default, download full compilation folder unless --singles-only is set or folder is a loose dump
             download_full_dir = not self.singles_only and not is_loose_dump(dir_name)
-            dir_files = self._get_or_fetch_full_directory(user, dir_name) if download_full_dir else []
-
-            # Safety check: avoid directories with > 100 files if it's an accidental root share
-            if dir_files and len(dir_files) > 100:
-                dir_files = []
+            dir_files = match.get("dir_info", {}).get("full_directory_files") or match.get("dir_info", {}).get("matched_search_files", []) if download_full_dir else []
 
             if not dir_files:
                 full_fn = match.get("full_filename")
@@ -1055,7 +1054,7 @@ class SlskdArtistScraper:
                 except Exception as e:
                     console.print(f"[red]Failed to enqueue compilation '{dir_name}' from {user}: {e}[/red]")
 
-        # 3. Queue Standalone / Guest Track Releases
+        # 3. Queue Standalone / Guest Feature Track Releases
         for item in self.verified_standalone_tracks:
             match = item["best_match"]
             user = match["user"]
@@ -1065,33 +1064,15 @@ class SlskdArtistScraper:
             if dir_key in queued_dirs_set:
                 continue
 
-            # By default, download full release folder for guest features / collaborative albums
-            download_full_dir = not self.singles_only and not is_loose_dump(dir_name)
-            dir_files = self._get_or_fetch_full_directory(user, dir_name) if download_full_dir else []
-
-            # Safety check: avoid directories with > 80 files
-            if dir_files and len(dir_files) > 80:
-                dir_files = []
-
-            if not dir_files:
-                full_fn = match.get("full_filename")
-                files_to_enqueue = [{"filename": full_fn, "size": match.get("size", 0)}] if full_fn and full_fn not in queued_files_set else []
-            else:
-                files_to_enqueue = []
-                for f in dir_files:
-                    base = f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1]
-                    if is_audio_file(base) or is_supporting_file(base):
-                        full_fn = f.get("full_filename") or f.get("filename")
-                        if full_fn and full_fn not in queued_files_set:
-                            files_to_enqueue.append({"filename": full_fn, "size": f.get("size", 0)})
-                            queued_files_set.add(full_fn)
+            full_fn = match.get("full_filename")
+            files_to_enqueue = [{"filename": full_fn, "size": match.get("size", 0)}] if full_fn and full_fn not in queued_files_set else []
 
             if files_to_enqueue:
                 try:
                     self.client.enqueue_download(user, files_to_enqueue)
                     queued_dirs_set.add(dir_key)
                     self.queued_directories.append({
-                        "type": "Featured / Collab Album" if len(files_to_enqueue) > 1 else "Standalone Track",
+                        "type": "Standalone Track",
                         "title": item["track_title"],
                         "user": user,
                         "directory": match["directory"],
@@ -1206,9 +1187,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 slskd_scraper.py "kyou1110"
-  python3 slskd_scraper.py "kyou1110" --dry-run
-  python3 slskd_scraper.py "kyou1110" --singles-only
+  python3 slskd_scraper.py "Mekuso"
+  python3 slskd_scraper.py "Mekuso" --dry-run
+  python3 slskd_scraper.py "Mekuso" --singles-only
   python3 slskd_scraper.py "Stellabee" --format flac --min-match 0.8
         """
     )
@@ -1216,10 +1197,10 @@ Examples:
     parser.add_argument("-d", "--music-dir", default=None, help="Local music library directory to scan (READ-ONLY)")
     parser.add_argument("-f", "--format", default="flac", choices=["flac", "mp3-320", "any"], help="Preferred audio format")
     parser.add_argument("--min-match", type=float, default=0.70, help="Minimum track match ratio for albums (default: 0.70)")
-    parser.add_argument("--timeout", type=float, default=8.0, help="Soulseek search timeout in seconds (default: 8)")
+    parser.add_argument("--timeout", type=float, default=14.0, help="Soulseek search timeout in seconds (default: 14)")
     parser.add_argument("--dry-run", action="store_true", help="Discover and verify matches without enqueuing downloads")
     parser.add_argument("--singles-only", action="store_true", default=False, help="Only download single matching tracks for compilations/features instead of full releases")
-    parser.add_argument("-t", "--threads", type=int, default=4, help="Worker threads for local scanning")
+    parser.add_argument("-t", "--threads", type=int, default=6, help="Worker threads for local scanning and browsing")
 
     args = parser.parse_args()
 

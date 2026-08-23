@@ -19,6 +19,8 @@ TOOL_SCRIPTS = {
     "artist": ROOT_DIR / "artist_downloader.py",
     "download-artist": ROOT_DIR / "artist_downloader.py",
     "audit": ROOT_DIR / "check_missing_tracks.py",
+    "soulseek": ROOT_DIR / "slskd_scraper.py",
+    "slskd": ROOT_DIR / "slskd_scraper.py",
     "bandcamp": ROOT_DIR / "bandcamp_scraper.py",
     "scrape": ROOT_DIR / "music_scraper.py",
     "clean": ROOT_DIR / "clean_empty_folders.py",
@@ -37,19 +39,24 @@ Usage:
   python3 main.py <command> [options]
 
 Commands:
+  soulseek  Search Soulseek (via slskd) for full artist discographies,
+            reconcile tracklists against MusicBrainz, and queue downloads
+            Example: python3 main.py soulseek "Mekuso"
+            Example: python3 main.py soulseek "Mekuso" --dry-run
+            Example: python3 main.py soulseek "kyou1110" --format flac
+
+  artist    Download & audit an artist's full discography across Soulseek,
+            Bandcamp, Archive.org, and web netlabel sources
+            Example: python3 main.py artist "Mekuso" --slskd
+            Example: python3 main.py artist "96-glass"
+
+  audit     Audit your local library against MusicBrainz for missing releases & tracks
+            Example: python3 main.py audit "Stellabee" -d /mnt/music
+
   tag       Apply intelligent genre tags to artists, albums, & tracks via Last.fm
             (Cascades track->album->artist tags, filters noise, formats ID3/Vorbis)
             Example: python3 main.py tag "/mnt/music/Library/goreshit" --dry-run
             Example: python3 main.py tag "/mnt/music/Library" --skip-existing
-
-  artist    Download & audit an artist's full discography using MusicBrainz data
-            (Discovers Bandcamp, MediaFire, Archive.org & netlabel releases, unpacks archives,
-            and generates comprehensive missing track reports)
-            Example: python3 main.py artist "96-glass"
-            Example: python3 main.py artist "https://musicbrainz.org/artist/2a7276cf-e768-4e7e-bf71-be7468d3604f"
-
-  audit     Audit your local library against MusicBrainz for missing releases & tracks
-            Example: python3 main.py audit "Stellabee" -d /mnt/music
 
   bandcamp  Download albums, tracks, or full artist discographies from Bandcamp
             Example: python3 main.py bandcamp goreshit -f flac
