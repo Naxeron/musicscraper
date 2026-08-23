@@ -87,6 +87,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 logger = logging.getLogger("musicscraper")
+logging.getLogger("musicbrainzngs").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 class FilenameUtils:

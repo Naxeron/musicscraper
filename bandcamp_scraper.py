@@ -56,6 +56,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 logger = logging.getLogger("bandcampscraper")
+logging.getLogger("musicbrainzngs").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 class FilenameUtils:

@@ -26,6 +26,7 @@ import re
 import csv
 import json
 import time
+import logging
 import zipfile
 import tarfile
 import argparse
@@ -44,6 +45,10 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.text import Text
 from rich import box
+
+# Silence noisy third-party loggers (e.g. musicbrainzngs schema parsing notices, urllib3)
+logging.getLogger("musicbrainzngs").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 from check_missing_tracks import (
     MusicBrainzClient,

@@ -21,6 +21,7 @@ import re
 import csv
 import json
 import time
+import logging
 import argparse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +39,10 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeEl
 from rich.text import Text
 from rich.tree import Tree
 from rich import box
+
+# Silence noisy third-party loggers (e.g. musicbrainzngs schema parsing notices, urllib3)
+logging.getLogger("musicbrainzngs").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # Initialize Rich Console
 console = Console()
