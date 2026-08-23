@@ -73,7 +73,7 @@ from slskd_api import SlskdClient
 # Initialize Rich Console
 console = Console()
 
-DEFAULT_OUTPUT_DIR = "./downloads"
+DEFAULT_OUTPUT_DIR = "/mnt/music/downloads" if os.path.exists("/mnt/music/downloads") else "./downloads"
 
 # Domain normalizations (e.g. legacy/moved netlabels)
 DOMAIN_REPLACEMENTS = [

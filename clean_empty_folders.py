@@ -98,7 +98,7 @@ def clean_folders(
 
 
 def main():
-    default_dir = "./downloads" if os.path.exists("./downloads") else "."
+    default_dir = "/mnt/music/downloads" if os.path.exists("/mnt/music/downloads") else ("./downloads" if os.path.exists("./downloads") else ".")
 
     parser = argparse.ArgumentParser(
         description="Clean and delete folders that contain no music files."

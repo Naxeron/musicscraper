@@ -48,7 +48,7 @@ SUPPORTED_FORMATS = [
     "flac", "mp3-320", "wav", "aac-hi", "aiff-lossless", "alac", "vorbis", "mp3-v0", "mp3-128"
 ]
 
-DEFAULT_OUTPUT_DIR = "./downloads"
+DEFAULT_OUTPUT_DIR = "/mnt/music/downloads" if os.path.exists("/mnt/music/downloads") else "./downloads"
 
 logging.basicConfig(
     level=logging.INFO,
