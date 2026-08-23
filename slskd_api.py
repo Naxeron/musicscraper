@@ -245,20 +245,24 @@ class SlskdClient:
         # 1. Check existing searches in slskd history
         if use_existing:
             existing = self.list_searches()
-            existing_by_text: Dict[str, Dict[str, Any]] = {}
+            existing_by_text: Dict[str, List[Dict[str, Any]]] = {}
             for s in existing:
                 st = s.get("searchText", "").strip().lower()
                 if st:
-                    existing_by_text[st] = s
+                    if st not in existing_by_text:
+                        existing_by_text[st] = []
+                    existing_by_text[st].append(s)
 
             for q in clean_queries:
                 q_lower = q.lower()
                 if q_lower in existing_by_text:
-                    s_info = existing_by_text[q_lower]
-                    sid = s_info.get("id")
-                    st = s_info.get("state", "")
-                    is_done = s_info.get("isComplete", False) or "Completed" in st
-                    if is_done and s_info.get("fileCount", 0) > 0:
+                    matches = existing_by_text[q_lower]
+                    # Select the match with highest file count
+                    best_s = max(matches, key=lambda x: (x.get("fileCount", 0), 1 if "Completed" in x.get("state", "") else 0))
+                    sid = best_s.get("id")
+                    st = best_s.get("state", "")
+                    is_done = best_s.get("isComplete", False) or "Completed" in st
+                    if best_s.get("fileCount", 0) > 0:
                         try:
                             full_res = self.get_search_results(sid)
                             if full_res.get("responses"):
@@ -267,9 +271,7 @@ class SlskdClient:
                         except Exception:
                             pass
                     elif not is_done and sid:
-                        # Existing search is in-progress
                         query_to_search_id[q] = sid
-                        pending_queries.append(q)
                         continue
 
                 pending_queries.append(q)

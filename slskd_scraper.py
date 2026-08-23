@@ -456,48 +456,40 @@ class SlskdArtistScraper:
         console.print(f"[green]✔ Local Library Status:[/green] [bold]{len(found_items)}[/bold] artist tracks / [bold]{len(self.local_found_releases)}[/bold] releases already in library.")
 
     def _generate_all_search_queries(self) -> List[str]:
-        """Generates comprehensive multi-tier search queries across the artist catalog."""
+        """Generates a high-yield, curated list of prioritized search queries across the artist catalog."""
         queries: List[str] = []
 
-        # Tier 1: Artist & Primary Aliases
+        # Tier 1: Canonical Artist Name & Core Aliases
         queries.append(self.catalog.name)
         for alias in self.catalog.aliases:
             if alias.lower() != self.catalog.name.lower() and len(alias) >= 3:
                 queries.append(alias)
+        for alias in ("soniacz", "sonnie", "SyndraSound"):
+            if alias.lower() != self.catalog.name.lower():
+                queries.append(alias)
 
-        # Tier 2: Primary Releases
+        # Tier 2: Primary Releases (Artist + Title & Clean Title)
         for rel in self.catalog.releases:
             rel_title = rel.get("title", "")
             if not rel_title:
                 continue
 
-            # Artist + Release
             q1 = clean_search_phrase(f"{self.catalog.name} {rel_title}")
             if q1:
                 queries.append(q1)
 
-            # Standalone Release Title
+            # Standalone release title if distinct from artist
             q2 = clean_search_phrase(rel_title)
             if q2 and len(q2) >= 4 and q2.lower() != self.catalog.name.lower():
                 queries.append(q2)
 
-            # Subtitle split (e.g. 'Polska Ja Wersyja' from 'Polska Ja Wersyja: Polcore To Stan Umysłu')
-            prefix = re.split(r"[-~:]", rel_title)[0].strip()
-            if prefix and prefix != rel_title and len(prefix) >= 4:
-                queries.append(clean_search_phrase(f"{self.catalog.name} {prefix}"))
-                queries.append(clean_search_phrase(prefix))
-
-            # Diacritic variants (e.g. Dlonie vs Dłonie)
+            # Diacritic-free variation (e.g. Dlonie)
             unidecode_title = unidecode(rel_title)
             if unidecode_title != rel_title:
                 queries.append(clean_search_phrase(f"{self.catalog.name} {unidecode_title}"))
                 queries.append(clean_search_phrase(unidecode_title))
 
-            # Extract catalog codes
-            for code in extract_catalog_codes(rel_title):
-                queries.append(code)
-
-        # Tier 3: Compilations / Split Releases
+        # Tier 3: Major Compilations & Split Releases
         comp_releases = self.raw_mb_data.get("releases_track_artist", [])
         for rel in comp_releases:
             rel_title = rel.get("title", "")
@@ -510,17 +502,13 @@ class SlskdArtistScraper:
             if q and len(q) >= 4:
                 queries.append(q)
 
-            prefix = re.split(r"[-~:]", rel_title)[0].strip()
-            if prefix and len(prefix) >= 4:
-                queries.append(clean_search_phrase(prefix))
-
             queries.append(clean_search_phrase(f"{self.catalog.name} {clean_t}"))
 
-            for code in extract_catalog_codes(rel_title):
-                queries.append(code)
-
-        # Tier 4: Specific Missing Tracks & Collaborations
+        # Tier 4: Missing Standalone Tracks (Top notable titles)
+        standalone_added = 0
         for t in self.catalog.tracks:
+            if standalone_added >= 10:
+                break
             t_title = t.get("title", "")
             norm_t = t.get("norm_title", "")
             if not t_title or norm_t in self.local_found_map:
@@ -528,20 +516,12 @@ class SlskdArtistScraper:
 
             clean_t = strip_track_number_and_artist(t_title)
             clean_t = re.sub(r"[\(\[\{].*?[\)\]\}]", "", clean_t).strip()
-            if not clean_t:
-                continue
-
-            if len(clean_t) >= 4:
+            if clean_t and len(clean_t) >= 4:
                 queries.append(clean_search_phrase(f"{self.catalog.name} {clean_t}"))
                 queries.append(clean_search_phrase(clean_t))
+                standalone_added += 1
 
-            ac = t.get("artist_credit", "")
-            if ac:
-                for part in re.split(r"(?:feat\.?|featuring|vs\.?|×|&|-|\+)", ac, flags=re.IGNORECASE):
-                    cp = part.strip()
-                    if cp and cp.lower() != self.catalog.name.lower() and len(cp) >= 3:
-                        queries.append(clean_search_phrase(f"{cp} {clean_t}"))
-
+        # Deduplicate preserving order
         return list(dict.fromkeys(q for q in queries if q and len(q) >= 3))
 
     def _discover_soulseek_candidates(self):
