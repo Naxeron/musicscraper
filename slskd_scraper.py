@@ -920,10 +920,11 @@ class SlskdArtistScraper:
                 })
                 all_covered_titles.add(norm_t)
             else:
-                self.unresolved_standalone_tracks.append({
-                    "track_title": t_title,
-                    "artist_credit": artist_credit or self.catalog.name
-                })
+                if t.get("release_type") == "Standalone / Single":
+                    self.unresolved_standalone_tracks.append({
+                        "track_title": t_title,
+                        "artist_credit": artist_credit or self.catalog.name
+                    })
 
     def _queue_downloads(self):
         """Enqueues verified primary release directories, compilation tracks, and standalone tracks into slskd."""
