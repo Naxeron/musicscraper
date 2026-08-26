@@ -678,10 +678,18 @@ class BandcampEngine:
             t_num = track["track_num"]
             t_title = track["title"]
             s_url = track["stream_url"]
-            filename = f"{t_num:02d} - {FilenameUtils.sanitize(t_title)}.mp3"
-            track_file = release_dir / filename
+            # Check if any audio file for this track already exists in release_dir in any format
+            existing_audio = None
+            if not self.overwrite and release_dir.exists():
+                clean_title = FilenameUtils.sanitize(t_title).lower()
+                for f_exist in release_dir.iterdir():
+                    if f_exist.is_file() and f_exist.suffix.lower() in {".flac", ".mp3", ".m4a", ".wav", ".ogg", ".opus", ".aif", ".aiff"} and f_exist.stat().st_size > 0:
+                        fn_low = f_exist.stem.lower()
+                        if fn_low.startswith(f"{t_num:02d}") or fn_low.startswith(f"{t_num} ") or fn_low.startswith(f"{t_num}-") or clean_title in fn_low:
+                            existing_audio = f_exist
+                            break
 
-            if track_file.exists() and track_file.stat().st_size > 0:
+            if existing_audio:
                 success_tracks += 1
                 continue
 

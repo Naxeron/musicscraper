@@ -345,6 +345,10 @@ class SlskdArtistScraper:
         self.peer_directories: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.searches_performed: Set[str] = set()
 
+        # Deduplication & coverage tracking
+        self.reconciled_release_keys: Set[str] = set()
+        self.covered_track_titles: Set[str] = set()
+
         # Audit & download state
         self.queued_directories: List[Dict[str, Any]] = []
         self.already_downloading_files: Set[str] = set()
@@ -627,7 +631,8 @@ class SlskdArtistScraper:
 
     def _reconcile_primary_releases(self):
         """Verifies candidate directories against all primary releases from MusicBrainz."""
-        console.print(f"\n[bold cyan]Verifying Primary Releases ({len(self.catalog.releases)} releases)...[/bold cyan]")
+        primary_rels = self.catalog.primary_releases if hasattr(self.catalog, "primary_releases") else [r for r in self.catalog.releases if not r.get("is_va", False)]
+        console.print(f"\n[bold cyan]Verifying Primary Releases ({len(primary_rels)} releases)...[/bold cyan]")
 
         # Index peer directories by clean path tokens
         dir_token_map: Dict[Tuple[str, str], str] = {
@@ -635,13 +640,16 @@ class SlskdArtistScraper:
             for (user, d) in self.peer_directories.keys()
         }
 
-        for rel in self.catalog.releases:
+        for rel in primary_rels:
             rel_title = rel.get("title", "")
             norm_rel = normalize_text(rel_title)
             token_rel = clean_tokens(rel_title)
 
-            if norm_rel in self.local_found_releases:
+            if norm_rel in self.local_found_releases or norm_rel in self.reconciled_release_keys or (token_rel and token_rel in self.reconciled_release_keys):
                 continue
+            self.reconciled_release_keys.add(norm_rel)
+            if token_rel:
+                self.reconciled_release_keys.add(token_rel)
 
             expected_tracks = [
                 t for t in self.catalog.tracks
@@ -711,6 +719,18 @@ class SlskdArtistScraper:
                     "best_match": best_match,
                     "all_candidates_count": len(candidate_matches)
                 })
+
+                for mt in best_match.get("matched_tracks", []):
+                    exp_t = mt.get("expected", "")
+                    if exp_t:
+                        self.covered_track_titles.add(normalize_text(exp_t))
+                        self.covered_track_titles.add(clean_tokens(exp_t))
+                if best_match.get("match_ratio", 0) >= self.min_match_ratio:
+                    for exp in expected_tracks:
+                        exp_t = exp.get("title", "")
+                        if exp_t:
+                            self.covered_track_titles.add(normalize_text(exp_t))
+                            self.covered_track_titles.add(clean_tokens(exp_t))
             else:
                 self.unresolved_releases.append({
                     "release_title": rel_title,
@@ -822,6 +842,11 @@ class SlskdArtistScraper:
             rel_title = rel.get("title", "")
             artist_credit = rel.get("artist-credit-phrase", "Various Artists")
             norm_rel = normalize_text(rel_title)
+            token_rel = clean_tokens(rel_title)
+
+            # Skip if this compilation was already matched as a primary release or previously reconciled
+            if norm_rel in self.local_found_releases or norm_rel in self.reconciled_release_keys or (token_rel and token_rel in self.reconciled_release_keys):
+                continue
 
             target_tracks = []
             for m in rel.get("medium-list", []):
@@ -842,14 +867,26 @@ class SlskdArtistScraper:
                     for t in self.catalog.tracks if t.get("norm_release") == norm_rel
                 ]
 
-            missing_tracks = [tt for tt in target_tracks if tt["norm_title"] not in self.local_found_map]
+            missing_tracks = [
+                tt for tt in target_tracks
+                if tt["norm_title"] not in self.local_found_map
+                and tt["norm_title"] not in self.covered_track_titles
+                and clean_tokens(tt["title"]) not in self.covered_track_titles
+            ]
             if not missing_tracks:
                 continue
+
+            self.reconciled_release_keys.add(norm_rel)
+            if token_rel:
+                self.reconciled_release_keys.add(token_rel)
+
+            # Deduplicate by picking best matching candidate directory for this compilation
+            comp_candidate_dirs: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
             for tt in missing_tracks:
                 t_title = tt.get("title", "")
                 norm_t = tt.get("norm_title", "")
-                candidate_matches: List[Dict[str, Any]] = []
+                clean_t = clean_tokens(t_title)
 
                 for user, dir_name, sf, dir_info in all_discovered_audio_files:
                     fn = sf.get("full_filename") or sf.get("filename", "")
@@ -861,33 +898,44 @@ class SlskdArtistScraper:
                         speed = dir_info.get("speed", 0)
                         has_slot = dir_info.get("has_slot", True)
 
-                        candidate_matches.append({
-                            "user": user,
-                            "directory": dir_name,
-                            "matched_file": base,
-                            "full_filename": fn,
-                            "size": sf.get("size", 0),
-                            "format_label": fmt_label,
-                            "format_score": fmt_score,
-                            "queue": queue,
-                            "speed": speed,
-                            "has_slot": has_slot,
-                            "total_score": fmt_score + (20 if has_slot else 0) + min(speed / 500_000, 20) - min(queue / 2, 40),
-                            "dir_info": dir_info
-                        })
+                        fmt_bonus = 25 if self.preferred_format == "flac" and "FLAC" in fmt_label else 0
+                        score = fmt_score + fmt_bonus + (20 if has_slot else 0) + min(speed / 500_000, 20) - min(queue / 2, 40)
 
-                if candidate_matches:
-                    candidate_matches.sort(key=lambda x: x["total_score"], reverse=True)
-                    best_match = candidate_matches[0]
-                    self.verified_compilation_tracks.append({
-                        "track_title": t_title,
-                        "release_title": rel_title,
-                        "release_artist": artist_credit,
-                        "best_match": best_match
-                    })
-                else:
+                        dir_key = (user, dir_name)
+                        if dir_key not in comp_candidate_dirs or score > comp_candidate_dirs[dir_key]["score"]:
+                            comp_candidate_dirs[dir_key] = {
+                                "user": user,
+                                "directory": dir_name,
+                                "matched_file": base,
+                                "full_filename": fn,
+                                "size": sf.get("size", 0),
+                                "format_label": fmt_label,
+                                "format_score": fmt_score,
+                                "queue": queue,
+                                "speed": speed,
+                                "has_slot": has_slot,
+                                "score": score,
+                                "track_title": t_title,
+                                "dir_info": dir_info
+                            }
+
+            if comp_candidate_dirs:
+                best_dir_candidate = max(comp_candidate_dirs.values(), key=lambda x: x["score"])
+                self.verified_compilation_tracks.append({
+                    "track_title": best_dir_candidate["track_title"],
+                    "release_title": rel_title,
+                    "release_artist": artist_credit,
+                    "best_match": best_dir_candidate
+                })
+                self.covered_track_titles.add(normalize_text(best_dir_candidate["track_title"]))
+                self.covered_track_titles.add(clean_tokens(best_dir_candidate["track_title"]))
+                for tt in missing_tracks:
+                    self.covered_track_titles.add(tt["norm_title"])
+                    self.covered_track_titles.add(clean_tokens(tt["title"]))
+            else:
+                for tt in missing_tracks:
                     self.unresolved_compilation_tracks.append({
-                        "track_title": t_title,
+                        "track_title": tt.get("title", ""),
                         "release_title": rel_title,
                         "release_artist": artist_credit
                     })
@@ -896,17 +944,27 @@ class SlskdArtistScraper:
         """Discovers and verifies standalone singles, remixes, collaborations, and non-album tracks."""
         console.print(f"\n[bold cyan]Verifying Standalone & Non-Album Tracks...[/bold cyan]")
 
-        all_covered_titles = set(self.local_found_map.keys())
+        all_covered_titles = set(self.local_found_map.keys()) | set(self.covered_track_titles)
         for vr in self.verified_releases:
             for mt in vr["best_match"].get("matched_tracks", []):
                 all_covered_titles.add(normalize_text(mt.get("expected", "")))
+                all_covered_titles.add(clean_tokens(mt.get("expected", "")))
         for vc in self.verified_compilation_tracks:
             all_covered_titles.add(normalize_text(vc.get("track_title", "")))
+            all_covered_titles.add(clean_tokens(vc.get("track_title", "")))
 
-        standalone_candidates = [
-            t for t in self.catalog.tracks
-            if t.get("norm_title") not in all_covered_titles
-        ]
+        standalone_candidates = []
+        for t in self.catalog.tracks:
+            norm_t = t.get("norm_title", "")
+            clean_t = clean_tokens(t.get("title", ""))
+            norm_rel = t.get("norm_release", "")
+            # Skip if track title was already covered
+            if norm_t in all_covered_titles or clean_t in all_covered_titles:
+                continue
+            # Skip if track belongs to an album that was already reconciled / verified in full
+            if norm_rel and norm_rel in self.reconciled_release_keys:
+                continue
+            standalone_candidates.append(t)
 
         if not standalone_candidates:
             return
@@ -923,9 +981,10 @@ class SlskdArtistScraper:
         for t in standalone_candidates:
             t_title = t.get("title", "")
             norm_t = t.get("norm_title", "")
+            clean_t = clean_tokens(t_title)
             artist_credit = t.get("artist_credit", "")
 
-            if norm_t in all_covered_titles:
+            if norm_t in all_covered_titles or clean_t in all_covered_titles:
                 continue
 
             matched_candidates: List[Dict[str, Any]] = []
@@ -938,6 +997,7 @@ class SlskdArtistScraper:
                     queue = dir_info.get("queue", 0)
                     speed = dir_info.get("speed", 0)
                     has_slot = dir_info.get("has_slot", True)
+                    fmt_bonus = 25 if self.preferred_format == "flac" and "FLAC" in fmt_label else 0
                     matched_candidates.append({
                         "user": user,
                         "directory": dir_name,
@@ -949,7 +1009,7 @@ class SlskdArtistScraper:
                         "queue": queue,
                         "speed": speed,
                         "has_slot": has_slot,
-                        "total_score": fmt_score + (20 if has_slot else 0) + min(speed / 500_000, 20) - min(queue / 2, 40),
+                        "total_score": fmt_score + fmt_bonus + (20 if has_slot else 0) + min(speed / 500_000, 20) - min(queue / 2, 40),
                         "dir_info": dir_info
                     })
 
@@ -962,6 +1022,9 @@ class SlskdArtistScraper:
                     "best_match": best_match
                 })
                 all_covered_titles.add(norm_t)
+                all_covered_titles.add(clean_t)
+                self.covered_track_titles.add(norm_t)
+                self.covered_track_titles.add(clean_t)
             else:
                 if t.get("release_type") == "Standalone / Single":
                     self.unresolved_standalone_tracks.append({
@@ -971,8 +1034,10 @@ class SlskdArtistScraper:
 
     def _queue_downloads(self):
         """Enqueues verified primary release directories, compilation tracks, and standalone tracks into slskd."""
-        queued_dirs_set = set()
-        queued_files_set = set(self.already_downloading_files)
+        queued_dirs_set: Set[Tuple[str, str]] = set()
+        queued_release_keys: Set[str] = set()
+        queued_track_keys: Set[str] = set()
+        queued_files_set: Set[str] = set(self.already_downloading_files)
 
         def is_loose_dump(d_path: str) -> bool:
             parts = [p.strip().lower() for p in sanitize_remote_path(d_path).split("\\") if p.strip()]
@@ -985,6 +1050,14 @@ class SlskdArtistScraper:
 
         # 1. Queue Primary Release Directories (Full Folders)
         for item in self.verified_releases:
+            rel_title = item.get("release_title", "")
+            norm_rel = normalize_text(rel_title)
+            clean_rel = clean_tokens(rel_title)
+
+            # Prevent duplicate queueing of the same release
+            if norm_rel in queued_release_keys or (clean_rel and clean_rel in queued_release_keys):
+                continue
+
             match = item["best_match"]
             user = match["user"]
             dir_name = match["directory"]
@@ -1028,6 +1101,15 @@ class SlskdArtistScraper:
                 try:
                     self.client.enqueue_download(user, files_to_enqueue)
                     queued_dirs_set.add(dir_key)
+                    queued_release_keys.add(norm_rel)
+                    if clean_rel:
+                        queued_release_keys.add(clean_rel)
+                    for mt in match.get("matched_tracks", []):
+                        exp = mt.get("expected", "")
+                        if exp:
+                            queued_track_keys.add(normalize_text(exp))
+                            queued_track_keys.add(clean_tokens(exp))
+
                     self.queued_directories.append({
                         "type": "Primary Release",
                         "title": item["release_title"],
@@ -1043,6 +1125,17 @@ class SlskdArtistScraper:
 
         # 2. Queue Compilation / Split Release Directories
         for item in self.verified_compilation_tracks:
+            rel_title = item.get("release_title", "")
+            track_title = item.get("track_title", "")
+            norm_rel = normalize_text(rel_title)
+            clean_rel = clean_tokens(rel_title)
+            norm_track = normalize_text(track_title)
+            clean_track = clean_tokens(track_title)
+
+            # Skip if track already queued in another directory
+            if (norm_track and norm_track in queued_track_keys) or (clean_track and clean_track in queued_track_keys):
+                continue
+
             match = item["best_match"]
             user = match["user"]
             dir_name = match["directory"]
@@ -1051,13 +1144,20 @@ class SlskdArtistScraper:
             if dir_key in queued_dirs_set:
                 continue
 
-            download_full_dir = not self.singles_only and not is_loose_dump(dir_name)
-            dir_files = match.get("dir_info", {}).get("full_directory_files") or match.get("dir_info", {}).get("matched_search_files", []) if download_full_dir else []
+            download_full_dir = (
+                not self.singles_only
+                and not is_loose_dump(dir_name)
+                and (norm_rel not in queued_release_keys)
+                and (not clean_rel or clean_rel not in queued_release_keys)
+            )
 
-            if not dir_files:
+            if not download_full_dir:
                 full_fn = match.get("full_filename")
                 files_to_enqueue = [{"filename": full_fn, "size": match.get("size", 0)}] if full_fn and full_fn not in queued_files_set else []
+                if files_to_enqueue:
+                    queued_files_set.add(full_fn)
             else:
+                dir_files = match.get("dir_info", {}).get("full_directory_files") or match.get("dir_info", {}).get("matched_search_files", [])
                 files_to_enqueue = []
                 for f in dir_files:
                     base = f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1]
@@ -1071,6 +1171,15 @@ class SlskdArtistScraper:
                 try:
                     self.client.enqueue_download(user, files_to_enqueue)
                     queued_dirs_set.add(dir_key)
+                    if download_full_dir:
+                        queued_release_keys.add(norm_rel)
+                        if clean_rel:
+                            queued_release_keys.add(clean_rel)
+                    if norm_track:
+                        queued_track_keys.add(norm_track)
+                    if clean_track:
+                        queued_track_keys.add(clean_track)
+
                     self.queued_directories.append({
                         "type": "Compilation Album" if len(files_to_enqueue) > 1 else "Compilation Track",
                         "title": f"{item['release_title']} (feat. {item['track_title']})",
@@ -1086,6 +1195,14 @@ class SlskdArtistScraper:
 
         # 3. Queue Standalone / Guest Feature Track Releases
         for item in self.verified_standalone_tracks:
+            track_title = item.get("track_title", "")
+            norm_track = normalize_text(track_title)
+            clean_track = clean_tokens(track_title)
+
+            # Skip if track already queued in a release or compilation
+            if (norm_track and norm_track in queued_track_keys) or (clean_track and clean_track in queued_track_keys):
+                continue
+
             match = item["best_match"]
             user = match["user"]
             dir_name = match["directory"]
@@ -1101,6 +1218,12 @@ class SlskdArtistScraper:
                 try:
                     self.client.enqueue_download(user, files_to_enqueue)
                     queued_dirs_set.add(dir_key)
+                    queued_files_set.add(full_fn)
+                    if norm_track:
+                        queued_track_keys.add(norm_track)
+                    if clean_track:
+                        queued_track_keys.add(clean_track)
+
                     self.queued_directories.append({
                         "type": "Standalone Track",
                         "title": item["track_title"],

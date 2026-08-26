@@ -481,15 +481,17 @@ class ArtistDownloadOrchestrator:
 
         title = meta.get("title", "")
         album = meta.get("album", "")
-        norm_album = normalize_text(album or title)
+        raw_album = album or title
+        norm_album = normalize_text(raw_album)
+        clean_album = re.sub(r"\b(ep|lp|single|album|remaster|remastered|vip|vol\s*\d+|edition)\b", "", norm_album).strip()
         artist = meta.get("artist", "").lower()
         tracks = meta.get("tracks", [])
 
-        # Check if entire release was satisfied on server or Soulseek
-        if norm_album in self.server_found_releases:
-            return True, f"Release '{album or title}' is already fully present on server library"
-        if norm_album in self.slskd_found_releases:
-            return True, f"Release '{album or title}' is already verified & queued via Soulseek (slskd)"
+        # Check if entire release was satisfied on server or Soulseek (exact or fuzzy)
+        if norm_album in self.server_found_releases or any((len(r) >= 4 and (r in norm_album or norm_album in r or clean_album == r)) for r in self.server_found_releases):
+            return True, f"Release '{raw_album}' is already fully present on server library"
+        if norm_album in self.slskd_found_releases or any((len(r) >= 4 and (r in norm_album or norm_album in r or clean_album == r)) for r in self.slskd_found_releases):
+            return True, f"Release '{raw_album}' is already verified & queued via Soulseek (slskd)"
 
         # Check tracks by target artist
         is_target_artist_rel = any(a in artist or a in unidecode(artist) for a in self.catalog.aliases)
@@ -505,7 +507,7 @@ class ArtistDownloadOrchestrator:
             artist_tracks = tracks
 
         if artist_tracks:
-            all_present = True
+            satisfied_cnt = 0
             for t in artist_tracks:
                 norm_t = normalize_text(t.get("title", ""))
                 clean_t = strip_track_number_and_artist(t.get("title", ""))
@@ -521,12 +523,11 @@ class ArtistDownloadOrchestrator:
                     norm_clean in self.slskd_found_tracks or
                     any(norm_clean == k or norm_clean in k for k in self.slskd_found_tracks)
                 )
-                if not (track_on_server or track_on_slsk):
-                    all_present = False
-                    break
+                if track_on_server or track_on_slsk:
+                    satisfied_cnt += 1
 
-            if all_present:
-                return True, f"All {len(artist_tracks)} artist track(s) from '{title}' are already satisfied (Server / Soulseek)"
+            if satisfied_cnt > 0 and (satisfied_cnt == len(artist_tracks) or (len(artist_tracks) >= 3 and satisfied_cnt / len(artist_tracks) >= 0.80)):
+                return True, f"{satisfied_cnt}/{len(artist_tracks)} artist track(s) from '{title}' are already satisfied (Server / Soulseek)"
 
         return False, ""
 
@@ -551,10 +552,11 @@ class ArtistDownloadOrchestrator:
         # Check if matching release tracks are already satisfied on server or Soulseek
         for rel in self.catalog.releases:
             norm_rel = normalize_text(rel.get("title", ""))
-            if norm_rel and norm_rel in normalize_text(combined):
-                if norm_rel in self.server_found_releases:
+            clean_rel = re.sub(r"\b(ep|lp|single|album|remaster|remastered|vip|vol\s*\d+|edition)\b", "", norm_rel).strip()
+            if norm_rel and (norm_rel in normalize_text(combined) or (len(clean_rel) >= 4 and clean_rel in normalize_text(combined))):
+                if norm_rel in self.server_found_releases or any((len(r) >= 4 and (r in norm_rel or norm_rel in r)) for r in self.server_found_releases):
                     return True, f"Release '{rel.get('title')}' is already on server library"
-                if norm_rel in self.slskd_found_releases:
+                if norm_rel in self.slskd_found_releases or any((len(r) >= 4 and (r in norm_rel or norm_rel in r)) for r in self.slskd_found_releases):
                     return True, f"Release '{rel.get('title')}' is already verified & queued via Soulseek (slskd)"
 
         return False, ""

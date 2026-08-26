@@ -535,14 +535,19 @@ class ArtistCatalog:
                 elif u.startswith('http') and not any(ign in u for ign in ('discogs.com', 'rateyourmusic.com', 'wikidata.org', 'imdb.com', 'twitter.com', 'instagram.com')):
                     if u not in self.web_urls: self.web_urls.append(u)
 
-            self.releases.append({
+            rel_dict = {
                 "id": rel_id,
+                "release_group_id": rg_id,
                 "title": rel_title,
+                "norm_title": normalize_text(rel_title),
                 "type": rg_type,
                 "date": rel_date,
                 "is_va": False,
                 "urls": rel_urls
-            })
+            }
+            # Deduplicate primary release entries by normalized title / release-group
+            if not any(not r["is_va"] and (r["norm_title"] == rel_dict["norm_title"] or (rg_id and r.get("release_group_id") == rg_id)) for r in self.releases):
+                self.releases.append(rel_dict)
 
             for m in rel.get('medium-list', []):
                 for t in m.get('track-list', []):
@@ -617,14 +622,19 @@ class ArtistCatalog:
                 elif u.startswith('http') and not any(ign in u for ign in ('discogs.com', 'rateyourmusic.com', 'wikidata.org', 'imdb.com', 'twitter.com', 'instagram.com')):
                     if u not in self.web_urls: self.web_urls.append(u)
 
-            self.releases.append({
+            comp_dict = {
                 "id": rel_id,
+                "release_group_id": rg_id,
                 "title": rel_title,
+                "norm_title": normalize_text(rel_title),
                 "type": f"Compilation ({rg_type})",
                 "date": rel_date,
                 "is_va": True,
                 "urls": rel_urls
-            })
+            }
+            # Deduplicate compilation entries by normalized title / release-group
+            if not any(r["is_va"] and (r["norm_title"] == comp_dict["norm_title"] or (rg_id and r.get("release_group_id") == rg_id)) for r in self.releases):
+                self.releases.append(comp_dict)
 
             for m in rel.get('medium-list', []):
                 for t in m.get('track-list', []):
@@ -732,6 +742,16 @@ class ArtistCatalog:
                     title_to_key[norm_t] = rec_id
 
         self.tracks = list(rec_map.values())
+
+    @property
+    def primary_releases(self) -> List[Dict[str, Any]]:
+        """Returns only primary releases by the artist (excluding compilations/VA)."""
+        return [r for r in self.releases if not r.get("is_va", False)]
+
+    @property
+    def compilation_releases(self) -> List[Dict[str, Any]]:
+        """Returns only compilation/split releases where the artist is a track artist."""
+        return [r for r in self.releases if r.get("is_va", False)]
 
 
 # ==============================================================================

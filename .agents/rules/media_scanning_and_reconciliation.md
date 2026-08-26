@@ -55,3 +55,19 @@ Guidelines and invariants for audio file discovery, metadata tag parsing, persis
   - Chunk download enqueue requests into batches of $\le 50$ files with $\ge 30$s timeout to prevent HTTP timeout errors.
   - Ensure all standard library modules (`re`, `urllib.parse`) are explicitly imported at the top of client modules.
 
+## 7. Strict Release, Container & Audio Format Deduplication Invariants
+- **Catalog Release Group & Normalized Title Deduplication**:
+  - MusicBrainz catalogs must deduplicate release entries by `(is_va, normalize_text(title), release_group_id)`. Multiple editions (e.g. CD vs Bandcamp Web vs Remasters) must not produce duplicate release objects or evaluation loops.
+  - Primary releases (`is_va=False`) and compilation releases (`is_va=True`) must be strictly segregated. Primary reconcilers must only evaluate primary releases; compilation reconcilers must evaluate compilations once without re-evaluating primary albums.
+- **Cross-Stage Track Coverage & Spillover Prevention**:
+  - When a primary release or compilation folder is matched with `match_ratio >= min_match_ratio`, mark all of its constituent track titles as covered in `covered_track_titles`.
+  - Standalone reconcilers must never search for leftover track variations of already matched/queued releases to prevent secondary single downloads in alternative formats.
+- **Release & Track-Level Queue Deduplication**:
+  - Download queue engines must maintain `queued_release_keys` and `queued_track_keys` in addition to directory keys `(user, dir_name)`.
+  - Never queue multiple peer directories for the same release across different peers or formats (e.g., FLAC directory vs MP3 directory). Prioritize preferred audio formats (e.g. lossless FLAC) and queue exactly one candidate directory per release.
+- **Fuzzy Platform Title Skipping**:
+  - Bandcamp, MediaFire, Archive.org, and web scrapers must use fuzzy normalized title matching (stripping `[EP]`, `[LP]`, `Single`, `Remaster`, `VIP`, etc.) against server and queued releases, skipping downloads when $\ge 80\%$ of artist tracks are already present or queued.
+- **Intra-Directory Audio Container Conflict Safety**:
+  - Stream fallback downloaders (e.g. Bandcamp MP3-128 stream fallback) must check if ANY supported audio file (`.flac`, `.wav`, `.m4a`, `.mp3`, etc.) already exists for that track index/title before writing fallback MP3 stream files.
+
+
