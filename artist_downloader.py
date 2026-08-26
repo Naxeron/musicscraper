@@ -392,7 +392,15 @@ class ArtistDownloadOrchestrator:
             full_scan=False,
             threads=self.threads
         )
-        self.server_tracks = scanner.scan()
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeElapsedColumn(),
+            console=console
+        ) as progress:
+            task_id = progress.add_task("[cyan]Scanning library...", total=None)
+            self.server_tracks = scanner.scan(progress=progress, task_id=task_id)
 
         reconciler = DiscographyReconciler(catalog=self.catalog, local_tracks=self.server_tracks)
         found_items, _ = reconciler.reconcile()
@@ -844,25 +852,33 @@ class ArtistDownloadOrchestrator:
         console.print("\n[cyan]Stage 4: Auditing downloaded tracks against MusicBrainz discography...[/cyan]")
 
         local_tracks = []
-        if self.artist_output_dir and self.artist_output_dir.exists():
-            scanner = AudioFileScanner(
-                music_dir=str(self.artist_output_dir),
-                catalog=self.catalog,
-                full_scan=True,
-                threads=self.threads
-            )
-            local_tracks.extend(scanner.scan())
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeElapsedColumn(),
+            console=console
+        ) as progress:
+            if self.artist_output_dir and self.artist_output_dir.exists():
+                scanner = AudioFileScanner(
+                    music_dir=str(self.artist_output_dir),
+                    catalog=self.catalog,
+                    full_scan=True,
+                    threads=self.threads
+                )
+                task_id = progress.add_task(f"[cyan]Scanning output folder {self.artist_output_dir.name}...", total=None)
+                local_tracks.extend(scanner.scan(progress=progress, task_id=task_id))
 
-        # If user also provided an existing music directory, scan it (READ-ONLY) to combine coverage
-        if self.music_dir and self.music_dir.exists() and self.music_dir != self.artist_output_dir:
-            console.print(f"[dim]Cross-referencing with existing music library at {self.music_dir} (Read-Only)...[/dim]")
-            ext_scanner = AudioFileScanner(
-                music_dir=str(self.music_dir),
-                catalog=self.catalog,
-                full_scan=False,
-                threads=self.threads
-            )
-            local_tracks.extend(ext_scanner.scan())
+            # If user also provided an existing music directory, scan it (READ-ONLY) to combine coverage
+            if self.music_dir and self.music_dir.exists() and self.music_dir != self.artist_output_dir:
+                ext_scanner = AudioFileScanner(
+                    music_dir=str(self.music_dir),
+                    catalog=self.catalog,
+                    full_scan=False,
+                    threads=self.threads
+                )
+                task_id = progress.add_task(f"[cyan]Scanning library {self.music_dir.name}...", total=None)
+                local_tracks.extend(ext_scanner.scan(progress=progress, task_id=task_id))
 
         # Reconcile tracks
         reconciler = DiscographyReconciler(catalog=self.catalog, local_tracks=local_tracks)

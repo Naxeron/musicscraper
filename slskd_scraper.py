@@ -447,7 +447,16 @@ class SlskdArtistScraper:
             full_scan=False,
             threads=self.threads
         )
-        local_tracks = scanner.scan()
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeElapsedColumn(),
+            console=console
+        ) as progress:
+            task_id = progress.add_task("[cyan]Scanning library...", total=None)
+            local_tracks = scanner.scan(progress=progress, task_id=task_id)
 
         reconciler = DiscographyReconciler(catalog=self.catalog, local_tracks=local_tracks)
         found_items, _ = reconciler.reconcile()

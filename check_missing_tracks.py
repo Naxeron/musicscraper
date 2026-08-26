@@ -28,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 from typing import Dict, List, Set, Tuple, Optional, Any
 
+import sqlite3
 import requests
 import musicbrainzngs
 import mutagen
@@ -62,13 +63,36 @@ AUDIO_EXTENSIONS = {
 
 # Compilation / VA Directory Indicators
 VA_DIR_MARKERS = {
-    'various', 'va', 'compilation', 'compilations', 'split',
-    'soundtrack', 'soundtracks', 'ost', 'various artists', 'sampler',
-    'anthology', 'tribute', 'tributes'
+    'various', 'various artists', 'compilation', 'compilations', 'split',
+    'soundtrack', 'soundtracks', 'ost', 'sampler', 'anthology', 'tribute', 'tributes'
 }
 
-# Default Cache Directory
+# Generic words / track markers / common words that should not trigger loose filename matching
+GENERIC_OR_COMMON_WORDS = {
+    # Common track descriptors & markers
+    "intro", "outro", "interlude", "prelude", "untitled", "bonus", "bonus track",
+    "track", "instrumental", "opening", "ending", "skit", "silence", "noise",
+    "demo", "mix", "remix", "version", "edit", "side a", "side b", "vip", "theme",
+    "audio", "original", "cover", "live", "sampler", "compilation", "single", "ep",
+    "album", "lp", "ost", "soundtrack", "part", "vol", "volume", "chapter", "reissue",
+    # Common single English words prone to false positives when matching loose filenames
+    "shit", "dreams", "sleep", "everyday", "scream", "fly", "sin", "jump", "angels",
+    "love", "love you", "alone", "night", "rain", "home", "time", "summer", "winter",
+    "spring", "fall", "sky", "sun", "moon", "star", "fire", "water", "blue", "red",
+    "black", "white", "run", "walk", "fall", "rise", "stay", "go", "come", "life",
+    "death", "dark", "light", "space", "mind", "soul", "heart", "eyes", "girl", "boy",
+    "friends", "forever", "today", "tomorrow", "yesterday", "world", "hope", "lost",
+    # Electronic music genre keywords
+    "breakcore", "lolicore", "speedcore", "hardcore", "frenchcore", "nightcore",
+    "jcore", "j-core", "extratone", "splittercore", "terrorcore", "mashcore",
+    "gabber", "gabba", "dancecore", "flashcore", "noise", "harsh noise", "ambient",
+    "vaporwave", "chiptune", "electronic", "techno", "trance", "house", "dubstep",
+    "dnb", "drum and bass", "jungle", "rave", "rave music", "acid"
+}
+
+# Default Cache Directory & Audio Cache Database
 DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/musicscraper/mb_cache")
+DEFAULT_AUDIO_CACHE_DB = os.path.expanduser("~/.cache/musicscraper/audio_cache.db")
 
 
 # ==============================================================================
@@ -151,47 +175,103 @@ class MusicBrainzClient:
         """
         Resolves an artist query (MBID, URL, or Name) to (mbid, canonical_name).
         """
+        query_strip = query.strip()
+        search_cache_file = self.cache_dir / "artist_search_cache.json"
+
         # 1. Check if query is a MusicBrainz URL
-        url_match = re.search(r'musicbrainz\.org/artist/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', query, re.I)
+        url_match = re.search(r'musicbrainz\.org/artist/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', query_strip, re.I)
         if url_match:
             mbid = url_match.group(1)
             artist_info = musicbrainzngs.get_artist_by_id(mbid)
             return mbid, artist_info['artist'].get('name', 'Unknown Artist')
 
         # 2. Check if query is already an MBID UUID
-        uuid_match = re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', query.strip(), re.I)
+        uuid_match = re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', query_strip, re.I)
         if uuid_match:
-            mbid = query.strip()
+            mbid = query_strip
             artist_info = musicbrainzngs.get_artist_by_id(mbid)
             return mbid, artist_info['artist'].get('name', 'Unknown Artist')
 
-        # 3. Otherwise, search by query (Lucene full text search across names, aliases, and sortnames)
-        console.print(f"[cyan]Searching MusicBrainz for artist:[/cyan] [bold]{query}[/bold]...")
+        # 3. Check persistent search query cache
+        search_cache = {}
+        if self.use_cache and search_cache_file.exists():
+            try:
+                with open(search_cache_file, "r", encoding="utf-8") as f:
+                    search_cache = json.load(f)
+                cached = search_cache.get(query_strip.lower())
+                if cached:
+                    mbid, name, disambiguation, country = cached
+                    console.print(f"[green]✔ Matched Artist (from cache):[/green] [bold]{name}[/bold]{disambiguation}{country} (MBID: {mbid})")
+                    return mbid, name
+            except Exception:
+                pass
+
+        # 4. Check cached artist files in cache_dir
+        if self.use_cache and self.cache_dir.exists():
+            try:
+                for json_file in self.cache_dir.glob("artist_*.json"):
+                    with open(json_file, "r", encoding="utf-8") as f:
+                        cached_data = json.load(f)
+                    c_artist = cached_data.get("artist", {})
+                    c_name = c_artist.get("name", "")
+                    c_mbid = c_artist.get("id", "")
+                    c_aliases = [a.get("alias", "") if isinstance(a, dict) else str(a) for a in c_artist.get("aliases", [])]
+                    if c_name.lower() == query_strip.lower() or any(a.lower() == query_strip.lower() for a in c_aliases):
+                        console.print(f"[green]✔ Matched Artist (from cache):[/green] [bold]{c_name}[/bold] (MBID: {c_mbid})")
+                        if self.use_cache:
+                            search_cache[query_strip.lower()] = [c_mbid, c_name, "", ""]
+                            try:
+                                with open(search_cache_file, "w", encoding="utf-8") as f:
+                                    json.dump(search_cache, f, indent=2)
+                            except Exception:
+                                pass
+                        return c_mbid, c_name
+            except Exception:
+                pass
+
+        # 5. Search MusicBrainz API via fast requests JSON
+        console.print(f"[cyan]Searching MusicBrainz for artist:[/cyan] [bold]{query_strip}[/bold]...")
         
         artist_list = []
+        headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION} ({APP_CONTACT})"}
         try:
-            res = musicbrainzngs.search_artists(query=query, limit=10)
-            artist_list = res.get('artist-list', [])
+            r = requests.get(
+                "https://musicbrainz.org/ws/2/artist",
+                params={"query": query_strip, "fmt": "json", "limit": 10},
+                headers=headers,
+                timeout=12
+            )
+            if r.status_code == 200:
+                artist_list = r.json().get("artists", [])
         except Exception:
             pass
 
         if not artist_list:
             try:
-                res = musicbrainzngs.search_artists(artist=query, limit=10)
+                res = musicbrainzngs.search_artists(query=query_strip, limit=10)
                 artist_list = res.get('artist-list', [])
             except Exception:
                 pass
 
         if not artist_list:
-            raise ValueError(f"No artist found on MusicBrainz matching query '{query}'.")
+            raise ValueError(f"No artist found on MusicBrainz matching query '{query_strip}'.")
 
         # Pick top match
         top_match = artist_list[0]
         mbid = top_match['id']
-        name = top_match.get('name', query)
+        name = top_match.get('name', query_strip)
         disambiguation = f" ({top_match.get('disambiguation')})" if top_match.get('disambiguation') else ""
         country = f" [{top_match.get('country')}]" if top_match.get('country') else ""
         console.print(f"[green]✔ Matched Artist:[/green] [bold]{name}[/bold]{disambiguation}{country} (MBID: {mbid})")
+
+        if self.use_cache:
+            search_cache[query_strip.lower()] = [mbid, name, disambiguation, country]
+            try:
+                with open(search_cache_file, "w", encoding="utf-8") as f:
+                    json.dump(search_cache, f, indent=2)
+            except Exception:
+                pass
+
         return mbid, name
 
     def fetch_full_discography(self, mbid: str, force_refresh: bool = False) -> Dict[str, Any]:
@@ -646,6 +726,113 @@ class ArtistCatalog:
 
 
 # ==============================================================================
+# AUDIO METADATA PERSISTENT CACHE
+# ==============================================================================
+
+class AudioMetadataCache:
+    """Lightweight persistent SQLite database cache for parsed audio file tags."""
+    def __init__(self, db_path: str = DEFAULT_AUDIO_CACHE_DB):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self._init_db()
+
+    def _init_db(self):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS audio_metadata (
+                        path TEXT PRIMARY KEY,
+                        mtime REAL,
+                        size INTEGER,
+                        data_json TEXT
+                    )
+                """)
+                conn.commit()
+        except Exception:
+            pass
+
+    def get_batch(self, file_infos: List[Tuple[str, float, int]]) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+        """
+        Takes list of (path, mtime, size).
+        Returns (cached_map, uncached_paths).
+        """
+        cached_map: Dict[str, Dict[str, Any]] = {}
+        uncached_paths: List[str] = []
+        if not file_infos:
+            return cached_map, uncached_paths
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                for i in range(0, len(file_infos), 500):
+                    chunk = file_infos[i:i+500]
+                    placeholders = ",".join(["?"] * len(chunk))
+                    paths = [p for p, _, _ in chunk]
+                    info_map = {p: (mt, sz) for p, mt, sz in chunk}
+                    cursor.execute(
+                        f"SELECT path, mtime, size, data_json FROM audio_metadata WHERE path IN ({placeholders})",
+                        paths
+                    )
+                    rows = cursor.fetchall()
+                    for p, mt, sz, dj in rows:
+                        expected_mt, expected_sz = info_map.get(p, (None, None))
+                        if expected_mt is not None and abs(mt - expected_mt) < 0.001 and sz == expected_sz:
+                            try:
+                                d = json.loads(dj)
+                                d["mb_track_ids"] = set(d.get("mb_track_ids", []))
+                                d["mb_rec_ids"] = set(d.get("mb_rec_ids", []))
+                                d["mb_artist_ids"] = set(d.get("mb_artist_ids", []))
+                                d["mb_release_ids"] = set(d.get("mb_release_ids", []))
+                                cached_map[p] = d
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+
+        for p, _, _ in file_infos:
+            if p not in cached_map:
+                uncached_paths.append(p)
+
+        return cached_map, uncached_paths
+
+    def set_batch(self, items: List[Tuple[str, float, int, Dict[str, Any]]]):
+        """Saves parsed audio tag dictionaries to SQLite database."""
+        if not items:
+            return
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                records = []
+                for p, mt, sz, data in items:
+                    data_copy = dict(data)
+                    data_copy["mb_track_ids"] = list(data.get("mb_track_ids", []))
+                    data_copy["mb_rec_ids"] = list(data.get("mb_rec_ids", []))
+                    data_copy["mb_artist_ids"] = list(data.get("mb_artist_ids", []))
+                    data_copy["mb_release_ids"] = list(data.get("mb_release_ids", []))
+                    records.append((p, mt, sz, json.dumps(data_copy)))
+                conn.executemany(
+                    "INSERT OR REPLACE INTO audio_metadata (path, mtime, size, data_json) VALUES (?, ?, ?, ?)",
+                    records
+                )
+                conn.commit()
+        except Exception:
+            pass
+
+
+def is_distinct_track_title(title_norm: str) -> bool:
+    """Determines if a normalized track title is distinct enough to safely match standalone filenames."""
+    if not title_norm or len(title_norm) < 4:
+        return False
+    if title_norm in GENERIC_OR_COMMON_WORDS:
+        return False
+    words = title_norm.split()
+    if len(words) >= 2 and len(title_norm) >= 6:
+        return True
+    if len(words) == 1 and len(title_norm) >= 8 and title_norm not in GENERIC_OR_COMMON_WORDS:
+        return True
+    return False
+
+
+# ==============================================================================
 # AUDIO LIBRARY SCANNER (OPTIMIZED FOR SSHFS / NETWORK / LOCAL)
 # ==============================================================================
 
@@ -655,34 +842,52 @@ class AudioFileScanner:
         self.catalog = catalog
         self.full_scan = full_scan
         self.threads = threads
+        self.cache = AudioMetadataCache()
 
     def scan(self, progress: Optional[Progress] = None, task_id: Optional[Any] = None) -> List[Dict[str, Any]]:
         """
-        Scans the music directory using a 2-stage fast discovery + parallel metadata extraction.
+        Scans the music directory using a 2-stage fast discovery + parallel metadata extraction
+        with persistent SQLite caching.
         """
         if not self.music_dir.exists():
             return []
 
         if progress and task_id:
-            progress.update(task_id, description="[cyan]Stage 1: Discovering audio files on disk...")
+            progress.update(task_id, description="[cyan]Stage 1: Discovering candidate audio files on disk...")
 
-        # Prepare fast substring matching lookups
-        raw_aliases = [a.lower() for a in self.catalog.aliases if len(a) >= 2]
-        uni_aliases = [unidecode(a).lower() for a in raw_aliases]
-        norm_aliases = [normalize_text(a) for a in self.catalog.aliases if len(a) >= 2]
-        
-        raw_tracks = [t["title"].lower() for t in self.catalog.tracks if t.get("title") and len(t["title"]) >= 3]
-        uni_tracks = [unidecode(t).lower() for t in raw_tracks]
-        norm_tracks = [t["norm_title"] for t in self.catalog.tracks if t.get("norm_title") and len(t["norm_title"]) >= 3]
+        # 1. Compile Artist Alias Patterns (Word boundary)
+        alias_pats = []
+        for a in self.catalog.aliases:
+            norm = normalize_text(a)
+            if norm and len(norm) >= 2:
+                alias_pats.append(re.compile(r"(?:\b|_)" + re.escape(norm) + r"(?:\b|_)", re.IGNORECASE))
 
-        all_audio_paths = []
-        candidate_paths = []
+        # 2. Compile Release Title Patterns
+        rel_pats = []
+        for rel in self.catalog.releases:
+            norm = normalize_text(rel.get("title", ""))
+            if norm and len(norm) >= 4 and norm not in GENERIC_OR_COMMON_WORDS:
+                rel_pats.append(re.compile(r"(?:\b|_)" + re.escape(norm) + r"(?:\b|_)", re.IGNORECASE))
 
-        # Stage 1: Walk directory structure (Fast scan)
+        for trk in self.catalog.tracks:
+            for rel_t in trk.get("all_releases", set()):
+                norm = normalize_text(rel_t)
+                if norm and len(norm) >= 4 and norm not in GENERIC_OR_COMMON_WORDS:
+                    rel_pats.append(re.compile(r"(?:\b|_)" + re.escape(norm) + r"(?:\b|_)", re.IGNORECASE))
+
+        # 3. Compile Distinct Track Title Patterns
+        trk_pats = []
+        for trk in self.catalog.tracks:
+            norm = trk.get("norm_title", "")
+            if is_distinct_track_title(norm):
+                trk_pats.append(re.compile(r"(?:\b|_)" + re.escape(norm) + r"(?:\b|_)", re.IGNORECASE))
+
+        candidate_paths: List[str] = []
+
+        # Stage 1: Walk directory structure (Fast targeted discovery)
         for root, dirs, files in os.walk(self.music_dir):
-            root_lower = root.lower()
-            dir_matches_artist = any(a in root_lower for a in raw_aliases) or any(u in root_lower for u in uni_aliases)
-            dir_is_va = any(vm in root_lower for vm in VA_DIR_MARKERS)
+            norm_root = normalize_text(root)
+            dir_matches = any(p.search(norm_root) for p in alias_pats) or any(p.search(norm_root) for p in rel_pats)
 
             for f in files:
                 ext = os.path.splitext(f)[1].lower()
@@ -690,20 +895,14 @@ class AudioFileScanner:
                     continue
 
                 full_path = os.path.join(root, f)
-                all_audio_paths.append(full_path)
 
-                if self.full_scan or dir_matches_artist or dir_is_va:
+                if self.full_scan or dir_matches:
                     candidate_paths.append(full_path)
                 else:
-                    f_lower = f.lower()
-                    if any(a in f_lower for a in raw_aliases) or any(u in f_lower for u in uni_aliases) or any(t in f_lower for t in raw_tracks) or any(ut in f_lower for ut in uni_tracks):
+                    norm_f = normalize_text(f)
+                    if any(p.search(norm_f) for p in alias_pats) or any(p.search(norm_f) for p in trk_pats):
                         candidate_paths.append(full_path)
-                    else:
-                        f_norm = normalize_text(f)
-                        if any(t in f_norm for t in norm_tracks):
-                            candidate_paths.append(full_path)
 
-        total_audio = len(all_audio_paths)
         total_candidates = len(candidate_paths)
 
         if progress and task_id:
@@ -714,14 +913,38 @@ class AudioFileScanner:
                 completed=0
             )
 
-        # Stage 2: Parallel metadata reading
-        local_tracks = []
-        with ThreadPoolExecutor(max_workers=self.threads) as pool:
-            for item in pool.map(self._read_audio_metadata, candidate_paths):
-                if item:
-                    local_tracks.append(item)
-                if progress and task_id:
-                    progress.advance(task_id, 1)
+        # Stage 2: Fast Cache Lookup + Parallel Metadata Extraction
+        file_infos: List[Tuple[str, float, int]] = []
+        for p in candidate_paths:
+            try:
+                st = os.stat(p)
+                file_infos.append((p, st.st_mtime, st.st_size))
+            except Exception:
+                pass
+
+        cached_map, uncached_paths = self.cache.get_batch(file_infos)
+        local_tracks: List[Dict[str, Any]] = list(cached_map.values())
+
+        if progress and task_id and cached_map:
+            progress.advance(task_id, len(cached_map))
+
+        # Parse any uncached or modified candidate files
+        if uncached_paths:
+            new_records: List[Tuple[str, float, int, Dict[str, Any]]] = []
+            with ThreadPoolExecutor(max_workers=self.threads) as pool:
+                for item in pool.map(self._read_audio_metadata, uncached_paths):
+                    if item:
+                        local_tracks.append(item)
+                        try:
+                            st = os.stat(item["path"])
+                            new_records.append((item["path"], st.st_mtime, st.st_size, item))
+                        except Exception:
+                            pass
+                    if progress and task_id:
+                        progress.advance(task_id, 1)
+
+            if new_records:
+                self.cache.set_batch(new_records)
 
         return local_tracks
 
@@ -739,55 +962,63 @@ class AudioFileScanner:
 
         try:
             mf = mutagen.File(path)
-            if mf:
-                # ID3 Tags (MP3, AIFF, WAV)
-                if hasattr(mf, 'tags') and mf.tags:
-                    for k, v in mf.tags.items():
-                        k_str = str(k).upper()
-                        v_str = str(v)
-                        if 'MUSICBRAINZ TRACK ID' in k_str or 'MUSICBRAINZ RELEASE TRACK ID' in k_str:
-                            mb_track_ids.add(v_str.strip())
-                        elif 'UFID' in k_str or 'MUSICBRAINZ RECORDING ID' in k_str:
-                            clean_ufid = re.sub(r'^[^\w\-]+', '', v_str)
-                            clean_ufid = clean_ufid.replace("http://musicbrainz.org=", "").replace("b'", "").replace("'", "")
-                            mb_rec_ids.add(clean_ufid.strip())
-                        elif 'MUSICBRAINZ ARTIST ID' in k_str or 'MUSICBRAINZ ALBUM ARTIST ID' in k_str:
-                            mb_artist_ids.add(v_str.strip())
-                        elif 'MUSICBRAINZ ALBUM ID' in k_str:
-                            mb_release_ids.add(v_str.strip())
+            if mf and hasattr(mf, "tags") and mf.tags is not None:
+                tags = mf.tags
+                if hasattr(tags, "items"):
+                    for k, v in tags.items():
+                        k_str = str(k).upper().strip()
+                        v_list = [str(x) for x in v] if isinstance(v, (list, tuple)) else [str(v)]
 
-                        if k_str in ('TPE1', 'TPE2', 'TOPE', 'TEXT', 'TCOM', 'ARTIST', 'ALBUMARTIST', 'COMPOSER', 'PERFORMER', 'ARTISTS'):
-                            artists.append(v_str)
-                        elif 'TIT2' in k_str or 'TITLE' in k_str:
-                            title = v_str
-                        elif 'TALB' in k_str or 'ALBUM' in k_str:
-                            album = v_str
-                        elif 'TRCK' in k_str or 'TRACKNUMBER' in k_str:
-                            track_number = v_str.split('/')[0].strip()
+                        # MusicBrainz Tag IDs
+                        if k_str in (
+                            "MUSICBRAINZ_TRACKID", "MUSICBRAINZ TRACK ID",
+                            "MUSICBRAINZ_RELEASETRACKID", "MUSICBRAINZ RELEASE TRACK ID",
+                            "TXXX:MUSICBRAINZ TRACK ID", "TXXX:MUSICBRAINZ RELEASE TRACK ID",
+                            "TXXX:MUSICBRAINZ/TRACK ID"
+                        ):
+                            for x in v_list:
+                                if x.strip():
+                                    mb_track_ids.add(x.strip())
+                        elif k_str in (
+                            "MUSICBRAINZ_RECORDINGID", "MUSICBRAINZ RECORDING ID",
+                            "TXXX:MUSICBRAINZ RECORDING ID", "TXXX:MUSICBRAINZ/RECORDING ID"
+                        ) or k_str.startswith("UFID"):
+                            for x in v_list:
+                                clean_ufid = re.sub(r"^[^\w\-]+", "", x).replace("http://musicbrainz.org=", "").replace("b'", "").replace("'", "").strip()
+                                if clean_ufid:
+                                    mb_rec_ids.add(clean_ufid)
+                        elif k_str in (
+                            "MUSICBRAINZ_ARTISTID", "MUSICBRAINZ ARTIST ID",
+                            "MUSICBRAINZ_ALBUMARTISTID", "MUSICBRAINZ ALBUM ARTIST ID",
+                            "TXXX:MUSICBRAINZ ARTIST ID", "TXXX:MUSICBRAINZ ALBUM ARTIST ID"
+                        ):
+                            for x in v_list:
+                                if x.strip():
+                                    mb_artist_ids.add(x.strip())
+                        elif k_str in (
+                            "MUSICBRAINZ_ALBUMID", "MUSICBRAINZ ALBUM ID",
+                            "TXXX:MUSICBRAINZ ALBUM ID"
+                        ):
+                            for x in v_list:
+                                if x.strip():
+                                    mb_release_ids.add(x.strip())
 
-                # Vorbis / FLAC / Opus Tags
-                if hasattr(mf, 'items'):
-                    for k, v in mf.items():
-                        k_str = str(k).upper()
-                        v_str = " / ".join(str(x) for x in v) if isinstance(v, list) else str(v)
-
-                        if 'MUSICBRAINZ_TRACKID' in k_str or 'MUSICBRAINZ_RELEASETRACKID' in k_str:
-                            mb_track_ids.add(v_str.strip())
-                        elif 'MUSICBRAINZ_RECORDINGID' in k_str:
-                            mb_rec_ids.add(v_str.strip())
-                        elif 'MUSICBRAINZ_ARTISTID' in k_str or 'MUSICBRAINZ_ALBUMARTISTID' in k_str:
-                            mb_artist_ids.add(v_str.strip())
-                        elif 'MUSICBRAINZ_ALBUMID' in k_str:
-                            mb_release_ids.add(v_str.strip())
-
-                        if k_str in ('ARTIST', 'ALBUMARTIST', 'COMPOSER', 'PERFORMER', 'ARTISTS'):
-                            artists.append(v_str)
-                        elif k_str == 'TITLE':
-                            title = v_str
-                        elif k_str == 'ALBUM':
-                            album = v_str
-                        elif k_str == 'TRACKNUMBER':
-                            track_number = v_str.split('/')[0].strip()
+                        # Core Metadata (Exact ID3 / Vorbis matching to avoid ReplayGain overwrite)
+                        if k_str in ("TIT2", "TITLE", "\xa9NAM", "TXXX:TITLE") and not title:
+                            title = v_list[0].strip() if v_list else ""
+                        elif k_str in ("TALB", "ALBUM", "\xa9ALB", "TXXX:ALBUM") and not album:
+                            album = v_list[0].strip() if v_list else ""
+                        elif k_str in ("TRCK", "TRACKNUMBER", "TXXX:TRACKNUMBER") and not track_number:
+                            raw_trck = v_list[0].strip() if v_list else ""
+                            track_number = raw_trck.split("/")[0].strip()
+                        elif k_str in (
+                            "TPE1", "TPE2", "TOPE", "TEXT", "TCOM", "ARTIST",
+                            "ALBUMARTIST", "COMPOSER", "PERFORMER", "ARTISTS", "\xa9ART", "AART"
+                        ):
+                            for x in v_list:
+                                x_clean = x.strip()
+                                if x_clean and x_clean not in artists:
+                                    artists.append(x_clean)
         except Exception:
             pass
 
@@ -928,6 +1159,7 @@ class DiscographyReconciler:
                 continue
 
             mb_title_norm = mb["norm_title"]
+            mb_rel_norm = mb.get("norm_release", "")
             if not mb_title_norm or len(mb_title_norm) < 3:
                 continue
 
@@ -938,11 +1170,23 @@ class DiscographyReconciler:
                 lt_title_norm = lt["norm_title"]
                 path_norm = normalize_text(lt["path"])
 
+                # Verify artist or release association to avoid matching other artists in compilation folders
+                has_artist_tag = any(
+                    any(alias in a.lower() or alias in unidecode(a.lower()) for alias in artist_aliases)
+                    for a in lt.get("artists", [])
+                )
+                has_artist_path = any(alias in path_norm for alias in artist_aliases)
+                has_rel_match = bool(mb_rel_norm and (mb_rel_norm in path_norm or mb_rel_norm == lt.get("norm_album", "")))
+
+                # Require artist alias or release album verification for fuzzy match
+                if not (has_artist_tag or has_artist_path or has_rel_match or mb.get("release_title") == "Standalone / Other"):
+                    continue
+
                 title_in_path = len(mb_title_norm) >= 5 and mb_title_norm in path_norm
                 title_in_tag = len(mb_title_norm) >= 5 and mb_title_norm in lt_title_norm
                 sim = calculate_similarity(mb_title_norm, lt_title_norm)
 
-                if sim > 0.82 or title_in_path or title_in_tag:
+                if sim > 0.85 or (sim > 0.75 and (has_artist_tag or has_artist_path)) or title_in_path or title_in_tag:
                     self.matched[i] = (lt, f"Fuzzy Match ({int(sim*100)}%)")
                     matched_mb_indices.add(i)
                     matched_local_paths.add(lt["path"])
