@@ -54,6 +54,7 @@ from check_missing_tracks import (
     MusicBrainzClient,
     ArtistCatalog,
     AudioFileScanner,
+    NavidromeScanner,
     DiscographyReconciler,
     ReportGenerator,
     normalize_text,
@@ -381,17 +382,19 @@ class ArtistDownloadOrchestrator:
             console.print(f"[bold red]slskd priority discovery error:[/bold red] {e}")
 
     def _prescan_server_library(self):
-        """Scans the existing server library (Read-Only) to detect tracks and releases already present."""
-        if not self.music_dir or not self.music_dir.exists():
+        """Scans the existing server library (Read-Only) and/or Navidrome to detect tracks and releases already present."""
+        nav_url = os.getenv("NAVIDROME_URL", os.getenv("SUBSONIC_URL", "")).strip()
+        nav_user = os.getenv("NAVIDROME_USERNAME", os.getenv("SUBSONIC_USERNAME", "")).strip()
+        nav_pass = os.getenv("NAVIDROME_PASSWORD", os.getenv("SUBSONIC_PASSWORD", "")).strip()
+        has_nav = bool(nav_url and nav_user and nav_pass)
+        has_local = bool(self.music_dir and self.music_dir.exists())
+
+        if not has_nav and not has_local:
             return
 
-        console.print(f"\n[cyan]Pre-scanning server music library at {self.music_dir} (Read-Only)...[/cyan]")
-        scanner = AudioFileScanner(
-            music_dir=str(self.music_dir),
-            catalog=self.catalog,
-            full_scan=False,
-            threads=self.threads
-        )
+        self.server_tracks = []
+        seen_paths = set()
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -399,8 +402,46 @@ class ArtistDownloadOrchestrator:
             TimeElapsedColumn(),
             console=console
         ) as progress:
-            task_id = progress.add_task("[cyan]Scanning library...", total=None)
-            self.server_tracks = scanner.scan(progress=progress, task_id=task_id)
+            if has_nav:
+                task_id = progress.add_task(f"[cyan]Pre-scanning Navidrome ({nav_url})...", total=None)
+                try:
+                    nav_scanner = NavidromeScanner(
+                        base_url=nav_url,
+                        username=nav_user,
+                        password=nav_pass,
+                        catalog=self.catalog
+                    )
+                    nav_tracks = nav_scanner.scan(progress=progress, task_id=task_id)
+                    for nt in nav_tracks:
+                        p = nt["path"]
+                        if p not in seen_paths:
+                            self.server_tracks.append(nt)
+                            seen_paths.add(p)
+                    progress.update(task_id, description=f"[green]✔ Retrieved {len(nav_tracks)} tracks from Navidrome server", completed=1, total=1)
+                except Exception as e:
+                    console.print(f"[yellow]Warning: Navidrome pre-scan error:[/yellow] {e}")
+
+            if has_local:
+                task_id = progress.add_task(f"[cyan]Pre-scanning local library ({self.music_dir})...", total=None)
+                scanner = AudioFileScanner(
+                    music_dir=str(self.music_dir),
+                    catalog=self.catalog,
+                    full_scan=False,
+                    threads=self.threads
+                )
+                try:
+                    disk_tracks = scanner.scan(progress=progress, task_id=task_id)
+                    for dt in disk_tracks:
+                        p = dt["path"]
+                        if p not in seen_paths:
+                            self.server_tracks.append(dt)
+                            seen_paths.add(p)
+                    progress.update(task_id, description=f"[green]✔ Parsed {len(disk_tracks)} audio files from local library", completed=1, total=1)
+                except Exception as e:
+                    console.print(f"[yellow]Warning: Local library pre-scan error:[/yellow] {e}")
+
+        if not self.server_tracks:
+            return
 
         reconciler = DiscographyReconciler(catalog=self.catalog, local_tracks=self.server_tracks)
         found_items, _ = reconciler.reconcile()
@@ -414,12 +455,13 @@ class ArtistDownloadOrchestrator:
             for rid in mb.get("recording_ids", []):
                 self.server_found_rec_ids.add(rid)
 
-        # Check for DCKS codes in server directory structure
-        for root, dirs, _ in os.walk(self.music_dir):
-            for d in dirs:
-                m = re.search(r"dcks-\d+", d, re.IGNORECASE)
-                if m:
-                    self.server_dcks_codes.add(m.group(0).lower())
+        # Check for DCKS codes in server directory structure if local path exists
+        if has_local:
+            for root, dirs, _ in os.walk(self.music_dir):
+                for d in dirs:
+                    m = re.search(r"dcks-\d+", d, re.IGNORECASE)
+                    if m:
+                        self.server_dcks_codes.add(m.group(0).lower())
 
         # Check which releases are already fully satisfied on server
         for rel in self.catalog.releases:

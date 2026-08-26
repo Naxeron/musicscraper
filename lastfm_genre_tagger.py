@@ -1161,7 +1161,9 @@ class GenreTaggerEngine:
                         audio_files.append(Path(root) / f)
 
         if not audio_files:
-            console.print(f"[yellow]No audio files found in {target_path}[/yellow]")
+            console.print(f"[bold yellow]⚠ Warning: No audio files found in {target_path}[/bold yellow]")
+            if not target_path.is_file() and (str(target_path).startswith("/mnt") or str(target_path).startswith("/media")):
+                console.print(f"[yellow]  ↳ If '{target_path}' is an SSHFS/NFS/Samba network share, make sure it is mounted after rebooting.[/yellow]")
             return []
 
         console.print(f"[cyan]Found {len(audio_files)} audio file(s) to process in:[/cyan] [bold]{target_path}[/bold]")

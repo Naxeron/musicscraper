@@ -158,6 +158,8 @@ def main():
     print("\n" + "=" * 65)
     action_word = "Would delete" if is_dry_run else "Deleted"
     print(f"Summary: {action_word} {len(deleted)} of {total_scanned} scanned folder(s).")
+    if total_scanned == 0 and (target_dir.startswith("/mnt") or target_dir.startswith("/media")):
+        print(f"Notice:  0 subfolders found. If '{target_dir}' is a network mount (SSHFS/NFS), check if it is mounted.")
     if is_dry_run and deleted:
         print("To delete these folders, re-run with: python3 clean_empty_folders.py --force")
     print("=" * 65)

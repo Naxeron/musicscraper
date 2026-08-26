@@ -45,6 +45,7 @@ from check_missing_tracks import (
     MusicBrainzClient,
     ArtistCatalog,
     AudioFileScanner,
+    NavidromeScanner,
     DiscographyReconciler,
     ReportGenerator,
     normalize_text,
@@ -436,17 +437,18 @@ class SlskdArtistScraper:
         }
 
     def _prescan_library(self):
-        """Scans local music library to avoid downloading releases already in collection."""
-        if not self.music_dir or not self.music_dir.exists():
+        """Scans local music library and/or Navidrome server to avoid downloading releases already in collection."""
+        nav_url = os.getenv("NAVIDROME_URL", os.getenv("SUBSONIC_URL", "")).strip()
+        nav_user = os.getenv("NAVIDROME_USERNAME", os.getenv("SUBSONIC_USERNAME", "")).strip()
+        nav_pass = os.getenv("NAVIDROME_PASSWORD", os.getenv("SUBSONIC_PASSWORD", "")).strip()
+        has_nav = bool(nav_url and nav_user and nav_pass)
+        has_local = bool(self.music_dir and self.music_dir.exists())
+
+        if not has_nav and not has_local:
             return
 
-        console.print(f"\n[cyan]Pre-scanning local music library at {self.music_dir} (Read-Only)...[/cyan]")
-        scanner = AudioFileScanner(
-            music_dir=str(self.music_dir),
-            catalog=self.catalog,
-            full_scan=False,
-            threads=self.threads
-        )
+        local_tracks: List[Dict[str, Any]] = []
+        seen_paths: Set[str] = set()
 
         with Progress(
             SpinnerColumn(),
@@ -455,8 +457,46 @@ class SlskdArtistScraper:
             TimeElapsedColumn(),
             console=console
         ) as progress:
-            task_id = progress.add_task("[cyan]Scanning library...", total=None)
-            local_tracks = scanner.scan(progress=progress, task_id=task_id)
+            if has_nav:
+                task_id = progress.add_task(f"[cyan]Pre-scanning Navidrome ({nav_url})...", total=None)
+                try:
+                    nav_scanner = NavidromeScanner(
+                        base_url=nav_url,
+                        username=nav_user,
+                        password=nav_pass,
+                        catalog=self.catalog
+                    )
+                    nav_tracks = nav_scanner.scan(progress=progress, task_id=task_id)
+                    for nt in nav_tracks:
+                        p = nt["path"]
+                        if p not in seen_paths:
+                            local_tracks.append(nt)
+                            seen_paths.add(p)
+                    progress.update(task_id, description=f"[green]✔ Retrieved {len(nav_tracks)} tracks from Navidrome server", completed=1, total=1)
+                except Exception as e:
+                    console.print(f"[yellow]Warning: Navidrome pre-scan error:[/yellow] {e}")
+
+            if has_local:
+                task_id = progress.add_task(f"[cyan]Pre-scanning local library ({self.music_dir})...", total=None)
+                scanner = AudioFileScanner(
+                    music_dir=str(self.music_dir),
+                    catalog=self.catalog,
+                    full_scan=False,
+                    threads=self.threads
+                )
+                try:
+                    disk_tracks = scanner.scan(progress=progress, task_id=task_id)
+                    for dt in disk_tracks:
+                        p = dt["path"]
+                        if p not in seen_paths:
+                            local_tracks.append(dt)
+                            seen_paths.add(p)
+                    progress.update(task_id, description=f"[green]✔ Parsed {len(disk_tracks)} audio files from local library", completed=1, total=1)
+                except Exception as e:
+                    console.print(f"[yellow]Warning: Local library pre-scan error:[/yellow] {e}")
+
+        if not local_tracks:
+            return
 
         reconciler = DiscographyReconciler(catalog=self.catalog, local_tracks=local_tracks)
         found_items, _ = reconciler.reconcile()
@@ -475,7 +515,7 @@ class SlskdArtistScraper:
             if rel_tracks and all(t.get("norm_title") in self.local_found_map for t in rel_tracks):
                 self.local_found_releases.add(norm_rel)
 
-        console.print(f"[green]✔ Local Library Status:[/green] [bold]{len(found_items)}[/bold] artist tracks / [bold]{len(self.local_found_releases)}[/bold] releases already in library.")
+        console.print(f"[green]✔ Library Status:[/green] [bold]{len(found_items)}[/bold] artist tracks / [bold]{len(self.local_found_releases)}[/bold] releases already in library.")
 
     def _generate_all_search_queries(self) -> List[str]:
         """Generates a high-yield, curated list of prioritized search queries across the artist catalog."""

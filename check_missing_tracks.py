@@ -23,6 +23,11 @@ import json
 import time
 import logging
 import argparse
+import hashlib
+import random
+import string
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
@@ -33,6 +38,7 @@ import requests
 import musicbrainzngs
 import mutagen
 from unidecode import unidecode
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -40,6 +46,9 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeEl
 from rich.text import Text
 from rich.tree import Tree
 from rich import box
+
+# Load environment variables (.env)
+load_dotenv()
 
 # Silence noisy third-party loggers (e.g. musicbrainzngs schema parsing notices, urllib3)
 logging.getLogger("musicbrainzngs").setLevel(logging.WARNING)
@@ -1038,8 +1047,171 @@ class AudioFileScanner:
             "mb_track_ids": mb_track_ids,
             "mb_rec_ids": mb_rec_ids,
             "mb_artist_ids": mb_artist_ids,
-            "mb_release_ids": mb_release_ids
+            "mb_release_ids": mb_release_ids,
+            "source": "local"
         }
+
+
+# ==============================================================================
+# NAVIDROME / SUBSONIC REMOTE LIBRARY SCANNER
+# ==============================================================================
+
+class NavidromeScanner:
+    def __init__(
+        self,
+        base_url: str,
+        username: str,
+        password: str,
+        catalog: ArtistCatalog,
+        timeout: int = 15
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.username = username
+        self.password = password
+        self.catalog = catalog
+        self.timeout = timeout
+
+    def test_connection(self) -> bool:
+        """Pings the Navidrome/Subsonic server to verify connectivity and credentials."""
+        res = self._api_request("ping", {})
+        return res is not None
+
+    def _api_request(self, endpoint: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        salt = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+        token = hashlib.md5((self.password + salt).encode("utf-8")).hexdigest()
+
+        req_params = {
+            "u": self.username,
+            "t": token,
+            "s": salt,
+            "v": "1.16.1",
+            "c": "musicscraper",
+            "f": "json"
+        }
+        req_params.update(params)
+
+        url = f"{self.base_url}/rest/{endpoint}.view?{urllib.parse.urlencode(req_params)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "musicscraper/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                sub_resp = data.get("subsonic-response", {})
+                if sub_resp.get("status") == "ok":
+                    return sub_resp
+        except Exception:
+            pass
+        return None
+
+    def scan(self, progress: Optional[Progress] = None, task_id: Optional[Any] = None) -> List[Dict[str, Any]]:
+        """
+        Queries Navidrome Subsonic API for:
+        1. Artist aliases & transliterations via search3.view
+        2. Exact MusicBrainz Artist ID (if indexed) via getArtists.view / getArtist.view
+        3. Primary release titles & distinct track titles
+        """
+        if progress and task_id:
+            progress.update(task_id, description=f"[cyan]Connecting to Navidrome server ({self.base_url})...")
+
+        found_songs: Dict[str, Dict[str, Any]] = {}
+        processed_queries: Set[str] = set()
+
+        # 1. Search by artist aliases
+        for a in self.catalog.aliases:
+            clean_a = a.strip()
+            if clean_a and len(clean_a) >= 2 and clean_a.lower() not in processed_queries:
+                processed_queries.add(clean_a.lower())
+                if progress and task_id:
+                    progress.update(task_id, description=f"[cyan]Navidrome: Searching for artist '{clean_a}'...")
+                res = self._api_request("search3", {
+                    "query": clean_a,
+                    "artistCount": 20,
+                    "albumCount": 50,
+                    "songCount": 500
+                })
+                if res:
+                    for s in res.get("searchResult3", {}).get("song", []):
+                        sid = s.get("id") or s.get("path")
+                        if sid:
+                            found_songs[sid] = s
+
+        # 2. Check for exact MBID match in Navidrome artist catalog
+        if self.catalog.mbid:
+            try:
+                artists_res = self._api_request("getArtists", {})
+                if artists_res:
+                    for idx in artists_res.get("artists", {}).get("index", []):
+                        for artist in idx.get("artist", []):
+                            if artist.get("musicBrainzId") == self.catalog.mbid:
+                                artist_id = artist.get("id")
+                                if artist_id:
+                                    artist_detail = self._api_request("getArtist", {"id": artist_id})
+                                    if artist_detail:
+                                        for alb in artist_detail.get("artist", {}).get("album", []):
+                                            alb_id = alb.get("id")
+                                            if alb_id:
+                                                alb_detail = self._api_request("getAlbum", {"id": alb_id})
+                                                if alb_detail:
+                                                    for s in alb_detail.get("album", {}).get("song", []):
+                                                        sid = s.get("id") or s.get("path")
+                                                        if sid:
+                                                            found_songs[sid] = s
+            except Exception:
+                pass
+
+        # 3. Search for primary release titles (e.g. non-compilation albums)
+        for rel in self.catalog.releases:
+            rel_title = rel.get("title", "").strip()
+            norm_rel = normalize_text(rel_title)
+            if norm_rel and len(norm_rel) >= 5 and norm_rel not in GENERIC_OR_COMMON_WORDS and norm_rel not in processed_queries:
+                processed_queries.add(norm_rel)
+                res = self._api_request("search3", {
+                    "query": rel_title,
+                    "artistCount": 5,
+                    "albumCount": 20,
+                    "songCount": 200
+                })
+                if res:
+                    for s in res.get("searchResult3", {}).get("song", []):
+                        sid = s.get("id") or s.get("path")
+                        if sid:
+                            found_songs[sid] = s
+
+        # Convert to local_tracks schema
+        nav_tracks: List[Dict[str, Any]] = []
+        for s in found_songs.values():
+            title = s.get("title", "")
+            album = s.get("album", "")
+            track_num = str(s.get("track", ""))
+            path = s.get("path", "")
+            artists = [s.get("artist", "")]
+            for a in s.get("artists", []):
+                name = a.get("name", "")
+                if name and name not in artists:
+                    artists.append(name)
+
+            mb_rec_ids: Set[str] = set()
+            mb_trk_ids: Set[str] = set()
+            mbid_s = s.get("musicBrainzId", "")
+            if mbid_s:
+                mb_rec_ids.add(mbid_s)
+
+            nav_tracks.append({
+                "path": path,
+                "filename": os.path.basename(path),
+                "title": title or "",
+                "norm_title": normalize_text(title),
+                "album": album or "",
+                "norm_album": normalize_text(album),
+                "track_number": track_num or "",
+                "artists": artists,
+                "mb_track_ids": mb_trk_ids,
+                "mb_rec_ids": mb_rec_ids,
+                "mb_artist_ids": set(),
+                "mb_release_ids": set(),
+                "source": "navidrome"
+            })
+
+        return nav_tracks
 
 
 # ==============================================================================
@@ -1462,14 +1634,20 @@ def parse_args():
 Examples:
   python3 check_missing_tracks.py "すてらべえ"
   python3 check_missing_tracks.py "Stellabee" -d /mnt/music
+  python3 check_missing_tracks.py "Glidelas" --source navidrome
   python3 check_missing_tracks.py "https://musicbrainz.org/artist/2dbd3954-9bb7-4165-9445-98f66c3861bf"
   python3 check_missing_tracks.py "Aphex Twin" --only-missing --export-txt missing.txt
   python3 check_missing_tracks.py "goreshit" --export-bandcamp-links goreshit_bc.txt
         """
     )
     parser.add_argument("artist", help="Artist Name, MusicBrainz Artist ID (MBID), or MusicBrainz Artist URL")
-    parser.add_argument("-d", "--dir", "--music-dir", dest="music_dir", default="/mnt/music", help="Path to music library directory (default: /mnt/music)")
-    parser.add_argument("--full-scan", action="store_true", help="Perform a full deep-scan of every audio file in the music directory instead of fast path pre-filtering")
+    parser.add_argument("-d", "--dir", "--music-dir", dest="music_dir", default="/mnt/music", help="Path to local music library directory (default: /mnt/music)")
+    parser.add_argument("--source", choices=["auto", "local", "navidrome", "both"], default="auto", help="Library source to scan: 'auto' (detects Navidrome / local), 'navidrome', 'local', or 'both' (default: auto)")
+    parser.add_argument("--navidrome", "--subsonic", action="store_true", help="Force scanning Navidrome/Subsonic server")
+    parser.add_argument("--navidrome-url", type=str, default="", help="Navidrome/Subsonic server URL (default: from NAVIDROME_URL in .env)")
+    parser.add_argument("--navidrome-user", "--navidrome-username", dest="navidrome_username", type=str, default="", help="Navidrome/Subsonic username (default: from NAVIDROME_USERNAME in .env)")
+    parser.add_argument("--navidrome-pass", "--navidrome-password", dest="navidrome_password", type=str, default="", help="Navidrome/Subsonic password (default: from NAVIDROME_PASSWORD in .env)")
+    parser.add_argument("--full-scan", action="store_true", help="Perform a full deep-scan of every audio file in the local music directory instead of fast path pre-filtering")
     parser.add_argument("-t", "--threads", type=int, default=24, help="Number of parallel worker threads for reading audio metadata tags (default: 24)")
     parser.add_argument("--only-missing", action="store_true", help="Display only missing tracks/releases in the output")
     parser.add_argument("--only-found", action="store_true", help="Display only found tracks in the output")
@@ -1506,13 +1684,35 @@ def main():
     catalog = ArtistCatalog(raw_data)
     console.print(f"[cyan]Loaded [bold]{len(catalog.tracks)}[/bold] unique recordings/tracks across [bold]{len(raw_data.get('releases_artist', [])) + len(raw_data.get('releases_track_artist', []))}[/bold] releases.[/cyan]")
 
-    # Step 4: Scan Music Library
-    scanner = AudioFileScanner(
-        music_dir=args.music_dir,
-        catalog=catalog,
-        full_scan=args.full_scan,
-        threads=args.threads
-    )
+    # Step 4: Scan Music Library (Navidrome / Subsonic Server and/or Local Filesystem)
+    nav_url = (args.navidrome_url or os.getenv("NAVIDROME_URL", os.getenv("SUBSONIC_URL", ""))).strip()
+    nav_user = (args.navidrome_username or os.getenv("NAVIDROME_USERNAME", os.getenv("SUBSONIC_USERNAME", ""))).strip()
+    nav_pass = (args.navidrome_password or os.getenv("NAVIDROME_PASSWORD", os.getenv("SUBSONIC_PASSWORD", ""))).strip()
+
+    has_nav_config = bool(nav_url and nav_user and nav_pass)
+
+    if args.navidrome:
+        scan_nav = True
+        scan_local = (args.source == "both")
+    elif args.source == "navidrome":
+        scan_nav = True
+        scan_local = False
+    elif args.source == "local":
+        scan_nav = False
+        scan_local = True
+    elif args.source == "both":
+        scan_nav = has_nav_config
+        scan_local = True
+    else:  # auto
+        scan_nav = has_nav_config
+        scan_local = True
+
+    if (args.navidrome or args.source == "navidrome") and not has_nav_config:
+        console.print("[red]Error: Navidrome credentials missing.[/red] Please set NAVIDROME_URL, NAVIDROME_USERNAME, and NAVIDROME_PASSWORD in .env or pass --navidrome-url, --navidrome-user, --navidrome-pass")
+        sys.exit(1)
+
+    local_tracks: List[Dict[str, Any]] = []
+    seen_paths: Set[str] = set()
 
     with Progress(
         SpinnerColumn(),
@@ -1521,14 +1721,84 @@ def main():
         TimeElapsedColumn(),
         console=console
     ) as progress:
-        task_id = progress.add_task("[cyan]Scanning library...", total=None)
-        try:
-            local_tracks = scanner.scan(progress=progress, task_id=task_id)
-        except Exception as e:
-            console.print(f"[red]Error scanning music directory '{args.music_dir}':[/red] {e}")
-            sys.exit(1)
+        # Scan Navidrome
+        if scan_nav and has_nav_config:
+            task_id = progress.add_task(f"[cyan]Connecting to Navidrome ({nav_url})...", total=None)
+            nav_scanner = NavidromeScanner(
+                base_url=nav_url,
+                username=nav_user,
+                password=nav_pass,
+                catalog=catalog
+            )
+            try:
+                nav_tracks = nav_scanner.scan(progress=progress, task_id=task_id)
+                for nt in nav_tracks:
+                    p = nt["path"]
+                    if p not in seen_paths:
+                        local_tracks.append(nt)
+                        seen_paths.add(p)
+                progress.update(task_id, description=f"[green]✔ Retrieved {len(nav_tracks)} tracks from Navidrome server ({nav_url})", completed=1, total=1)
+            except Exception as e:
+                console.print(f"[yellow]Warning: Navidrome scan error ({nav_url}):[/yellow] {e}")
 
-    console.print(f"[dim]Parsed metadata from {len(local_tracks)} audio files in library.[/dim]")
+        # Scan Local Filesystem
+        disk_tracks_count = 0
+        local_dir_scanned = False
+        if scan_local:
+            local_dir_path = Path(args.music_dir)
+            if not local_dir_path.exists():
+                console.print(f"[bold yellow]⚠ Warning:[/bold yellow] Local music directory '[bold cyan]{args.music_dir}[/bold cyan]' does not exist or is unmounted.")
+            else:
+                local_dir_scanned = True
+                task_id = progress.add_task(f"[cyan]Scanning local library ({args.music_dir})...", total=None)
+                scanner = AudioFileScanner(
+                    music_dir=args.music_dir,
+                    catalog=catalog,
+                    full_scan=args.full_scan,
+                    threads=args.threads
+                )
+                try:
+                    disk_tracks = scanner.scan(progress=progress, task_id=task_id)
+                    disk_tracks_count = len(disk_tracks)
+                    added_disk = 0
+                    for dt in disk_tracks:
+                        p = dt["path"]
+                        if p not in seen_paths:
+                            local_tracks.append(dt)
+                            seen_paths.add(p)
+                            added_disk += 1
+                    if disk_tracks_count == 0:
+                        progress.update(task_id, description=f"[yellow]⚠ Local library ({args.music_dir}) contains 0 audio files (unmounted after reboot?)", completed=1, total=1)
+                    else:
+                        progress.update(task_id, description=f"[green]✔ Parsed {disk_tracks_count} audio files from local library", completed=1, total=1)
+                except Exception as e:
+                    console.print(f"[red]Error scanning music directory '{args.music_dir}':[/red] {e}")
+
+    # Visible Warning & Status Notifications
+    if local_dir_scanned and disk_tracks_count == 0:
+        if len(local_tracks) > 0:
+            console.print(f"[bold yellow]⚠ Notice:[/bold yellow] Local directory '[bold cyan]{args.music_dir}[/bold cyan]' contains 0 audio files (unmounted after reboot?). Using [bold green]{len(local_tracks)}[/bold green] tracks from Navidrome server.")
+        else:
+            warning_panel = Panel(
+                f"[bold yellow]⚠ 0 audio files found in '{args.music_dir}' or Navidrome server.[/bold yellow]\n\n"
+                f"• If [bold cyan]{args.music_dir}[/bold cyan] is an SSHFS, NFS, or network mount, make sure it is mounted after rebooting!\n"
+                f"• Check mount status: [dim]`ls {args.music_dir}`[/dim]\n"
+                f"• All [bold]{len(catalog.tracks)}[/bold] tracks in the MusicBrainz catalog will be marked as missing.",
+                title="[bold yellow]Unmounted / Empty Library Warning[/bold yellow]",
+                border_style="yellow",
+                box=box.ROUNDED
+            )
+            console.print(warning_panel)
+    elif len(local_tracks) == 0:
+        console.print(Panel(
+            f"[bold yellow]⚠ 0 candidate tracks found for '{catalog.name}' in local library or server.[/bold yellow]\n"
+            f"[dim]All {len(catalog.tracks)} tracks in the MusicBrainz catalog will be marked as missing.[/dim]",
+            title="[bold yellow]Library Scan Notice[/bold yellow]",
+            border_style="yellow",
+            box=box.ROUNDED
+        ))
+    else:
+        console.print(f"[dim]Total {len(local_tracks)} candidate tracks loaded for reconciliation.[/dim]")
 
     # Step 5: Reconcile Tracks
     reconciler = DiscographyReconciler(catalog=catalog, local_tracks=local_tracks)

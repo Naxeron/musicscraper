@@ -210,36 +210,42 @@ python3 main.py bandcamp https://jwrecords.bandcamp.com/
 
 ## 4. Missing Tracks Checker (`check_missing_tracks.py`)
 
-Cross-references your local music library (e.g. `/mnt/music`) against MusicBrainz discography data to detect missing tracks, albums, compilations, and standalone recordings for any artist. Discovers official Bandcamp pages and allows exporting URLs.
+Cross-references your music library (**Navidrome / Subsonic server** or local filesystem directory) against MusicBrainz discography data to detect missing tracks, albums, compilations, and standalone recordings for any artist. Discovers official Bandcamp pages and allows exporting URLs.
 
 ### Usage Examples
 
-#### Audit by Japanese Artist Name or Alias
+#### Audit with Navidrome / Subsonic Server (Auto-detected via `.env`)
 ```bash
-python3 check_missing_tracks.py "すてらべえ"
-python3 check_missing_tracks.py "Stellabee" -d /mnt/music
+python3 main.py audit "Glidelas"
+python3 main.py audit "Stellabee" --source navidrome
+```
+
+#### Audit Local or Mounted Library Directory
+```bash
+python3 main.py audit "Stellabee" -d /mnt/music
+python3 check_missing_tracks.py "すてらべえ" -d ~/Music
 ```
 
 #### Audit by MusicBrainz URL or MBID
 ```bash
-python3 check_missing_tracks.py "https://musicbrainz.org/artist/2dbd3954-9bb7-4165-9445-98f66c3861bf"
+python3 main.py audit "https://musicbrainz.org/artist/2dbd3954-9bb7-4165-9445-98f66c3861bf"
 ```
 
 #### Show Only Missing Tracks
 ```bash
-python3 check_missing_tracks.py "Stellabee" --only-missing
+python3 main.py audit "Stellabee" --only-missing
 ```
 
 #### Export Bandcamp Links for Missing Releases
 ```bash
-python3 check_missing_tracks.py "goreshit" --export-bandcamp-links goreshit_bc.txt
+python3 main.py audit "goreshit" --export-bandcamp-links goreshit_bc.txt
 # Then download directly with:
-python3 bandcamp_scraper.py -i goreshit_bc.txt
+python3 main.py bandcamp -i goreshit_bc.txt
 ```
 
 #### Export Structured Results
 ```bash
-python3 check_missing_tracks.py "Stellabee" \
+python3 main.py audit "Stellabee" \
   --export-json stellabee_audit.json \
   --export-csv stellabee_audit.csv \
   --export-txt stellabee_missing.txt
@@ -250,7 +256,12 @@ python3 check_missing_tracks.py "Stellabee" \
 | Flag | Default | Description |
 |---|---|---|
 | `artist` | *(required)* | Artist Name, MBID UUID, or MusicBrainz Artist URL |
+| `--source` | `auto` | Library source to scan: `auto` (detects Navidrome from `.env` / local disk), `navidrome`, `local`, or `both` |
 | `-d`, `--dir`, `--music-dir` | `/mnt/music` | Path to local or mounted music library directory |
+| `--navidrome`, `--subsonic` | `False` | Force scanning Navidrome/Subsonic server |
+| `--navidrome-url` | `.env` | Navidrome/Subsonic server URL (`NAVIDROME_URL`) |
+| `--navidrome-user` | `.env` | Navidrome/Subsonic username (`NAVIDROME_USERNAME`) |
+| `--navidrome-pass` | `.env` | Navidrome/Subsonic password (`NAVIDROME_PASSWORD`) |
 | `--only-missing` | `False` | Display only missing tracks and incomplete releases in the output |
 | `--only-found` | `False` | Display only found tracks in the output |
 | `--export-bandcamp-links` | `None` | Export artist Bandcamp URLs to a text file (feedable into `bandcamp_scraper.py -i`) |
