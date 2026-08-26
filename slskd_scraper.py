@@ -491,10 +491,7 @@ class SlskdArtistScraper:
                 queries.append(alias)
 
         # Tier 2: Primary Releases Missing from Local Library
-        rel_added = 0
         for rel in self.catalog.releases:
-            if rel_added >= 4:
-                break
             rel_title = rel.get("title", "")
             norm_rel = normalize_text(rel_title)
             if not rel_title or norm_rel in self.local_found_releases:
@@ -503,14 +500,10 @@ class SlskdArtistScraper:
             q1 = clean_search_phrase(f"{self.catalog.name} {rel_title}")
             if q1:
                 queries.append(q1)
-                rel_added += 1
 
         # Tier 3: Major Compilations & Split Releases Missing from Local Library
         comp_releases = self.raw_mb_data.get("releases_track_artist", [])
-        comp_added = 0
         for rel in comp_releases:
-            if comp_added >= 6:
-                break
             rel_title = rel.get("title", "")
             norm_rel = normalize_text(rel_title)
             if not rel_title or norm_rel in self.local_found_releases:
@@ -521,7 +514,17 @@ class SlskdArtistScraper:
             q = clean_search_phrase(clean_t)
             if q and len(q) >= 4:
                 queries.append(q)
-                comp_added += 1
+
+        # Tier 4: Standalone / Single Tracks Missing from Local Library
+        standalone_candidates = [
+            t for t in self.catalog.tracks
+            if t.get("release_type") == "Standalone / Single" and t.get("norm_title") not in self.local_found_map
+        ]
+        for t in standalone_candidates[:10]: # Limit to 10 to avoid spam
+            t_title = t.get("title", "")
+            q = clean_search_phrase(f"{self.catalog.name} {t_title}")
+            if q:
+                queries.append(q)
 
         # Deduplicate preserving order
         return list(dict.fromkeys(q for q in queries if q and len(q) >= 3))
