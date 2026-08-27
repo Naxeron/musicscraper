@@ -170,6 +170,189 @@ def calculate_similarity(str1: str, str2: str) -> float:
 
 
 # ==============================================================================
+# TRACK TITLE STRUCTURE, REMIX / VERSION & FEATURE EXTRACTION
+# ==============================================================================
+
+REMASTER_OR_NOISE_PATTERNS = [
+    r"[\(\[\{]?(?:20\d\d|19\d\d)?\s*digital\s*remaster(?:ed)?(?:\s*version|\s*\d{4})?[\)\]\}]?",
+    r"[\(\[\{]?(?:20\d\d|19\d\d)?\s*remaster(?:ed)?(?:\s*version|\s*\d{4})?[\)\]\}]?",
+    r"[\(\[\{]?anniversary\s*edition[\)\]\}]?",
+    r"[\(\[\{]?deluxe\s*(?:edition|version)[\)\]\}]?",
+    r"[\(\[\{]?bonus\s*track[\)\]\}]?",
+    r"[\(\[\{]?(?:original\s*mix|original\s*version|album\s*version|main\s*version)[\)\]\}]?",
+    r"[\(\[\{]?(?:flac|mp3|320kbps|24bit|lossless|wav|vbr|cd|web|vinyl|rip|official\s*audio|official\s*video|mv|lyrics)[\)\]\}]?",
+]
+
+FEATURE_PATTERNS = [
+    r"[\(\[\{]\s*(?:feat\.?|ft\.?|featuring|with)\s+([^\)\]\}]+)[\)\]\}]",
+    r"(?:\bfeat\.?|\bft\.?|\bfeaturing\b|\bwith\b)\s*([^,\-\(\[\{]+)",
+]
+
+VERSION_PATTERNS = [
+    (r"[\(\[\{]([^\)\]\}]*(?:remix|rmx|re-mix|flip|bootleg|rework|edit|refix|mashup|mash-up)[^\)\]\}]*)[\)\]\}]", "remix"),
+    (r"(?:^|\s)\-\s*([^\-]+(?:remix|rmx|re-mix|flip|bootleg|rework|edit|refix|mashup|mash-up)[^\-]*)", "remix"),
+    (r"[\(\[\{]([^\)\]\}]*(?:vip\s*mix|vip)[^\)\]\}]*)[\)\]\}]", "vip"),
+    (r"[\(\[\{]([^\)\]\}]*(?:instrumental|inst\b|off\s*vocal|karaoke|backing\s*track)[^\)\]\}]*)[\)\]\}]", "instrumental"),
+    (r"[\(\[\{]([^\)\]\}]*(?:acapella|a\s*cappella|vocal\s*version)[^\)\]\}]*)[\)\]\}]", "acapella"),
+    (r"[\(\[\{]([^\)\]\}]*(?:acoustic|unplugged|piano\s*ver(?:sion)?)[^\)\]\}]*)[\)\]\}]", "acoustic"),
+    (r"[\(\[\{]([^\)\]\}]*(?:live(?:\s+at|\s+in|\s+version|\s*\d{4})?)[^\)\]\}]*)[\)\]\}]", "live"),
+    (r"[\(\[\{]([^\)\]\}]*(?:speed\s*up|sped\s*up|slowed|nightcore|daycore|chopped\s*and\s*screwed)[^\)\]\}]*)[\)\]\}]", "speed"),
+    (r"[\(\[\{]([^\)\]\}]*(?:demo|alternate\s*take|alt\s*take|alt\s*mix|rough\s*mix)[^\)\]\}]*)[\)\]\}]", "demo"),
+    (r"[\(\[\{]([^\)\]\}]*(?:club\s*mix|extended\s*mix|extended\s*version|radio\s*edit|dub\s*mix|dub)[^\)\]\}]*)[\)\]\}]", "mix_edit"),
+]
+
+
+def parse_track_title_structure(title: str) -> Dict[str, Any]:
+    """
+    Parses a track title into structured components:
+    - Base normalized title (with noise, remasters, format tags, and features stripped)
+    - Version type and normalized descriptor text (e.g. remix, instrumental, live)
+    - Featured artist list
+    """
+    raw = (title or "").strip()
+    if not raw:
+        return {
+            "raw": "",
+            "base_norm": "",
+            "version_type": None,
+            "version_text": None,
+            "features": []
+        }
+
+    # Clean leading track numbers & artist prefixes (e.g. '01 - Artist - Title' or 'Artist: Title')
+    cleaned = strip_track_number_and_artist(raw)
+    if "：" in cleaned:
+        cleaned = cleaned.split("：", 1)[1].strip()
+
+    # 1. Extract features
+    features = []
+    for pat in FEATURE_PATTERNS:
+        for m in re.finditer(pat, cleaned, re.IGNORECASE):
+            f_text = m.group(1).strip()
+            if f_text:
+                features.append(normalize_text(f_text))
+
+    # 2. Extract version / remix
+    v_type = None
+    v_text = None
+    for pat, vtype in VERSION_PATTERNS:
+        m = re.search(pat, cleaned, re.IGNORECASE)
+        if m:
+            v_type = vtype
+            v_text = normalize_text(m.group(1))
+            break
+
+    # 3. Clean base title
+    base_str = cleaned
+    for pat, _ in VERSION_PATTERNS:
+        base_str = re.sub(pat, " ", base_str, flags=re.IGNORECASE)
+    for pat in FEATURE_PATTERNS:
+        base_str = re.sub(pat, " ", base_str, flags=re.IGNORECASE)
+    for pat in REMASTER_OR_NOISE_PATTERNS:
+        base_str = re.sub(pat, " ", base_str, flags=re.IGNORECASE)
+
+    base_norm = normalize_text(base_str)
+
+    return {
+        "raw": raw,
+        "base_norm": base_norm,
+        "version_type": v_type,
+        "version_text": v_text,
+        "features": features
+    }
+
+
+def are_versions_compatible(
+    v1_type: Optional[str],
+    v1_text: Optional[str],
+    v2_type: Optional[str],
+    v2_text: Optional[str]
+) -> bool:
+    """
+    Determines if two track version modifiers are musically compatible:
+    - Both original (None) -> Compatible
+    - Original vs Remix/Instrumental/Live -> INCOMPATIBLE
+    - Different version types (e.g. remix vs live) -> INCOMPATIBLE
+    - Both remixes/edits -> Compatible only if remix descriptors match/overlap
+    """
+    if v1_type is None and v2_type is None:
+        return True
+    if (v1_type is None) != (v2_type is None):
+        return False
+    if v1_type != v2_type:
+        return False
+    if v1_type in ("remix", "mix_edit", "vip"):
+        if not v1_text or not v2_text:
+            return True
+        sim = calculate_similarity(v1_text, v2_text)
+        if sim > 0.65 or v1_text in v2_text or v2_text in v1_text:
+            return True
+        return False
+    return True
+
+
+def deduplicate_candidate_tracks(tracks_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Deduplicates and merges candidate audio track items across Navidrome and Local Disk.
+    Consolidates MusicBrainz ID tags and preserves local filesystem paths.
+    """
+    if not tracks_list:
+        return []
+
+    by_fingerprint: Dict[str, Dict[str, Any]] = {}
+    merged: List[Dict[str, Any]] = []
+
+    for t in tracks_list:
+        norm_t = t.get("norm_title", "")
+        norm_a = t.get("norm_album", "")
+        trk = str(t.get("track_number", "")).strip()
+        fn = t.get("filename", "")
+        path = t.get("path", "")
+
+        # Try to find a matching existing fingerprint
+        fp = None
+        if norm_t and norm_a:
+            fp = f"alb_title:{norm_a}::{norm_t}::{trk}"
+        elif norm_t:
+            fp = f"title:{norm_t}::{trk}::{fn}"
+
+        # Also check if any existing item shares the exact same recording ID
+        matched_existing = None
+        if fp and fp in by_fingerprint:
+            matched_existing = by_fingerprint[fp]
+        elif t.get("mb_rec_ids"):
+            for ex in by_fingerprint.values():
+                if ex.get("mb_rec_ids") and (ex["mb_rec_ids"] & t["mb_rec_ids"]):
+                    matched_existing = ex
+                    break
+
+        if matched_existing is not None:
+            # Merge ID tags and metadata
+            matched_existing["mb_track_ids"].update(t.get("mb_track_ids", set()))
+            matched_existing["mb_rec_ids"].update(t.get("mb_rec_ids", set()))
+            matched_existing["mb_artist_ids"].update(t.get("mb_artist_ids", set()))
+            matched_existing["mb_release_ids"].update(t.get("mb_release_ids", set()))
+            # Prefer local filesystem path if available
+            if t.get("source") == "local" or (path.startswith("/") and not matched_existing.get("path", "").startswith("/")):
+                matched_existing["path"] = path
+                matched_existing["filename"] = fn or matched_existing.get("filename", "")
+                matched_existing["source"] = "local+navidrome"
+            elif matched_existing.get("source") != "local":
+                matched_existing["source"] = "local+navidrome"
+        else:
+            item_copy = dict(t)
+            item_copy["mb_track_ids"] = set(item_copy.get("mb_track_ids", set()))
+            item_copy["mb_rec_ids"] = set(item_copy.get("mb_rec_ids", set()))
+            item_copy["mb_artist_ids"] = set(item_copy.get("mb_artist_ids", set()))
+            item_copy["mb_release_ids"] = set(item_copy.get("mb_release_ids", set()))
+            if fp:
+                by_fingerprint[fp] = item_copy
+            merged.append(item_copy)
+
+    return merged
+
+
+# ==============================================================================
 # MUSICBRAINZ RESOLVER & DISCOGRAPHY FETCHER
 # ==============================================================================
 
@@ -1241,7 +1424,7 @@ class NavidromeScanner:
 class DiscographyReconciler:
     def __init__(self, catalog: ArtistCatalog, local_tracks: List[Dict[str, Any]]):
         self.catalog = catalog
-        self.local_tracks = local_tracks
+        self.local_tracks = deduplicate_candidate_tracks(local_tracks)
         self.matched: Dict[int, Tuple[Dict[str, Any], str]] = {}
         self.unmatched_local: List[Dict[str, Any]] = []
 
@@ -1255,6 +1438,12 @@ class DiscographyReconciler:
         mb_tracks = self.catalog.tracks
         artist_aliases = self.catalog.aliases
 
+        mb_parsed = [parse_track_title_structure(mb["title"]) for mb in mb_tracks]
+        local_parsed = [
+            parse_track_title_structure(lt.get("title") or lt.get("filename") or "")
+            for lt in self.local_tracks
+        ]
+
         # -------------------------------------------------------------
         # TIER 1: Exact MusicBrainz Tag Matching (MBID Track/Recording)
         # -------------------------------------------------------------
@@ -1264,7 +1453,7 @@ class DiscographyReconciler:
             mb_rec_ids = mb.get("recording_ids", set())
             mb_track_ids = mb.get("track_ids", set())
 
-            for lt in self.local_tracks:
+            for j, lt in enumerate(self.local_tracks):
                 if lt["path"] in matched_local_paths:
                     continue
 
@@ -1283,30 +1472,37 @@ class DiscographyReconciler:
                     break
 
         # -------------------------------------------------------------
-        # TIER 2: Exact Release + Exact Track Title Match
+        # TIER 2: Exact Release + Compatible Track Title Match
         # -------------------------------------------------------------
         for i, mb in enumerate(mb_tracks):
             if i in matched_mb_indices:
                 continue
 
-            mb_title_norm = mb["norm_title"]
-            mb_rel_norm = mb["norm_release"]
-            if not mb_title_norm:
+            p_mb = mb_parsed[i]
+            mb_rel_norm = mb.get("norm_release", "")
+            if not p_mb["base_norm"]:
                 continue
 
-            for lt in self.local_tracks:
+            for j, lt in enumerate(self.local_tracks):
                 if lt["path"] in matched_local_paths:
                     continue
 
-                lt_title_norm = lt["norm_title"]
-                lt_album_norm = lt["norm_album"]
-                path_norm = normalize_text(lt["path"])
+                p_lt = local_parsed[j]
+                lt_album_norm = lt.get("norm_album", "")
+                path_norm = normalize_text(lt.get("path", ""))
 
-                if mb_title_norm == lt_title_norm or calculate_similarity(mb_title_norm, lt_title_norm) > 0.95:
+                base_sim = calculate_similarity(p_mb["base_norm"], p_lt["base_norm"])
+                base_match = (p_mb["base_norm"] == p_lt["base_norm"]) or base_sim > 0.90
+                ver_compat = are_versions_compatible(
+                    p_mb["version_type"], p_mb["version_text"],
+                    p_lt["version_type"], p_lt["version_text"]
+                )
+
+                if base_match and ver_compat:
                     rel_sim = calculate_similarity(mb_rel_norm, lt_album_norm)
-                    path_has_rel = mb_rel_norm and mb_rel_norm in path_norm
+                    path_has_rel = bool(mb_rel_norm and mb_rel_norm in path_norm)
 
-                    if rel_sim > 0.7 or path_has_rel or mb["release_title"] == "Standalone / Other":
+                    if rel_sim > 0.7 or path_has_rel or mb.get("release_title") == "Standalone / Other":
                         self.matched[i] = (lt, "Exact Title & Album Match")
                         matched_mb_indices.add(i)
                         matched_local_paths.add(lt["path"])
@@ -1319,48 +1515,55 @@ class DiscographyReconciler:
             if i in matched_mb_indices:
                 continue
 
-            mb_title_norm = mb["norm_title"]
-            if not mb_title_norm:
+            p_mb = mb_parsed[i]
+            if not p_mb["base_norm"]:
                 continue
 
-            for lt in self.local_tracks:
+            for j, lt in enumerate(self.local_tracks):
                 if lt["path"] in matched_local_paths:
                     continue
 
-                lt_title_norm = lt["norm_title"]
-                path_norm = normalize_text(lt["path"])
+                p_lt = local_parsed[j]
+                path_norm = normalize_text(lt.get("path", ""))
 
                 has_artist_tag = any(
                     any(alias in a.lower() or alias in unidecode(a.lower()) for alias in artist_aliases)
-                    for a in lt["artists"]
+                    for a in lt.get("artists", [])
                 )
                 has_artist_path = any(alias in path_norm for alias in artist_aliases)
 
                 if has_artist_tag or has_artist_path or (mb.get("recording_ids") and any(rid in lt["mb_rec_ids"] for rid in mb["recording_ids"])):
-                    if mb_title_norm == lt_title_norm or calculate_similarity(mb_title_norm, lt_title_norm) > 0.88:
+                    base_sim = calculate_similarity(p_mb["base_norm"], p_lt["base_norm"])
+                    base_match = (p_mb["base_norm"] == p_lt["base_norm"]) or base_sim > 0.90
+                    ver_compat = are_versions_compatible(
+                        p_mb["version_type"], p_mb["version_text"],
+                        p_lt["version_type"], p_lt["version_text"]
+                    )
+
+                    if base_match and ver_compat:
                         self.matched[i] = (lt, "Title & Artist Alias Match")
                         matched_mb_indices.add(i)
                         matched_local_paths.add(lt["path"])
                         break
 
         # -------------------------------------------------------------
-        # TIER 4: Fuzzy Match (Substrings, Transliterations, Remixes)
+        # TIER 4: Strict Fuzzy Match (Transliterations, Minor Variances)
         # -------------------------------------------------------------
         for i, mb in enumerate(mb_tracks):
             if i in matched_mb_indices:
                 continue
 
-            mb_title_norm = mb["norm_title"]
+            p_mb = mb_parsed[i]
             mb_rel_norm = mb.get("norm_release", "")
-            if not mb_title_norm or len(mb_title_norm) < 3:
+            if not p_mb["base_norm"] or len(p_mb["base_norm"]) < 3:
                 continue
 
-            for lt in self.local_tracks:
+            for j, lt in enumerate(self.local_tracks):
                 if lt["path"] in matched_local_paths:
                     continue
 
-                lt_title_norm = lt["norm_title"]
-                path_norm = normalize_text(lt["path"])
+                p_lt = local_parsed[j]
+                path_norm = normalize_text(lt.get("path", ""))
 
                 # Verify artist or release association to avoid matching other artists in compilation folders
                 has_artist_tag = any(
@@ -1374,12 +1577,20 @@ class DiscographyReconciler:
                 if not (has_artist_tag or has_artist_path or has_rel_match or mb.get("release_title") == "Standalone / Other"):
                     continue
 
-                title_in_path = len(mb_title_norm) >= 5 and mb_title_norm in path_norm
-                title_in_tag = len(mb_title_norm) >= 5 and mb_title_norm in lt_title_norm
-                sim = calculate_similarity(mb_title_norm, lt_title_norm)
+                # Version compatibility is strictly required
+                ver_compat = are_versions_compatible(
+                    p_mb["version_type"], p_mb["version_text"],
+                    p_lt["version_type"], p_lt["version_text"]
+                )
+                if not ver_compat:
+                    continue
 
-                if sim > 0.85 or (sim > 0.75 and (has_artist_tag or has_artist_path)) or title_in_path or title_in_tag:
-                    self.matched[i] = (lt, f"Fuzzy Match ({int(sim*100)}%)")
+                base_sim = calculate_similarity(p_mb["base_norm"], p_lt["base_norm"])
+                full_sim = calculate_similarity(mb["norm_title"], lt.get("norm_title", ""))
+                max_sim = max(base_sim, full_sim)
+
+                if max_sim >= 0.85:
+                    self.matched[i] = (lt, f"Fuzzy Match ({int(max_sim*100)}%)")
                     matched_mb_indices.add(i)
                     matched_local_paths.add(lt["path"])
                     break
@@ -1794,6 +2005,10 @@ def main():
                 except Exception as e:
                     console.print(f"[red]Error scanning music directory '{args.music_dir}':[/red] {e}")
 
+    # Deduplicate candidate tracks across sources (Navidrome + Local Filesystem)
+    raw_candidate_count = len(local_tracks)
+    local_tracks = deduplicate_candidate_tracks(local_tracks)
+
     # Visible Warning & Status Notifications
     if local_dir_scanned and disk_tracks_count == 0:
         if len(local_tracks) > 0:
@@ -1818,7 +2033,10 @@ def main():
             box=box.ROUNDED
         ))
     else:
-        console.print(f"[dim]Total {len(local_tracks)} candidate tracks loaded for reconciliation.[/dim]")
+        if raw_candidate_count != len(local_tracks):
+            console.print(f"[dim]Total {len(local_tracks)} unique candidate tracks loaded for reconciliation (deduplicated from {raw_candidate_count} scanned items).[/dim]")
+        else:
+            console.print(f"[dim]Total {len(local_tracks)} candidate tracks loaded for reconciliation.[/dim]")
 
     # Step 5: Reconcile Tracks
     reconciler = DiscographyReconciler(catalog=catalog, local_tracks=local_tracks)

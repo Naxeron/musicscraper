@@ -25,18 +25,30 @@ Guidelines and invariants for audio file discovery, metadata tag parsing, persis
 
 ## 4. Multi-Tier Reconciliation & False-Positive Prevention
 - **Tier 1 (Exact MBID)**: Highest priority match on Track ID, Release Track ID, or Recording UFID.
-- **Tier 2 (Exact Release + Title)**: Matches track title and album title/path with $\ge 95\%$ confidence.
-- **Tier 3 (Artist Alias + Title)**: Matches track title and verifies that artist alias exists in tags or file path.
+- **Tier 2 (Exact Release + Title)**: Matches track title and album title/path with $\ge 88\%$ base title similarity and strict version compatibility.
+- **Tier 3 (Artist Alias + Title)**: Matches track title ($\ge 90\%$ base title similarity) and verifies that artist alias exists in tags or file path, with strict version compatibility.
 - **Tier 4 (Fuzzy Match Guardrails)**:
   - Fuzzy matching must **never** attribute tracks to an artist without container or tag verification.
   - Require artist alias confirmation (`has_artist_tag` / `has_artist_path`) or release album confirmation (`has_rel_match`) before accepting a fuzzy match.
   - Standalone tracks without artist or album confirmation require very high direct similarity ($\ge 92\%$) and non-generic title status.
+  - **Strict Version & Remix Incompatibility**:
+    - An original track (`version_type is None`) must **never** match a remix, instrumental, acoustic, live, or speed-up version.
+    - Remixes with differing remixers/descriptors (e.g. `WilliamDavi's remix` vs `Vaenus remix`) must **never** match each other.
+    - Never bypass version compatibility with unvalidated substring checks (`title_in_tag` / `title_in_path`).
+    - Distinguish featured artists (`feat.`, `ft.`) from version modifiers; featured artists do not alter the version type.
+    - Treat non-musical sound engineering tags (`[2021 Remaster]`, `[FLAC]`, `[320]`, `(Original Mix)`) as non-destructive tags.
 
-## 5. Network Requests & MusicBrainz Resolution
+## 5. Multi-Source Candidate Deduplication
+- **Cross-Source Merging (Navidrome + Local Disk)**:
+  - When scanning both remote API sources (Navidrome / Subsonic) and local filesystem paths, candidate tracks must be deduplicated via `deduplicate_candidate_tracks()` prior to reconciliation.
+  - Fingerprint candidate tracks by `(norm_album, norm_title, track_number)`, shared MusicBrainz Recording/Track IDs, and path tails.
+  - Merge ID tag sets and retain the physical local filesystem path. Prevent duplicate candidate instances of the same physical file from being left over to falsely satisfy other releases in fuzzy passes.
+
+## 6. Network Requests & MusicBrainz Resolution
 - **Search Query Caching**: Cache resolved artist queries in `artist_search_cache.json` and check existing `artist_*.json` files before making remote network calls.
 - **Explicit Timeouts & IPv4/HTTP Fast Fallbacks**: Use `requests` with explicit timeouts when querying MusicBrainz endpoints to avoid indefinite `urllib` blocking.
 
-## 6. Soulseek & slskd P2P Discography Discovery Invariants
+## 7. Soulseek & slskd P2P Discography Discovery Invariants
 - **Curated High-Yield Query Generation**:
   - Never flood slskd with dozens of granular track searches. Limit artist search generation to 10–15 curated queries (canonical artist name, aliases/alter-egos, missing primary releases, and key compilations).
   - Dispatch searches in controlled chunks (max 4 concurrent) to prevent slskd internal queue starvation (`state: Queued`).
@@ -55,7 +67,7 @@ Guidelines and invariants for audio file discovery, metadata tag parsing, persis
   - Chunk download enqueue requests into batches of $\le 50$ files with $\ge 30$s timeout to prevent HTTP timeout errors.
   - Ensure all standard library modules (`re`, `urllib.parse`) are explicitly imported at the top of client modules.
 
-## 7. Strict Release, Container & Audio Format Deduplication Invariants
+## 8. Strict Release, Container & Audio Format Deduplication Invariants
 - **Catalog Release Group & Normalized Title Deduplication**:
   - MusicBrainz catalogs must deduplicate release entries by `(is_va, normalize_text(title), release_group_id)`. Multiple editions (e.g. CD vs Bandcamp Web vs Remasters) must not produce duplicate release objects or evaluation loops.
   - Primary releases (`is_va=False`) and compilation releases (`is_va=True`) must be strictly segregated. Primary reconcilers must only evaluate primary releases; compilation reconcilers must evaluate compilations once without re-evaluating primary albums.

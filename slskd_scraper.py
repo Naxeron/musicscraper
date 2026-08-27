@@ -51,6 +51,8 @@ from check_missing_tracks import (
     normalize_text,
     strip_track_number_and_artist,
     calculate_similarity,
+    parse_track_title_structure,
+    are_versions_compatible,
     DEFAULT_CACHE_DIR,
     AUDIO_EXTENSIONS,
 )
@@ -158,21 +160,27 @@ def is_track_title_match(
 ) -> bool:
     """
     Robustly verifies if candidate_filename matches expected track title:
+    - Enforces version and remix compatibility (original vs remix vs different remixer).
     - Uses whole-word token sub-sequence matching.
     - Tests compressed tokens (handles symbols like F>B>D, $S$S$, むげん☆ういんぐ).
     - Checks fuzzy similarity for minor tagging variances.
-    - Handles subtitle / remix differences.
     - For short titles (<= 3 chars or 1 common word), validates directory or artist context.
     """
-    exp_words = tokenize_words(exp_title)
+    # 0. Version compatibility check
+    p_exp = parse_track_title_structure(exp_title)
+    p_cand = parse_track_title_structure(candidate_filename)
+    if not are_versions_compatible(p_exp["version_type"], p_exp["version_text"], p_cand["version_type"], p_cand["version_text"]):
+        return False
+
+    exp_words = tokenize_words(p_exp["base_norm"] or exp_title)
     if not exp_words:
         return False
 
-    clean_exp_title = strip_track_number_and_artist(exp_title)
+    clean_exp_title = p_exp["base_norm"] or strip_track_number_and_artist(exp_title)
     clean_exp_words = tokenize_words(clean_exp_title) or exp_words
 
-    file_words = tokenize_words(candidate_filename)
-    clean_file_words = tokenize_words(strip_track_number_and_artist(candidate_filename)) or file_words
+    file_words = tokenize_words(p_cand["base_norm"] or candidate_filename)
+    clean_file_words = tokenize_words(p_cand["base_norm"] or strip_track_number_and_artist(candidate_filename)) or file_words
 
     # 1. Direct token sequence match
     exact_match = (

@@ -59,6 +59,9 @@ from check_missing_tracks import (
     ReportGenerator,
     normalize_text,
     strip_track_number_and_artist,
+    calculate_similarity,
+    parse_track_title_structure,
+    are_versions_compatible,
     DEFAULT_CACHE_DIR,
     AUDIO_EXTENSIONS,
 )
@@ -509,20 +512,23 @@ class ArtistDownloadOrchestrator:
         if artist_tracks:
             satisfied_cnt = 0
             for t in artist_tracks:
-                norm_t = normalize_text(t.get("title", ""))
-                clean_t = strip_track_number_and_artist(t.get("title", ""))
-                norm_clean = normalize_text(clean_t)
+                t_title = t.get("title", "")
+                p_t = parse_track_title_structure(t_title)
+                norm_t = normalize_text(t_title)
 
-                track_on_server = (
-                    norm_t in self.server_found_map or
-                    norm_clean in self.server_found_map or
-                    any(norm_clean == k or norm_clean in k for k in self.server_found_map)
-                )
-                track_on_slsk = (
-                    norm_t in self.slskd_found_tracks or
-                    norm_clean in self.slskd_found_tracks or
-                    any(norm_clean == k or norm_clean in k for k in self.slskd_found_tracks)
-                )
+                def is_in_collection(p_target, collection_keys):
+                    if not p_target["base_norm"]:
+                        return False
+                    for k in collection_keys:
+                        p_k = parse_track_title_structure(k)
+                        if p_target["base_norm"] == p_k["base_norm"] or calculate_similarity(p_target["base_norm"], p_k["base_norm"]) > 0.90:
+                            if are_versions_compatible(p_target["version_type"], p_target["version_text"], p_k["version_type"], p_k["version_text"]):
+                                return True
+                    return False
+
+                track_on_server = (norm_t in self.server_found_map) or is_in_collection(p_t, self.server_found_map.keys())
+                track_on_slsk = (norm_t in self.slskd_found_tracks) or is_in_collection(p_t, self.slskd_found_tracks)
+
                 if track_on_server or track_on_slsk:
                     satisfied_cnt += 1
 
