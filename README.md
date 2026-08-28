@@ -1,14 +1,18 @@
 # MusicScraper
 
 A fast, versatile Python toolkit for music collectors and archivers:
-1. **Apply Intelligent Last.fm Genre Tags**: Queries Last.fm community tags for tracks, albums, and artists, filters out non-genre noise, canonicalizes formatting/casing (`IDM`, `J-Core`, `Breakcore`, `Lo-Fi`, etc.), and tags audio files (`MP3`, `FLAC`, `M4A`, `OGG`, `WAV`) with SQLite caching and fast multithreading.
-2. **Download & Audit Artist Discographies from MusicBrainz**: Automatically queries MusicBrainz for an artist's full catalog (primary releases, VA compilations, splits, and standalone recordings), discovers downloadable releases across Bandcamp, MediaFire, Archive.org, and netlabels, downloads & unpacks them into project folders, cross-references downloaded audio against MusicBrainz, and generates comprehensive missing-track audit reports.
-3. **Audit local music libraries** for missing tracks and albums against MusicBrainz discography data (supporting aliases, transliterations, VA compilations, and network/SSHFS libraries).
-4. **Download Bandcamp releases and artist discographies** natively (supporting high-resolution free downloads in FLAC/MP3-320/WAV, streaming fallback in MP3-128, automatic ID3 & artwork tagging, and zero-duplicate manifest tracking).
-5. **Scrape and download free music releases** from netlabels and websites without duplicates (supporting **Bandcamp**, **MediaFire**, **Archive.org**, and direct audio/archive links).
-6. **Clean up empty & non-music folders** automatically.
+1. **Upgrade Low-Quality Audio Releases via Soulseek**: Automatically scans your music collection for low-bitrate or lossy audio files (`MP3 < 320kbps`, `AAC`, `OGG`, etc.), reconciles albums and standalone tracks against Soulseek peer catalogs, strictly verifies that releases match in tracklist structure, and queues lossless (`FLAC`) or high-bitrate (`MP3-320`) upgrades into `slskd`.
+2. **Search Soulseek / slskd for Full Artist Discographies**: Queries MusicBrainz for an artist's full catalog, performs multi-tier parallel searches across Soulseek peers, validates tracklists with phonetic & version compatibility, and enqueues downloads.
+3. **Apply Intelligent Last.fm Genre Tags**: Queries Last.fm community tags for tracks, albums, and artists, filters out non-genre noise, canonicalizes formatting/casing (`IDM`, `J-Core`, `Breakcore`, `Lo-Fi`, etc.), and tags audio files (`MP3`, `FLAC`, `M4A`, `OGG`, `WAV`) with SQLite caching and fast multithreading.
+4. **Download & Audit Artist Discographies from MusicBrainz**: Automatically queries MusicBrainz for an artist's full catalog (primary releases, VA compilations, splits, and standalone recordings), discovers downloadable releases across Bandcamp, MediaFire, Archive.org, and netlabels, downloads & unpacks them into project folders, cross-references downloaded audio against MusicBrainz, and generates comprehensive missing-track audit reports.
+5. **Audit local music libraries** for missing tracks and albums against MusicBrainz discography data (supporting aliases, transliterations, VA compilations, and network/SSHFS libraries).
+6. **Download Bandcamp releases and artist discographies** natively (supporting high-resolution free downloads in FLAC/MP3-320/WAV, streaming fallback in MP3-128, automatic ID3 & artwork tagging, and zero-duplicate manifest tracking).
+7. **Scrape and download free music releases** from netlabels and websites without duplicates (supporting **Bandcamp**, **MediaFire**, **Archive.org**, and direct audio/archive links).
+8. **Clean up empty & non-music folders** automatically.
 
 ### Dedicated Support Out-of-the-Box:
+- **[Soulseek Quality Upgrader](https://slskd.org)**: Automated scan for low-quality tracks/albums with strict tracklist verification and lossless FLAC / MP3-320 upgrade queueing.
+- **[Soulseek / slskd Discography Scraper](https://slskd.org)**: Complete artist catalog search, tracklist reconciliation, and download queueing.
 - **[Last.fm Genre Tagger](https://www.last.fm)**: Multi-level genre resolution (track -> album -> artist cascading), noise blacklist filtering, canonical casing, and multi-format audio tagging.
 - **[MusicBrainz Artist Downloader & Auditor](https://musicbrainz.org)**: Complete discography discovery, multi-provider downloading (Bandcamp, MediaFire, Archive.org, Netlabels), archive unpacking, and missing track audit reporting.
 - **[Bandcamp](https://bandcamp.com)**: Full artist discographies, albums, and tracks with embedded metadata.
@@ -35,6 +39,15 @@ pip install -r requirements.txt
 Run any tool in the suite through a single clean command:
 
 ```bash
+# Scan library and find higher-quality FLAC/320 releases on Soulseek
+python3 main.py upgrade "/mnt/music/Library"
+python3 main.py upgrade "/mnt/music/Library/goreshit" --dry-run
+python3 main.py upgrade "/mnt/music/Library" --max-bitrate 192 --format 320
+
+# Search Soulseek for complete artist discography
+python3 main.py soulseek "Mekuso"
+python3 main.py soulseek "Mekuso" --dry-run
+
 # Tag music files with Last.fm genre tags (preview with dry-run)
 python3 main.py tag "/mnt/music/Library/goreshit" --dry-run
 python3 main.py tag "/mnt/music/Library" --skip-existing
@@ -58,7 +71,57 @@ python3 main.py clean ./downloads --force
 
 ---
 
-## 1. Last.fm Intelligent Genre Tagger (`lastfm_genre_tagger.py`)
+## 1. Soulseek Quality Upgrader (`quality_upgrader.py`)
+
+Scans your local or server music library for low-quality or lossy audio files (e.g. `MP3 < 320kbps`, `AAC`, `OGG`), identifies album releases and standalone tracks, searches Soulseek via `slskd`, strictly verifies release tracklists and version compatibility, and enqueues verified higher-quality releases (`FLAC` lossless or `MP3-320`) into `slskd`.
+
+### Key Capabilities:
+- **Comprehensive Audio Inspection**: Uses Mutagen to inspect codecs, bitrates, bit depths, and sample rates across FLAC, MP3, M4A/AAC, OGG, OPUS, WAV, AIFF, APE, and WV with SQLite caching.
+- **Smart Release & Track Grouping**: Intelligently bundles multi-track albums/EPs so entire releases are upgraded together to complete lossless directories with artwork, cue sheets, and logs.
+- **Strict Quality & Tracklist Verification**: Verifies candidate directories against expected tracks using token sequence matching, diacritics transliteration, Katakana-Hiragana phonetic unification, and remix/version compatibility checking.
+- **Enforces Higher Quality Only**: Rejects peer results that do not strictly exceed the quality of local files (e.g. MP3 128/192kbps $\rightarrow$ FLAC/MP3-320; MP3 320kbps $\rightarrow$ FLAC; FLAC 16-bit $\rightarrow$ FLAC 24-bit).
+- **Safe & Non-Destructive**: External libraries are treated strictly as read-only. Includes `--dry-run` to preview upgrades before queuing downloads in `slskd`.
+
+### Usage Examples
+
+#### Scan Library and Upgrade Low-Quality Files to FLAC (Lossless)
+```bash
+python3 main.py upgrade "/mnt/music/Library"
+python3 quality_upgrader.py "/mnt/music/Library"
+```
+
+#### Preview Upgrades for an Artist (Dry-Run)
+```bash
+python3 main.py upgrade "/mnt/music/Library/goreshit" --dry-run
+```
+
+#### Target Files Below a Specific Bitrate (e.g. <= 192 kbps to MP3 320kbps)
+```bash
+python3 main.py upgrade "/mnt/music/Library" --max-bitrate 192 --format 320
+```
+
+#### Upgrade a Specific Album Folder
+```bash
+python3 main.py upgrade "/mnt/music/Library/Mekuso/First Album" --format flac
+```
+
+### Command-Line Options:
+| Flag | Default | Description |
+|---|---|---|
+| `path` | `.` | Target music directory, artist folder, album folder, or single audio file |
+| `-f`, `--format` | `flac` | Target upgrade audio format (`flac`, `lossless`, `320`, `mp3-320`, `any-higher`) |
+| `--max-bitrate` | `320` | Maximum bitrate (in kbps) of local files to target for upgrade |
+| `--min-match` | `0.70` | Minimum track match ratio for release verification (0.0 to 1.0) |
+| `--timeout` | `14.0` | Soulseek search timeout in seconds |
+| `--dry-run` | `False` | Discover and verify upgrades without enqueuing downloads |
+| `--singles-only` | `False` | Only download individual single files instead of full album directories |
+| `-t`, `--threads` | `8` | Worker threads for scanning and directory analysis |
+| `--no-mb` | `False` | Disable MusicBrainz catalog enrichment |
+| `--export-json` | `None` | Export upgrade audit results to a JSON file |
+
+---
+
+## 2. Last.fm Intelligent Genre Tagger (`lastfm_genre_tagger.py`)
 
 Automatically queries Last.fm community metadata to accurately tag artists, albums, and tracks with clean, canonical genre tags.
 

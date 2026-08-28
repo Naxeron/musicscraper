@@ -16,6 +16,11 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent
 
 TOOL_SCRIPTS = {
+    "upgrade": ROOT_DIR / "quality_upgrader.py",
+    "upgrade-quality": ROOT_DIR / "quality_upgrader.py",
+    "quality-upgrade": ROOT_DIR / "quality_upgrader.py",
+    "slskd-upgrade": ROOT_DIR / "quality_upgrader.py",
+    "quality": ROOT_DIR / "quality_upgrader.py",
     "artist": ROOT_DIR / "artist_downloader.py",
     "download-artist": ROOT_DIR / "artist_downloader.py",
     "audit": ROOT_DIR / "check_missing_tracks.py",
@@ -39,6 +44,12 @@ Usage:
   python3 main.py <command> [options]
 
 Commands:
+  upgrade   Scan local library for low-quality files (< 320kbps or lossy),
+            find verified higher-quality releases (FLAC/320) on Soulseek, and queue
+            Example: python3 main.py upgrade "/mnt/music/Library"
+            Example: python3 main.py upgrade "/mnt/music/Library/goreshit" --dry-run
+            Example: python3 main.py upgrade "/mnt/music/Library" --max-bitrate 192 --format 320
+
   soulseek  Search Soulseek (via slskd) for full artist discographies,
             reconcile tracklists against MusicBrainz, and queue downloads
             Example: python3 main.py soulseek "Mekuso"
