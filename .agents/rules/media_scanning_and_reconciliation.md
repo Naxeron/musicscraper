@@ -9,7 +9,9 @@ Guidelines and invariants for audio file discovery, metadata tag parsing, persis
   - Filter out generic track markers (`intro`, `outro`, `interlude`, `untitled`, `bonus`, `track`, `demo`, `mix`, `edit`, `vip`, `theme`, pure digits, single letters).
   - Filter out common single English dictionary words and electronic genre keywords (`breakcore`, `lolicore`, `speedcore`, `hardcore`, `ambient`, `vaporwave`, `rave`) when matching loose standalone filenames.
   - Require standalone track titles to be distinct (e.g. multi-word or length $\ge 8$) unless accompanied by an artist alias or album container match.
+  - **Unified Regex Matching**: In high-latency/SSHFS filesystems, compile combined unified regexes for aliases, release titles, and track titles rather than sequentially evaluating hundreds of regexes per file.
 - **Compilation Folder Filtering**: Do not blindly classify every audio file in a compilation/VA folder as a candidate for a single queried artist. Only match files in compilation directories if the album title matches a known catalog release or the track filename contains the artist's name.
+- **Folder-Level Candidate Propagation**: If a non-canonical folder (such as inside a downloads directory) contains $\ge 2$ tracks matching catalog items, scan the entire folder as a cohesive album candidate.
 
 ## 2. Persistent Audio Tag Caching
 - **SQLite Metadata Caching**: Always check `AudioMetadataCache` (`~/.cache/musicscraper/audio_cache.db`) before invoking `mutagen` file reads over disk.
@@ -77,6 +79,9 @@ Guidelines and invariants for audio file discovery, metadata tag parsing, persis
 - **Release & Track-Level Queue Deduplication**:
   - Download queue engines must maintain `queued_release_keys` and `queued_track_keys` in addition to directory keys `(user, dir_name)`.
   - Never queue multiple peer directories for the same release across different peers or formats (e.g., FLAC directory vs MP3 directory). Prioritize preferred audio formats (e.g. lossless FLAC) and queue exactly one candidate directory per release.
+  - **Multi-Fingerprint P2P Queue Deduplication**: Remote paths in slskd vary across peers. In addition to exact remote paths, track active and completed transfers by lowercase base filename (e.g., `01 - track.flac`) and normalized title tokens to prevent re-queueing identical files from different peers.
+  - **Selective Partial-Album Queueing**: When a release is partially present locally (e.g., 10 of 11 tracks present), download engines must filter candidate directory files to enqueue ONLY the genuinely missing tracks, preventing all-or-nothing full album re-downloads.
+  - **Local Library Pre-Seed Coverage Invariant**: Releases identified during local library pre-scan must immediately pre-seed `reconciled_release_keys` and `covered_track_titles` to prevent downstream compilation and standalone passes from re-evaluating and downloading tracks already satisfied locally.
 - **Fuzzy Platform Title Skipping**:
   - Bandcamp, MediaFire, Archive.org, and web scrapers must use fuzzy normalized title matching (stripping `[EP]`, `[LP]`, `Single`, `Remaster`, `VIP`, etc.) against server and queued releases, skipping downloads when $\ge 80\%$ of artist tracks are already present or queued.
 - **Intra-Directory Audio Container Conflict Safety**:
@@ -97,6 +102,11 @@ Guidelines and invariants for audio file discovery, metadata tag parsing, persis
   - Fast-path identical strings (`if str1 == str2: return 1.0`) to avoid matrix distance calculations.
 - **Index Synchronization on Remote Browse**:
   - When fetching complete folder listings from peers via API (`browse_directory`), update the active inverted index via `candidate_index.update_directory(user, dir_name, dir_info)` so that subsequent release and track reconciliation passes immediately benefit from the complete folder file list.
+
+## 10. Multi-Lingual & Numeric Title Normalization
+- **Kanji Numeral Parsing**: Catalog track titles with Japanese Kanji numbers (e.g. `九十四`, `一`, `十`) must be converted to Arabic digits (`94`) during normalization to ensure alignment with standard numeric file tags.
+- **Purely Numeric Track Title Safety**: Track-number stripping routines (`strip_track_number_and_artist`) must never strip purely numeric titles (e.g., `"94"`, `"1999"`, `"007"`) down to empty strings. If stripping leaves an empty string, fall back to the original non-extension filename.
+
 
 
 
