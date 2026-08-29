@@ -66,13 +66,21 @@ from slskd_scraper import (
     is_sublist,
     extract_catalog_codes,
     is_track_title_match,
+    is_track_title_match_fast,
+    is_dir_name_match,
+    is_dir_name_match_fast,
     sanitize_remote_path,
     extract_dir_and_filename,
     is_audio_file,
     is_supporting_file,
     clean_search_phrase,
-    is_dir_name_match,
     determine_audio_quality,
+    pre_parse_single_track,
+    pre_parse_expected_tracks,
+    CandidateFile,
+    CandidateDir,
+    PeerCandidateIndex,
+    DIR_STOP_WORDS,
     SUPPORTED_AUDIO_EXTENSIONS,
     SUPPORTING_EXTENSIONS,
     POLISH_DIACRITICS_MAP,
@@ -580,6 +588,7 @@ class SoulseekQualityUpgrader:
 
         # Discovered peers & directory cache
         self.peer_directories: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self.candidate_index: Optional[PeerCandidateIndex] = None
         self.searches_performed: Set[str] = set()
 
         # Results state
@@ -757,14 +766,99 @@ class SoulseekQualityUpgrader:
 
         return list(dict.fromkeys(q for q in queries if q and len(q) >= 3))
 
+    def _evaluate_indexed_directory_for_upgrade(
+        self,
+        cd: CandidateDir,
+        parsed_expected: List[Dict[str, Any]],
+        expected_tracks: List[Dict[str, Any]],
+        album_title: str,
+        artist_aliases: Set[str],
+        local_score: int
+    ) -> Optional[Dict[str, Any]]:
+        """Evaluates directory tracklist match and audio quality against local album."""
+        audio_files = cd.audio_files
+        if not audio_files:
+            return None
+
+        matched_tracks: List[Dict[str, Any]] = []
+        for pe, exp in zip(parsed_expected, expected_tracks):
+            exp_title = exp.get("title", "")
+            matched_file = None
+            for cf in audio_files:
+                if is_track_title_match_fast(
+                    pe["p_struct"], pe["words"], pe["clean_words"], pe["sig_words"], pe["concat"],
+                    cf, artist_aliases, album_title, cd.dir_name
+                ):
+                    matched_file = cf
+                    break
+            if matched_file:
+                matched_tracks.append({
+                    "expected": exp_title,
+                    "matched_file": matched_file.base_filename,
+                    "full_filename": matched_file.full_filename,
+                    "size": matched_file.size
+                })
+
+        match_ratio = len(matched_tracks) / len(expected_tracks) if expected_tracks else 0.0
+        if match_ratio < self.min_match_ratio and len(matched_tracks) == 0:
+            return None
+
+        primary_audio = audio_files[0]
+        format_label, format_score = primary_audio.fmt_label, primary_audio.fmt_score
+
+        queue = cd.dir_info.get("queue", 0)
+        speed = cd.dir_info.get("speed", 0)
+        has_slot = cd.dir_info.get("has_slot", True)
+        has_artwork = cd.has_artwork
+
+        queue_penalty = min(queue / 2, 40)
+        speed_bonus = min(speed / 500_000, 20)
+        slot_bonus = 20 if has_slot else 0
+        art_bonus = 10 if has_artwork else 0
+
+        format_weight = format_score
+        if self.target_format in ("flac", "lossless") and "FLAC" in format_label:
+            format_weight += 30
+
+        total_score = (match_ratio * 100) + format_weight + slot_bonus + speed_bonus + art_bonus - queue_penalty
+
+        return {
+            "user": cd.user,
+            "directory": cd.dir_name,
+            "queue": queue,
+            "speed": speed,
+            "has_slot": has_slot,
+            "format_label": format_label,
+            "format_score": format_score,
+            "match_ratio": match_ratio,
+            "matched_tracks": matched_tracks,
+            "total_score": total_score,
+            "has_artwork": has_artwork,
+            "dir_info": cd.dir_info,
+            "all_dir_files": [cf.raw_file for cf in cd.all_dir_files]
+        }
+
+    def _evaluate_directory_for_upgrade(
+        self,
+        user: str,
+        dir_name: str,
+        dir_info: Dict[str, Any],
+        expected_tracks: List[Dict[str, Any]],
+        album_title: str,
+        artist_aliases: Set[str],
+        local_score: int
+    ) -> Optional[Dict[str, Any]]:
+        """Backward-compatible evaluation wrapper."""
+        cd = CandidateDir(user, dir_name, dir_info)
+        parsed_expected = pre_parse_expected_tracks(expected_tracks)
+        return self._evaluate_indexed_directory_for_upgrade(cd, parsed_expected, expected_tracks, album_title, artist_aliases, local_score)
+
     def _reconcile_album_upgrades(self, albums: List[Dict[str, Any]]):
         """Verifies candidate peer directories for low-quality albums with strict quality checks."""
         console.print(f"\n[bold cyan]Verifying Higher-Quality Releases for {len(albums)} Albums...[/bold cyan]")
 
-        dir_token_map = {
-            (user, d): clean_tokens(d)
-            for (user, d) in self.peer_directories.keys()
-        }
+        if self.candidate_index is None:
+            self.candidate_index = PeerCandidateIndex(self.peer_directories)
 
         for alb in albums:
             album_title = alb.get("album", "")
@@ -778,22 +872,29 @@ class SoulseekQualityUpgrader:
                 continue
 
             artist_aliases = {artist_name, unidecode(artist_name), normalize_text(artist_name)}
+            parsed_expected = pre_parse_expected_tracks(expected_tracks)
+            clean_alb = clean_tokens(album_title)
+            alb_words = [w for w in _tokenize_words_cached(album_title) if w not in DIR_STOP_WORDS]
+            alb_sig_words = {w for w in alb_words if len(w) >= 3}
+
+            cand_dirs = self.candidate_index.get_candidate_dirs_for_release(album_title, parsed_expected, len(expected_tracks))
             candidate_matches: List[Dict[str, Any]] = []
 
-            for (user, dir_name), dir_tokens in dir_token_map.items():
-                dir_matches = is_dir_name_match(album_title, dir_name)
+            for cd in cand_dirs:
+                dir_matches = is_dir_name_match_fast(clean_alb, alb_sig_words, cd)
                 if not dir_matches and len(expected_tracks) >= 3:
-                    dir_files = self.peer_directories[(user, dir_name)].get("matched_search_files", [])
-                    matched_cnt = sum(
-                        1 for exp in expected_tracks
-                        if any(is_track_title_match(exp.get("title", ""), extract_dir_and_filename(sf.get("filename", ""))[1], artist_aliases, album_title, dir_name) for sf in dir_files)
-                    )
+                    matched_cnt = 0
+                    for pe in parsed_expected:
+                        if any(is_track_title_match_fast(
+                            pe["p_struct"], pe["words"], pe["clean_words"], pe["sig_words"], pe["concat"],
+                            cf, artist_aliases, album_title, cd.dir_name
+                        ) for cf in cd.audio_files):
+                            matched_cnt += 1
                     if matched_cnt >= 2 and (matched_cnt / len(expected_tracks) >= 0.60):
                         dir_matches = True
 
-                if dir_matches:
-                    dir_info = self.peer_directories.get((user, dir_name), {})
-                    match_data = self._evaluate_directory_for_upgrade(user, dir_name, dir_info, expected_tracks, album_title, artist_aliases, local_min_score)
+                if dir_matches and cd.audio_files:
+                    match_data = self._evaluate_indexed_directory_for_upgrade(cd, parsed_expected, expected_tracks, album_title, artist_aliases, local_min_score)
                     if match_data and match_data["match_ratio"] >= (0.60 if len(expected_tracks) >= 3 else 0.95):
                         if match_data["format_score"] > local_min_score or (self.target_format in ("flac", "lossless") and "FLAC" in match_data["format_label"] and local_min_score < 100):
                             candidate_matches.append(match_data)
@@ -820,7 +921,8 @@ class SoulseekQualityUpgrader:
                                     f_copy["base_filename"] = fn
                                     files.append(f_copy)
                             top_dir_info["full_directory_files"] = files
-                            updated_match = self._evaluate_directory_for_upgrade(top_user, top_dir, top_dir_info, expected_tracks, album_title, artist_aliases, local_min_score)
+                            updated_cd = self.candidate_index.update_directory(top_user, top_dir, top_dir_info)
+                            updated_match = self._evaluate_indexed_directory_for_upgrade(updated_cd, parsed_expected, expected_tracks, album_title, artist_aliases, local_min_score)
                             if updated_match and updated_match["format_score"] > local_min_score:
                                 best_match = updated_match
                     except Exception:
@@ -849,81 +951,6 @@ class SoulseekQualityUpgrader:
                     "local_tracks_count": len(local_tracks)
                 })
 
-    def _evaluate_directory_for_upgrade(
-        self,
-        user: str,
-        dir_name: str,
-        dir_info: Dict[str, Any],
-        expected_tracks: List[Dict[str, Any]],
-        album_title: str,
-        artist_aliases: Set[str],
-        local_score: int
-    ) -> Optional[Dict[str, Any]]:
-        """Evaluates directory tracklist match and audio quality against local album."""
-        dir_files = dir_info.get("full_directory_files") or dir_info.get("matched_search_files", [])
-        if not dir_files:
-            return None
-
-        audio_files = [f for f in dir_files if is_audio_file(f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1])]
-        if not audio_files:
-            return None
-
-        matched_tracks: List[Dict[str, Any]] = []
-        for exp in expected_tracks:
-            exp_title = exp.get("title", "")
-            matched_file = None
-            for f in audio_files:
-                base = f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1]
-                if is_track_title_match(exp_title, base, artist_aliases, album_title, dir_name):
-                    matched_file = f
-                    break
-            if matched_file:
-                matched_tracks.append({
-                    "expected": exp_title,
-                    "matched_file": matched_file.get("base_filename") or extract_dir_and_filename(matched_file.get("filename", ""))[1],
-                    "full_filename": matched_file.get("full_filename") or matched_file.get("filename"),
-                    "size": matched_file.get("size", 0)
-                })
-
-        match_ratio = len(matched_tracks) / len(expected_tracks) if expected_tracks else 0.0
-        if match_ratio < self.min_match_ratio and len(matched_tracks) == 0:
-            return None
-
-        primary_audio = audio_files[0]
-        format_label, format_score = determine_audio_quality(primary_audio)
-
-        queue = dir_info.get("queue", 0)
-        speed = dir_info.get("speed", 0)
-        has_slot = dir_info.get("has_slot", True)
-        has_artwork = any(is_supporting_file(f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1]) for f in dir_files)
-
-        queue_penalty = min(queue / 2, 40)
-        speed_bonus = min(speed / 500_000, 20)
-        slot_bonus = 20 if has_slot else 0
-        art_bonus = 10 if has_artwork else 0
-
-        format_weight = format_score
-        if self.target_format in ("flac", "lossless") and "FLAC" in format_label:
-            format_weight += 30
-
-        total_score = (match_ratio * 100) + format_weight + slot_bonus + speed_bonus + art_bonus - queue_penalty
-
-        return {
-            "user": user,
-            "directory": dir_name,
-            "queue": queue,
-            "speed": speed,
-            "has_slot": has_slot,
-            "format_label": format_label,
-            "format_score": format_score,
-            "match_ratio": match_ratio,
-            "matched_tracks": matched_tracks,
-            "total_score": total_score,
-            "has_artwork": has_artwork,
-            "dir_info": dir_info,
-            "all_dir_files": dir_files
-        }
-
     def _reconcile_single_upgrades(self, singles: List[Dict[str, Any]]):
         """Verifies standalone single files against discovered peer files with strict quality checks."""
         if not singles:
@@ -931,14 +958,8 @@ class SoulseekQualityUpgrader:
 
         console.print(f"\n[bold cyan]Verifying Higher-Quality Releases for {len(singles)} Standalone Singles...[/bold cyan]")
 
-        all_discovered_audio: List[Tuple[str, str, Dict[str, Any], Dict[str, Any]]] = []
-        for (user, dir_name), dir_info in self.peer_directories.items():
-            dir_files = dir_info.get("full_directory_files") or dir_info.get("matched_search_files", [])
-            for sf in dir_files:
-                fn = sf.get("full_filename") or sf.get("filename", "")
-                base = sf.get("base_filename") or extract_dir_and_filename(fn)[1]
-                if is_audio_file(base):
-                    all_discovered_audio.append((user, dir_name, sf, dir_info))
+        if self.candidate_index is None:
+            self.candidate_index = PeerCandidateIndex(self.peer_directories)
 
         for s in singles:
             track_title = s.get("title", "")
@@ -947,27 +968,31 @@ class SoulseekQualityUpgrader:
             local_fmt = s.get("format_label", "Unknown")
             artist_aliases = {artist_name, unidecode(artist_name), normalize_text(artist_name)} if artist_name else set()
 
+            parsed_s = pre_parse_single_track(track_title)
+            cand_files = self.candidate_index.get_candidate_files_for_track(parsed_s)
             candidate_matches: List[Dict[str, Any]] = []
 
-            for user, dir_name, sf, dir_info in all_discovered_audio:
-                fn = sf.get("full_filename") or sf.get("filename", "")
-                base = sf.get("base_filename") or extract_dir_and_filename(fn)[1]
-
-                if is_track_title_match(track_title, base, artist_aliases, s.get("album", ""), dir_name):
-                    fmt_label, fmt_score = determine_audio_quality(sf)
+            for cf in cand_files:
+                if is_track_title_match_fast(
+                    parsed_s["p_struct"], parsed_s["words"], parsed_s["clean_words"],
+                    parsed_s["sig_words"], parsed_s["concat"], cf, artist_aliases,
+                    s.get("album", ""), cf.dir_name
+                ):
+                    fmt_label, fmt_score = cf.fmt_label, cf.fmt_score
 
                     if fmt_score > local_score or (self.target_format in ("flac", "lossless") and "FLAC" in fmt_label and local_score < 100):
+                        dir_info = cf.dir_info
                         queue = dir_info.get("queue", 0)
                         speed = dir_info.get("speed", 0)
                         has_slot = dir_info.get("has_slot", True)
                         fmt_bonus = 30 if (self.target_format in ("flac", "lossless") and "FLAC" in fmt_label) else 0
 
                         candidate_matches.append({
-                            "user": user,
-                            "directory": dir_name,
-                            "matched_file": base,
-                            "full_filename": fn,
-                            "size": sf.get("size", 0),
+                            "user": cf.user,
+                            "directory": cf.dir_name,
+                            "matched_file": cf.base_filename,
+                            "full_filename": cf.full_filename,
+                            "size": cf.size,
                             "format_label": fmt_label,
                             "format_score": fmt_score,
                             "queue": queue,

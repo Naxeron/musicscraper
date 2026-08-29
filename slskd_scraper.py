@@ -27,6 +27,7 @@ import csv
 import json
 import time
 import argparse
+from functools import lru_cache
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Set, Tuple, Optional, Any
@@ -71,6 +72,12 @@ SUPPORTING_EXTENSIONS = {
 
 POLISH_DIACRITICS_MAP = str.maketrans("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ", "acelnoszzACELNOSZZ")
 
+DIR_STOP_WORDS = {
+    "various", "artists", "va", "compilation", "album", "ep", "vol",
+    "part", "records", "crew", "part1", "part2", "the", "a", "an",
+    "and", "or", "in", "of", "to", "for", "with", "on", "at"
+}
+
 
 def katakana_to_hiragana(text: str) -> str:
     """Converts Katakana characters to Hiragana for uniform Japanese phonetic matching."""
@@ -84,6 +91,7 @@ def katakana_to_hiragana(text: str) -> str:
     return "".join(res)
 
 
+@lru_cache(maxsize=65536)
 def normalize_track_title(text: Optional[str]) -> str:
     """
     Comprehensive string normalization:
@@ -104,7 +112,8 @@ def normalize_track_title(text: Optional[str]) -> str:
     return re.sub(r"\s+", " ", norm).strip()
 
 
-def clean_tokens(text: str) -> str:
+@lru_cache(maxsize=65536)
+def clean_tokens(text: Optional[str]) -> str:
     """Strips all punctuation and whitespace for compressed token comparison."""
     if not text:
         return ""
@@ -112,12 +121,17 @@ def clean_tokens(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", norm)
 
 
-def tokenize_words(text: str) -> List[str]:
-    """Extracts lowercase alphanumeric words with unidecode transliteration and number splitting."""
+@lru_cache(maxsize=65536)
+def _tokenize_words_cached(text: Optional[str]) -> Tuple[str, ...]:
     if not text:
-        return []
+        return ()
     norm = normalize_track_title(text)
-    return re.findall(r"[a-z0-9]+", norm)
+    return tuple(re.findall(r"[a-z0-9]+", norm))
+
+
+def tokenize_words(text: Optional[str]) -> List[str]:
+    """Extracts lowercase alphanumeric words with unidecode transliteration and number splitting."""
+    return list(_tokenize_words_cached(text))
 
 
 def is_sublist(sub: List[str], full: List[str]) -> bool:
@@ -149,83 +163,6 @@ def extract_catalog_codes(text: str) -> List[str]:
             if len(code) >= 4:
                 codes.append(code)
     return list(dict.fromkeys(codes))
-
-
-def is_track_title_match(
-    exp_title: str,
-    candidate_filename: str,
-    artist_aliases: Set[str],
-    rel_title: str = "",
-    dir_path: str = ""
-) -> bool:
-    """
-    Robustly verifies if candidate_filename matches expected track title:
-    - Enforces version and remix compatibility (original vs remix vs different remixer).
-    - Uses whole-word token sub-sequence matching.
-    - Tests compressed tokens (handles symbols like F>B>D, $S$S$, むげん☆ういんぐ).
-    - Checks fuzzy similarity for minor tagging variances.
-    - For short titles (<= 3 chars or 1 common word), validates directory or artist context.
-    """
-    # 0. Version compatibility check
-    p_exp = parse_track_title_structure(exp_title)
-    p_cand = parse_track_title_structure(candidate_filename)
-    if not are_versions_compatible(p_exp["version_type"], p_exp["version_text"], p_cand["version_type"], p_cand["version_text"]):
-        return False
-
-    exp_words = tokenize_words(p_exp["base_norm"] or exp_title)
-    if not exp_words:
-        return False
-
-    clean_exp_title = p_exp["base_norm"] or strip_track_number_and_artist(exp_title)
-    clean_exp_words = tokenize_words(clean_exp_title) or exp_words
-
-    file_words = tokenize_words(p_cand["base_norm"] or candidate_filename)
-    clean_file_words = tokenize_words(p_cand["base_norm"] or strip_track_number_and_artist(candidate_filename)) or file_words
-
-    # 1. Direct token sequence match
-    exact_match = (
-        is_sublist(exp_words, file_words) or
-        is_sublist(clean_exp_words, clean_file_words) or
-        is_sublist(clean_exp_words, file_words) or
-        is_sublist(exp_words, clean_file_words)
-    )
-
-    # 2. Check concatenated tokens
-    exp_concat = "".join(clean_exp_words)
-    file_concat = "".join(clean_file_words)
-    if not exact_match and len(exp_concat) >= 3:
-        if exp_concat in file_concat or file_concat in exp_concat:
-            exact_match = True
-
-    # 3. Fuzzy similarity fallback
-    if not exact_match and len(exp_concat) >= 4:
-        norm_exp = normalize_track_title(clean_exp_title)
-        norm_file = normalize_track_title(strip_track_number_and_artist(candidate_filename))
-        sim = calculate_similarity(norm_exp, norm_file)
-        if sim >= 0.82:
-            exact_match = True
-
-    if not exact_match:
-        return False
-
-    # 4. Contextual validation for very short titles
-    if len(clean_exp_words) <= 1 or len(exp_concat) <= 3:
-        dir_norm = clean_tokens(dir_path)
-        file_norm = clean_tokens(candidate_filename)
-        has_artist_context = any(clean_tokens(alias) in dir_norm or clean_tokens(alias) in file_norm for alias in artist_aliases if len(alias) >= 3)
-        has_rel_context = False
-        if rel_title:
-            rel_words = [w for w in tokenize_words(rel_title) if w not in ("various", "artists", "va", "compilation", "album", "ep", "vol")]
-            if rel_words:
-                has_rel_context = (
-                    is_sublist(rel_words[:3], tokenize_words(dir_path)) or
-                    any(w in dir_norm for w in rel_words if len(w) >= 4)
-                )
-
-        if not has_artist_context and not has_rel_context:
-            return False
-
-    return True
 
 
 def sanitize_remote_path(path_str: str) -> str:
@@ -291,16 +228,302 @@ def clean_search_phrase(text: str, max_words: int = 6) -> str:
     return " ".join(words[:max_words]).strip()
 
 
+# ==============================================================================
+# CANDIDATE INDEXING & FAST MATCHING ENGINE
+# ==============================================================================
+
+class CandidateFile:
+    """Pre-parsed, indexed representation of a discovered remote Soulseek file."""
+    __slots__ = (
+        "user", "dir_name", "raw_file", "dir_info", "base_filename", "full_filename",
+        "clean_base", "words", "clean_words", "sig_words", "concat",
+        "p_struct", "is_audio", "is_supporting", "fmt_label", "fmt_score", "size"
+    )
+
+    def __init__(self, user: str, dir_name: str, raw_file: Dict[str, Any], dir_info: Optional[Dict[str, Any]] = None):
+        self.user = user
+        self.dir_name = dir_name
+        self.raw_file = raw_file
+        self.dir_info = dir_info or {}
+        fn = raw_file.get("full_filename") or raw_file.get("filename", "")
+        self.full_filename = fn
+        self.base_filename = raw_file.get("base_filename") or extract_dir_and_filename(fn)[1]
+        self.size = raw_file.get("size", 0)
+        self.is_audio = is_audio_file(self.base_filename)
+        self.is_supporting = is_supporting_file(self.base_filename)
+        if self.is_audio:
+            self.p_struct = parse_track_title_structure(self.base_filename)
+            self.clean_base = self.p_struct["base_norm"] or strip_track_number_and_artist(self.base_filename)
+            self.words = list(_tokenize_words_cached(self.p_struct["base_norm"] or self.base_filename))
+            self.clean_words = list(_tokenize_words_cached(self.clean_base)) or self.words
+            self.sig_words = {w for w in self.clean_words if len(w) >= 3 and w not in DIR_STOP_WORDS}
+            self.concat = "".join(self.clean_words)
+            self.fmt_label, self.fmt_score = determine_audio_quality(raw_file)
+        else:
+            self.p_struct = None
+            self.clean_base = ""
+            self.words = []
+            self.clean_words = []
+            self.sig_words = set()
+            self.concat = ""
+            self.fmt_label, self.fmt_score = "", 0
+
+
+class CandidateDir:
+    """Pre-parsed, indexed representation of a discovered remote peer directory."""
+    __slots__ = (
+        "user", "dir_name", "clean_dir", "dir_words", "dir_sig_words",
+        "audio_files", "all_dir_files", "all_file_sig_words", "has_artwork", "dir_info"
+    )
+
+    def __init__(self, user: str, dir_name: str, dir_info: Dict[str, Any]):
+        self.user = user
+        self.dir_name = dir_name
+        self.dir_info = dir_info
+        self.clean_dir = clean_tokens(dir_name)
+        self.dir_words = set(_tokenize_words_cached(dir_name))
+        self.dir_sig_words = {w for w in self.dir_words if len(w) >= 3 and w not in DIR_STOP_WORDS}
+
+        raw_files = dir_info.get("full_directory_files") or dir_info.get("matched_search_files", [])
+        self.audio_files: List[CandidateFile] = []
+        self.all_dir_files: List[CandidateFile] = []
+        self.all_file_sig_words: Set[str] = set()
+        self.has_artwork = False
+
+        for rf in raw_files:
+            cf = CandidateFile(user, dir_name, rf, dir_info)
+            self.all_dir_files.append(cf)
+            if cf.is_audio:
+                self.audio_files.append(cf)
+                self.all_file_sig_words.update(cf.sig_words)
+            elif cf.is_supporting:
+                self.has_artwork = True
+
+
+class PeerCandidateIndex:
+    """In-memory inverted index over discovered Soulseek directories and audio files."""
+
+    def __init__(self, peer_directories: Dict[Tuple[str, str], Dict[str, Any]]):
+        self.peer_directories = peer_directories
+        self.dirs_map: Dict[Tuple[str, str], CandidateDir] = {}
+        self.word_to_dirs: Dict[str, List[CandidateDir]] = {}
+        self.word_to_audio_files: Dict[str, List[CandidateFile]] = {}
+        self.all_audio_files: List[CandidateFile] = []
+        self.all_dirs: List[CandidateDir] = []
+        self._build_index()
+
+    def _build_index(self):
+        for (user, dir_name), dir_info in self.peer_directories.items():
+            cd = CandidateDir(user, dir_name, dir_info)
+            self.dirs_map[(user, dir_name)] = cd
+            self.all_dirs.append(cd)
+
+            for w in cd.dir_sig_words:
+                if w not in self.word_to_dirs:
+                    self.word_to_dirs[w] = []
+                self.word_to_dirs[w].append(cd)
+
+            for cf in cd.audio_files:
+                self.all_audio_files.append(cf)
+                for w in cf.sig_words:
+                    if w not in self.word_to_audio_files:
+                        self.word_to_audio_files[w] = []
+                    self.word_to_audio_files[w].append(cf)
+
+    def update_directory(self, user: str, dir_name: str, dir_info: Dict[str, Any]) -> CandidateDir:
+        """Updates a directory after fetching its complete remote file listing."""
+        cd = CandidateDir(user, dir_name, dir_info)
+        self.dirs_map[(user, dir_name)] = cd
+        return cd
+
+    def get_candidate_dirs_for_release(
+        self,
+        rel_title: str,
+        parsed_expected: List[Dict[str, Any]],
+        expected_count: int
+    ) -> List[CandidateDir]:
+        """Sub-millisecond filtering of 7000+ candidate dirs to only relevant directories for this release."""
+        clean_rel = clean_tokens(rel_title)
+        rel_words = [w for w in _tokenize_words_cached(rel_title) if w not in DIR_STOP_WORDS]
+        rel_sig_words = {w for w in rel_words if len(w) >= 3}
+
+        album_sig_words: Set[str] = set()
+        for pe in parsed_expected:
+            album_sig_words.update(pe["sig_words"])
+
+        cand_dirs_set: Set[CandidateDir] = set()
+
+        # 1. Match directories containing release name tokens
+        for w in rel_sig_words:
+            if w in self.word_to_dirs:
+                cand_dirs_set.update(self.word_to_dirs[w])
+
+        # 2. Match directories with clean token substring
+        if clean_rel:
+            for cd in self.all_dirs:
+                if clean_rel in cd.clean_dir or cd.clean_dir in clean_rel:
+                    cand_dirs_set.add(cd)
+
+        # 3. For releases with >= 3 expected tracks, also match directories whose files overlap with track names
+        if expected_count >= 3:
+            for w in album_sig_words:
+                if w in self.word_to_dirs:
+                    cand_dirs_set.update(self.word_to_dirs[w])
+
+        return list(cand_dirs_set)
+
+    def get_candidate_files_for_track(self, parsed_track: Dict[str, Any]) -> List[CandidateFile]:
+        """Filters 60,000+ candidate files down to the ~2-10 files containing the target track's words."""
+        sig_words = parsed_track["sig_words"]
+        if not sig_words:
+            return self.all_audio_files
+
+        matched_files_set: Set[CandidateFile] = set()
+        for w in sig_words:
+            if w in self.word_to_audio_files:
+                matched_files_set.update(self.word_to_audio_files[w])
+
+        return list(matched_files_set) if matched_files_set else self.all_audio_files
+
+
+def pre_parse_single_track(track_title: str) -> Dict[str, Any]:
+    """Pre-parses and tokenizes a single track title for zero-allocation fast matching."""
+    p_struct = parse_track_title_structure(track_title)
+    clean_base = p_struct["base_norm"] or strip_track_number_and_artist(track_title)
+    words = list(_tokenize_words_cached(p_struct["base_norm"] or track_title))
+    clean_words = list(_tokenize_words_cached(clean_base)) or words
+    sig_words = {w for w in clean_words if len(w) >= 3 and w not in DIR_STOP_WORDS}
+    concat = "".join(clean_words)
+    return {
+        "title": track_title,
+        "p_struct": p_struct,
+        "clean_base": clean_base,
+        "words": words,
+        "clean_words": clean_words,
+        "sig_words": sig_words,
+        "concat": concat,
+    }
+
+
+def pre_parse_expected_tracks(expected_tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Pre-parses an album's expected tracklist."""
+    return [pre_parse_single_track(t.get("title", "")) for t in expected_tracks]
+
+
+def is_track_title_match_fast(
+    p_exp: Dict[str, Any],
+    exp_words: List[str],
+    clean_exp_words: List[str],
+    exp_sig_words: Set[str],
+    exp_concat: str,
+    cand: CandidateFile,
+    artist_aliases: Set[str],
+    rel_title: str = "",
+    dir_path: str = ""
+) -> bool:
+    """
+    High-performance, zero-allocation track title matcher comparing pre-tokenized structures:
+    - Enforces version and remix compatibility.
+    - Uses whole-word token sub-sequence matching.
+    - Tests compressed tokens (handles symbols like F>B>D, $S$S$, むげん☆ういんぐ).
+    - Checks fuzzy similarity for minor tagging variances.
+    - For short titles (<= 3 chars or 1 common word), validates directory or artist context.
+    """
+    p_cand = cand.p_struct
+    if not p_cand:
+        return False
+
+    # 0. Version compatibility check
+    if not are_versions_compatible(p_exp["version_type"], p_exp["version_text"], p_cand["version_type"], p_cand["version_text"]):
+        return False
+
+    if not exp_words:
+        return False
+
+    file_words = cand.words
+    clean_file_words = cand.clean_words
+
+    # 1. Direct token sequence match
+    exact_match = (
+        is_sublist(exp_words, file_words) or
+        is_sublist(clean_exp_words, clean_file_words) or
+        is_sublist(clean_exp_words, file_words) or
+        is_sublist(exp_words, clean_file_words)
+    )
+
+    # 2. Check concatenated tokens
+    if not exact_match and len(exp_concat) >= 3:
+        if exp_concat in cand.concat or cand.concat in exp_concat:
+            exact_match = True
+
+    # 3. Fuzzy similarity fallback
+    if not exact_match and len(exp_concat) >= 4:
+        if (exp_sig_words & cand.sig_words) or not exp_sig_words:
+            sim = calculate_similarity(p_exp["base_norm"], cand.clean_base)
+            if sim >= 0.82:
+                exact_match = True
+
+    if not exact_match:
+        return False
+
+    # 4. Contextual validation for very short titles
+    if len(clean_exp_words) <= 1 or len(exp_concat) <= 3:
+        dir_norm = clean_tokens(dir_path)
+        file_norm = cand.concat
+        has_artist_context = any(clean_tokens(alias) in dir_norm or clean_tokens(alias) in file_norm for alias in artist_aliases if len(alias) >= 3)
+        has_rel_context = False
+        if rel_title:
+            rel_words = [w for w in _tokenize_words_cached(rel_title) if w not in DIR_STOP_WORDS]
+            if rel_words:
+                has_rel_context = (
+                    is_sublist(rel_words[:3], list(_tokenize_words_cached(dir_path))) or
+                    any(w in dir_norm for w in rel_words if len(w) >= 4)
+                )
+
+        if not has_artist_context and not has_rel_context:
+            return False
+
+    return True
+
+
+def is_track_title_match(
+    exp_title: str,
+    candidate_filename: str,
+    artist_aliases: Set[str],
+    rel_title: str = "",
+    dir_path: str = ""
+) -> bool:
+    """Backward-compatible wrapper for single-track matching."""
+    pe = pre_parse_single_track(exp_title)
+    dummy_raw = {"filename": candidate_filename, "size": 0}
+    cf = CandidateFile("", dir_path, dummy_raw)
+    return is_track_title_match_fast(
+        pe["p_struct"], pe["words"], pe["clean_words"], pe["sig_words"], pe["concat"],
+        cf, artist_aliases, rel_title, dir_path
+    )
+
+
+def is_dir_name_match_fast(clean_rel: str, rel_sig_words: Set[str], cd: CandidateDir) -> bool:
+    """Fast directory name match check using precomputed token sets."""
+    if clean_rel and (clean_rel in cd.clean_dir or cd.clean_dir in clean_rel):
+        return True
+    if not rel_sig_words:
+        return False
+    matches = len(rel_sig_words & cd.dir_sig_words)
+    return matches >= min(2, len(rel_sig_words))
+
+
 def is_dir_name_match(rel_title: str, dir_name: str) -> bool:
     """Verifies whether a directory path corresponds to a specific release title."""
     clean_rel = clean_tokens(rel_title)
     clean_dir = clean_tokens(dir_name)
     if clean_rel and (clean_rel in clean_dir or clean_dir in clean_rel):
         return True
-    rel_words = [w for w in tokenize_words(rel_title) if w not in ("various", "artists", "va", "compilation", "album", "ep", "vol", "part", "records", "crew", "part1", "part2")]
+    rel_words = [w for w in _tokenize_words_cached(rel_title) if w not in DIR_STOP_WORDS]
     if not rel_words:
         return False
-    matches = sum(1 for w in rel_words if len(w) >= 3 and w in clean_dir)
+    dir_words = set(_tokenize_words_cached(dir_name))
+    matches = sum(1 for w in rel_words if len(w) >= 3 and w in dir_words)
     return matches >= min(2, len(rel_words))
 
 
@@ -351,6 +574,7 @@ class SlskdArtistScraper:
 
         # Discovered peers & directory cache
         self.peer_directories: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self.candidate_index: Optional[PeerCandidateIndex] = None
         self.searches_performed: Set[str] = set()
 
         # Deduplication & coverage tracking
@@ -636,17 +860,109 @@ class SlskdArtistScraper:
                         total_discovered_files += 1
 
         console.print(f"[green]✔ Soulseek Discovery:[/green] Found [bold]{len(self.peer_directories)}[/bold] candidate directories ([dim]{total_discovered_files} candidate files[/dim]) across peers.")
+        self.candidate_index = PeerCandidateIndex(self.peer_directories)
+
+    def _evaluate_indexed_directory(
+        self,
+        cd: CandidateDir,
+        parsed_expected: List[Dict[str, Any]],
+        expected_tracks: List[Dict[str, Any]],
+        rel_title: str
+    ) -> Optional[Dict[str, Any]]:
+        """Fast in-memory comparison of directory files against expected release tracklist."""
+        audio_files = cd.audio_files
+        if not audio_files:
+            return None
+
+        matched_tracks: List[Dict[str, Any]] = []
+        unmatched_expected: List[Dict[str, Any]] = []
+
+        for pe, exp in zip(parsed_expected, expected_tracks):
+            exp_title = exp.get("title", "")
+            matched_file = None
+
+            for cf in audio_files:
+                if is_track_title_match_fast(
+                    pe["p_struct"], pe["words"], pe["clean_words"], pe["sig_words"], pe["concat"],
+                    cf, self.all_artist_aliases, rel_title, cd.dir_name
+                ):
+                    matched_file = cf
+                    break
+
+            if matched_file:
+                matched_tracks.append({
+                    "expected": exp_title,
+                    "matched_file": matched_file.base_filename,
+                    "full_filename": matched_file.full_filename,
+                    "size": matched_file.size
+                })
+            else:
+                unmatched_expected.append(exp)
+
+        match_ratio = len(matched_tracks) / len(expected_tracks) if expected_tracks else 0.0
+
+        if match_ratio < self.min_match_ratio and len(matched_tracks) == 0:
+            return None
+
+        has_bonus = len(audio_files) > len(expected_tracks) and match_ratio >= 0.70
+
+        primary_audio = audio_files[0]
+        format_label, format_score = primary_audio.fmt_label, primary_audio.fmt_score
+
+        queue = cd.dir_info.get("queue", 0)
+        speed = cd.dir_info.get("speed", 0)
+        has_slot = cd.dir_info.get("has_slot", True)
+        has_artwork = cd.has_artwork
+
+        queue_penalty = min(queue / 2, 40)
+        speed_bonus = min(speed / 500_000, 20)
+        slot_bonus = 20 if has_slot else 0
+        art_bonus = 10 if has_artwork else 0
+        bonus_ver_bonus = 15 if has_bonus else 0
+
+        format_weight = format_score
+        if self.preferred_format == "flac" and "FLAC" in format_label:
+            format_weight += 25
+
+        total_score = (match_ratio * 100) + format_weight + slot_bonus + speed_bonus + art_bonus + bonus_ver_bonus - queue_penalty
+
+        return {
+            "user": cd.user,
+            "directory": cd.dir_name,
+            "queue": queue,
+            "speed": speed,
+            "has_slot": has_slot,
+            "format_label": format_label,
+            "format_score": format_score,
+            "match_ratio": match_ratio,
+            "matched_tracks": matched_tracks,
+            "unmatched_expected": [u.get("title") for u in unmatched_expected],
+            "total_score": total_score,
+            "has_artwork": has_artwork,
+            "dir_info": cd.dir_info,
+            "all_dir_files": [cf.raw_file for cf in cd.all_dir_files]
+        }
+
+    def _evaluate_directory_in_memory(
+        self,
+        user: str,
+        dir_name: str,
+        dir_info: Dict[str, Any],
+        expected_tracks: List[Dict[str, Any]],
+        rel_title: str
+    ) -> Optional[Dict[str, Any]]:
+        """Backward-compatible evaluation wrapper."""
+        cd = CandidateDir(user, dir_name, dir_info)
+        parsed_expected = pre_parse_expected_tracks(expected_tracks)
+        return self._evaluate_indexed_directory(cd, parsed_expected, expected_tracks, rel_title)
 
     def _reconcile_primary_releases(self):
         """Verifies candidate directories against all primary releases from MusicBrainz."""
         primary_rels = self.catalog.primary_releases if hasattr(self.catalog, "primary_releases") else [r for r in self.catalog.releases if not r.get("is_va", False)]
         console.print(f"\n[bold cyan]Verifying Primary Releases ({len(primary_rels)} releases)...[/bold cyan]")
 
-        # Index peer directories by clean path tokens
-        dir_token_map: Dict[Tuple[str, str], str] = {
-            (user, d): clean_tokens(d)
-            for (user, d) in self.peer_directories.keys()
-        }
+        if self.candidate_index is None:
+            self.candidate_index = PeerCandidateIndex(self.peer_directories)
 
         for rel in primary_rels:
             rel_title = rel.get("title", "")
@@ -666,25 +982,30 @@ class SlskdArtistScraper:
             if not expected_tracks:
                 continue
 
+            parsed_expected = pre_parse_expected_tracks(expected_tracks)
+            clean_rel = clean_tokens(rel_title)
+            rel_words = [w for w in _tokenize_words_cached(rel_title) if w not in DIR_STOP_WORDS]
+            rel_sig_words = {w for w in rel_words if len(w) >= 3}
+
+            # Instant candidate filtering using inverted index
+            cand_dirs = self.candidate_index.get_candidate_dirs_for_release(rel_title, parsed_expected, len(expected_tracks))
             candidate_matches: List[Dict[str, Any]] = []
 
-            # 1. Fast in-memory evaluation against candidate directories
-            for (user, dir_name), dir_tokens in dir_token_map.items():
-                dir_matches = is_dir_name_match(rel_title, dir_name)
-                if not dir_matches:
-                    # For releases with >= 3 expected tracks, allow track-level candidate match if >= 2 tracks match and high ratio
-                    if len(expected_tracks) >= 3:
-                        dir_files = self.peer_directories[(user, dir_name)].get("matched_search_files", [])
-                        matched_cnt = sum(
-                            1 for exp in expected_tracks
-                            if any(is_track_title_match(exp.get("title", ""), extract_dir_and_filename(sf.get("filename", ""))[1], self.all_artist_aliases, rel_title, dir_name) for sf in dir_files)
-                        )
-                        if matched_cnt >= 2 and (matched_cnt / len(expected_tracks) >= 0.60):
-                            dir_matches = True
+            for cd in cand_dirs:
+                dir_matches = is_dir_name_match_fast(clean_rel, rel_sig_words, cd)
+                if not dir_matches and len(expected_tracks) >= 3:
+                    matched_cnt = 0
+                    for pe in parsed_expected:
+                        if any(is_track_title_match_fast(
+                            pe["p_struct"], pe["words"], pe["clean_words"], pe["sig_words"], pe["concat"],
+                            cf, self.all_artist_aliases, rel_title, cd.dir_name
+                        ) for cf in cd.audio_files):
+                            matched_cnt += 1
+                    if matched_cnt >= 2 and (matched_cnt / len(expected_tracks) >= 0.60):
+                        dir_matches = True
 
-                if dir_matches:
-                    dir_info = self.peer_directories.get((user, dir_name), {})
-                    match_data = self._evaluate_directory_in_memory(user, dir_name, dir_info, expected_tracks, rel_title)
+                if dir_matches and cd.audio_files:
+                    match_data = self._evaluate_indexed_directory(cd, parsed_expected, expected_tracks, rel_title)
                     if match_data and match_data["match_ratio"] >= (0.60 if len(expected_tracks) >= 3 else 0.99):
                         candidate_matches.append(match_data)
 
@@ -712,8 +1033,8 @@ class SlskdArtistScraper:
                                         f_copy["base_filename"] = fn
                                         files.append(f_copy)
                                 top_dir_info["full_directory_files"] = files
-                                # Re-evaluate with complete files
-                                updated_match = self._evaluate_directory_in_memory(top_user, top_dir, top_dir_info, expected_tracks, rel_title)
+                                updated_cd = self.candidate_index.update_directory(top_user, top_dir, top_dir_info)
+                                updated_match = self._evaluate_indexed_directory(updated_cd, parsed_expected, expected_tracks, rel_title)
                                 if updated_match:
                                     best_match = updated_match
                         except Exception:
@@ -748,103 +1069,13 @@ class SlskdArtistScraper:
                     "expected_tracks": [t.get("title") for t in expected_tracks]
                 })
 
-    def _evaluate_directory_in_memory(
-        self,
-        user: str,
-        dir_name: str,
-        dir_info: Dict[str, Any],
-        expected_tracks: List[Dict[str, Any]],
-        rel_title: str
-    ) -> Optional[Dict[str, Any]]:
-        """Fast in-memory comparison of directory files against expected release tracklist."""
-        dir_files = dir_info.get("full_directory_files") or dir_info.get("matched_search_files", [])
-        if not dir_files:
-            return None
-
-        audio_files = [f for f in dir_files if is_audio_file(f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1])]
-        if not audio_files:
-            return None
-
-        matched_tracks: List[Dict[str, Any]] = []
-        unmatched_expected: List[Dict[str, Any]] = []
-
-        for exp in expected_tracks:
-            exp_title = exp.get("title", "")
-            matched_file = None
-
-            for f in audio_files:
-                base = f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1]
-                if is_track_title_match(exp_title, base, self.all_artist_aliases, rel_title, dir_name):
-                    matched_file = f
-                    break
-
-            if matched_file:
-                matched_tracks.append({
-                    "expected": exp_title,
-                    "matched_file": matched_file.get("base_filename") or extract_dir_and_filename(matched_file.get("filename", ""))[1],
-                    "full_filename": matched_file.get("full_filename") or matched_file.get("filename"),
-                    "size": matched_file.get("size", 0)
-                })
-            else:
-                unmatched_expected.append(exp)
-
-        match_ratio = len(matched_tracks) / len(expected_tracks) if expected_tracks else 0.0
-
-        if match_ratio < self.min_match_ratio and len(matched_tracks) == 0:
-            return None
-
-        has_bonus = len(audio_files) > len(expected_tracks) and match_ratio >= 0.70
-
-        primary_audio = audio_files[0]
-        format_label, format_score = determine_audio_quality(primary_audio)
-
-        queue = dir_info.get("queue", 0)
-        speed = dir_info.get("speed", 0)
-        has_slot = dir_info.get("has_slot", True)
-        has_artwork = any(is_supporting_file(f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1]) for f in dir_files)
-
-        queue_penalty = min(queue / 2, 40)
-        speed_bonus = min(speed / 500_000, 20)
-        slot_bonus = 20 if has_slot else 0
-        art_bonus = 10 if has_artwork else 0
-        bonus_ver_bonus = 15 if has_bonus else 0
-
-        format_weight = format_score
-        if self.preferred_format == "flac" and "FLAC" in format_label:
-            format_weight += 25
-
-        total_score = (match_ratio * 100) + format_weight + slot_bonus + speed_bonus + art_bonus + bonus_ver_bonus - queue_penalty
-
-        return {
-            "user": user,
-            "directory": dir_name,
-            "queue": queue,
-            "speed": speed,
-            "has_slot": has_slot,
-            "format_label": format_label,
-            "format_score": format_score,
-            "match_ratio": match_ratio,
-            "matched_tracks": matched_tracks,
-            "unmatched_expected": [u.get("title") for u in unmatched_expected],
-            "total_score": total_score,
-            "has_artwork": has_artwork,
-            "dir_info": dir_info,
-            "all_dir_files": dir_files
-        }
-
     def _reconcile_compilation_tracks(self):
         """Verifies candidate tracks on compilation / VA releases."""
         comp_releases = self.raw_mb_data.get("releases_track_artist", [])
         console.print(f"\n[bold cyan]Verifying Compilation & Split Tracks ({len(comp_releases)} releases)...[/bold cyan]")
 
-        all_discovered_audio_files: List[Tuple[str, str, Dict[str, Any], Dict[str, Any]]] = []
-        for (user, dir_name), dir_info in self.peer_directories.items():
-            dir_files = dir_info.get("full_directory_files") or dir_info.get("matched_search_files", [])
-            for sf in dir_files:
-                fn = sf.get("full_filename") or sf.get("filename", "")
-                base = sf.get("base_filename") or extract_dir_and_filename(fn)[1]
-                if is_audio_file(base):
-                    all_discovered_audio_files.append((user, dir_name, sf, dir_info))
+        if self.candidate_index is None:
+            self.candidate_index = PeerCandidateIndex(self.peer_directories)
 
         for rel in comp_releases:
             rel_title = rel.get("title", "")
@@ -888,20 +1119,21 @@ class SlskdArtistScraper:
             if token_rel:
                 self.reconciled_release_keys.add(token_rel)
 
-            # Deduplicate by picking best matching candidate directory for this compilation
             comp_candidate_dirs: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
             for tt in missing_tracks:
                 t_title = tt.get("title", "")
-                norm_t = tt.get("norm_title", "")
-                clean_t = clean_tokens(t_title)
+                parsed_tt = pre_parse_single_track(t_title)
+                cand_files = self.candidate_index.get_candidate_files_for_track(parsed_tt)
 
-                for user, dir_name, sf, dir_info in all_discovered_audio_files:
-                    fn = sf.get("full_filename") or sf.get("filename", "")
-                    base = sf.get("base_filename") or extract_dir_and_filename(fn)[1]
-
-                    if is_track_title_match(t_title, base, self.all_artist_aliases, rel_title, dir_name):
-                        fmt_label, fmt_score = determine_audio_quality(sf)
+                for cf in cand_files:
+                    if is_track_title_match_fast(
+                        parsed_tt["p_struct"], parsed_tt["words"], parsed_tt["clean_words"],
+                        parsed_tt["sig_words"], parsed_tt["concat"], cf, self.all_artist_aliases,
+                        rel_title, cf.dir_name
+                    ):
+                        fmt_label, fmt_score = cf.fmt_label, cf.fmt_score
+                        dir_info = cf.dir_info
                         queue = dir_info.get("queue", 0)
                         speed = dir_info.get("speed", 0)
                         has_slot = dir_info.get("has_slot", True)
@@ -909,14 +1141,14 @@ class SlskdArtistScraper:
                         fmt_bonus = 25 if self.preferred_format == "flac" and "FLAC" in fmt_label else 0
                         score = fmt_score + fmt_bonus + (20 if has_slot else 0) + min(speed / 500_000, 20) - min(queue / 2, 40)
 
-                        dir_key = (user, dir_name)
+                        dir_key = (cf.user, cf.dir_name)
                         if dir_key not in comp_candidate_dirs or score > comp_candidate_dirs[dir_key]["score"]:
                             comp_candidate_dirs[dir_key] = {
-                                "user": user,
-                                "directory": dir_name,
-                                "matched_file": base,
-                                "full_filename": fn,
-                                "size": sf.get("size", 0),
+                                "user": cf.user,
+                                "directory": cf.dir_name,
+                                "matched_file": cf.base_filename,
+                                "full_filename": cf.full_filename,
+                                "size": cf.size,
                                 "format_label": fmt_label,
                                 "format_score": fmt_score,
                                 "queue": queue,
@@ -977,14 +1209,8 @@ class SlskdArtistScraper:
         if not standalone_candidates:
             return
 
-        all_discovered_audio_files: List[Tuple[str, str, Dict[str, Any], Dict[str, Any]]] = []
-        for (user, dir_name), dir_info in self.peer_directories.items():
-            dir_files = dir_info.get("full_directory_files") or dir_info.get("matched_search_files", [])
-            for sf in dir_files:
-                fn = sf.get("full_filename") or sf.get("filename", "")
-                base = sf.get("base_filename") or extract_dir_and_filename(fn)[1]
-                if is_audio_file(base):
-                    all_discovered_audio_files.append((user, dir_name, sf, dir_info))
+        if self.candidate_index is None:
+            self.candidate_index = PeerCandidateIndex(self.peer_directories)
 
         for t in standalone_candidates:
             t_title = t.get("title", "")
@@ -995,23 +1221,28 @@ class SlskdArtistScraper:
             if norm_t in all_covered_titles or clean_t in all_covered_titles:
                 continue
 
+            parsed_t = pre_parse_single_track(t_title)
+            cand_files = self.candidate_index.get_candidate_files_for_track(parsed_t)
             matched_candidates: List[Dict[str, Any]] = []
 
-            for user, dir_name, sf, dir_info in all_discovered_audio_files:
-                fn = sf.get("full_filename") or sf.get("filename", "")
-                base = sf.get("base_filename") or extract_dir_and_filename(fn)[1]
-                if is_track_title_match(t_title, base, self.all_artist_aliases, t.get("release_title", ""), dir_name):
-                    fmt_label, fmt_score = determine_audio_quality(sf)
+            for cf in cand_files:
+                if is_track_title_match_fast(
+                    parsed_t["p_struct"], parsed_t["words"], parsed_t["clean_words"],
+                    parsed_t["sig_words"], parsed_t["concat"], cf, self.all_artist_aliases,
+                    t.get("release_title", ""), cf.dir_name
+                ):
+                    fmt_label, fmt_score = cf.fmt_label, cf.fmt_score
+                    dir_info = cf.dir_info
                     queue = dir_info.get("queue", 0)
                     speed = dir_info.get("speed", 0)
                     has_slot = dir_info.get("has_slot", True)
                     fmt_bonus = 25 if self.preferred_format == "flac" and "FLAC" in fmt_label else 0
                     matched_candidates.append({
-                        "user": user,
-                        "directory": dir_name,
-                        "matched_file": base,
-                        "full_filename": fn,
-                        "size": sf.get("size", 0),
+                        "user": cf.user,
+                        "directory": cf.dir_name,
+                        "matched_file": cf.base_filename,
+                        "full_filename": cf.full_filename,
+                        "size": cf.size,
                         "format_label": fmt_label,
                         "format_score": fmt_score,
                         "queue": queue,

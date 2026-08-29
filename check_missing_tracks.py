@@ -104,6 +104,8 @@ DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/musicscraper/mb_cache")
 DEFAULT_AUDIO_CACHE_DB = os.path.expanduser("~/.cache/musicscraper/audio_cache.db")
 
 
+from functools import lru_cache
+
 # ==============================================================================
 # STRING NORMALIZATION & FUZZY MATCHING HELPERS
 # ==============================================================================
@@ -120,6 +122,7 @@ def katakana_to_hiragana(text: str) -> str:
     return "".join(res)
 
 
+@lru_cache(maxsize=65536)
 def normalize_text(text: Optional[str]) -> str:
     """
     Normalizes text for robust comparison:
@@ -143,6 +146,7 @@ def normalize_text(text: Optional[str]) -> str:
     return text
 
 
+@lru_cache(maxsize=65536)
 def strip_track_number_and_artist(filename_no_ext: str) -> str:
     """
     Cleans a filename to extract the track title:
@@ -162,10 +166,13 @@ def strip_track_number_and_artist(filename_no_ext: str) -> str:
     return cleaned.strip()
 
 
+@lru_cache(maxsize=65536)
 def calculate_similarity(str1: str, str2: str) -> float:
     """Calculates SequenceMatcher ratio between two normalized strings."""
     if not str1 or not str2:
         return 0.0
+    if str1 == str2:
+        return 1.0
     return SequenceMatcher(None, str1, str2).ratio()
 
 
@@ -174,34 +181,35 @@ def calculate_similarity(str1: str, str2: str) -> float:
 # ==============================================================================
 
 REMASTER_OR_NOISE_PATTERNS = [
-    r"[\(\[\{]?(?:20\d\d|19\d\d)?\s*digital\s*remaster(?:ed)?(?:\s*version|\s*\d{4})?[\)\]\}]?",
-    r"[\(\[\{]?(?:20\d\d|19\d\d)?\s*remaster(?:ed)?(?:\s*version|\s*\d{4})?[\)\]\}]?",
-    r"[\(\[\{]?anniversary\s*edition[\)\]\}]?",
-    r"[\(\[\{]?deluxe\s*(?:edition|version)[\)\]\}]?",
-    r"[\(\[\{]?bonus\s*track[\)\]\}]?",
-    r"[\(\[\{]?(?:original\s*mix|original\s*version|album\s*version|main\s*version)[\)\]\}]?",
-    r"[\(\[\{]?(?:flac|mp3|320kbps|24bit|lossless|wav|vbr|cd|web|vinyl|rip|official\s*audio|official\s*video|mv|lyrics)[\)\]\}]?",
+    re.compile(r"[\(\[\{]?(?:20\d\d|19\d\d)?\s*digital\s*remaster(?:ed)?(?:\s*version|\s*\d{4})?[\)\]\}]?", re.IGNORECASE),
+    re.compile(r"[\(\[\{]?(?:20\d\d|19\d\d)?\s*remaster(?:ed)?(?:\s*version|\s*\d{4})?[\)\]\}]?", re.IGNORECASE),
+    re.compile(r"[\(\[\{]?anniversary\s*edition[\)\]\}]?", re.IGNORECASE),
+    re.compile(r"[\(\[\{]?deluxe\s*(?:edition|version)[\)\]\}]?", re.IGNORECASE),
+    re.compile(r"[\(\[\{]?bonus\s*track[\)\]\}]?", re.IGNORECASE),
+    re.compile(r"[\(\[\{]?(?:original\s*mix|original\s*version|album\s*version|main\s*version)[\)\]\}]?", re.IGNORECASE),
+    re.compile(r"[\(\[\{]?(?:flac|mp3|320kbps|24bit|lossless|wav|vbr|cd|web|vinyl|rip|official\s*audio|official\s*video|mv|lyrics)[\)\]\}]?", re.IGNORECASE),
 ]
 
 FEATURE_PATTERNS = [
-    r"[\(\[\{]\s*(?:feat\.?|ft\.?|featuring|with)\s+([^\)\]\}]+)[\)\]\}]",
-    r"(?:\bfeat\.?|\bft\.?|\bfeaturing\b|\bwith\b)\s*([^,\-\(\[\{]+)",
+    re.compile(r"[\(\[\{]\s*(?:feat\.?|ft\.?|featuring|with)\s+([^\)\]\}]+)[\)\]\}]", re.IGNORECASE),
+    re.compile(r"(?:\bfeat\.?|\bft\.?|\bfeaturing\b|\bwith\b)\s*([^,\-\(\[\{]+)", re.IGNORECASE),
 ]
 
 VERSION_PATTERNS = [
-    (r"[\(\[\{]([^\)\]\}]*(?:remix|rmx|re-mix|flip|bootleg|rework|edit|refix|mashup|mash-up)[^\)\]\}]*)[\)\]\}]", "remix"),
-    (r"(?:^|\s)\-\s*([^\-]+(?:remix|rmx|re-mix|flip|bootleg|rework|edit|refix|mashup|mash-up)[^\-]*)", "remix"),
-    (r"[\(\[\{]([^\)\]\}]*(?:vip\s*mix|vip)[^\)\]\}]*)[\)\]\}]", "vip"),
-    (r"[\(\[\{]([^\)\]\}]*(?:instrumental|inst\b|off\s*vocal|karaoke|backing\s*track)[^\)\]\}]*)[\)\]\}]", "instrumental"),
-    (r"[\(\[\{]([^\)\]\}]*(?:acapella|a\s*cappella|vocal\s*version)[^\)\]\}]*)[\)\]\}]", "acapella"),
-    (r"[\(\[\{]([^\)\]\}]*(?:acoustic|unplugged|piano\s*ver(?:sion)?)[^\)\]\}]*)[\)\]\}]", "acoustic"),
-    (r"[\(\[\{]([^\)\]\}]*(?:live(?:\s+at|\s+in|\s+version|\s*\d{4})?)[^\)\]\}]*)[\)\]\}]", "live"),
-    (r"[\(\[\{]([^\)\]\}]*(?:speed\s*up|sped\s*up|slowed|nightcore|daycore|chopped\s*and\s*screwed)[^\)\]\}]*)[\)\]\}]", "speed"),
-    (r"[\(\[\{]([^\)\]\}]*(?:demo|alternate\s*take|alt\s*take|alt\s*mix|rough\s*mix)[^\)\]\}]*)[\)\]\}]", "demo"),
-    (r"[\(\[\{]([^\)\]\}]*(?:club\s*mix|extended\s*mix|extended\s*version|radio\s*edit|dub\s*mix|dub)[^\)\]\}]*)[\)\]\}]", "mix_edit"),
+    (re.compile(r"[\(\[\{]([^\)\]\}]*(?:remix|rmx|re-mix|flip|bootleg|rework|edit|refix|mashup|mash-up)[^\)\]\}]*)[\)\]\}]", re.IGNORECASE), "remix"),
+    (re.compile(r"(?:^|\s)\-\s*([^\-]+(?:remix|rmx|re-mix|flip|bootleg|rework|edit|refix|mashup|mash-up)[^\-]*)", re.IGNORECASE), "remix"),
+    (re.compile(r"[\(\[\{]([^\)\]\}]*(?:vip\s*mix|vip)[^\)\]\}]*)[\)\]\}]", re.IGNORECASE), "vip"),
+    (re.compile(r"[\(\[\{]([^\)\]\}]*(?:instrumental|inst\b|off\s*vocal|karaoke|backing\s*track)[^\)\]\}]*)[\)\]\}]", re.IGNORECASE), "instrumental"),
+    (re.compile(r"[\(\[\{]([^\)\]\}]*(?:acapella|a\s*cappella|vocal\s*version)[^\)\]\}]*)[\)\]\}]", re.IGNORECASE), "acapella"),
+    (re.compile(r"[\(\[\{]([^\)\]\}]*(?:acoustic|unplugged|piano\s*ver(?:sion)?)[^\)\]\}]*)[\)\]\}]", re.IGNORECASE), "acoustic"),
+    (re.compile(r"[\(\[\{]([^\)\]\}]*(?:live(?:\s+at|\s+in|\s+version|\s*\d{4})?)[^\)\]\}]*)[\)\]\}]", re.IGNORECASE), "live"),
+    (re.compile(r"[\(\[\{]([^\)\]\}]*(?:speed\s*up|sped\s*up|slowed|nightcore|daycore|chopped\s*and\s*screwed)[^\)\]\}]*)[\)\]\}]", re.IGNORECASE), "speed"),
+    (re.compile(r"[\(\[\{]([^\)\]\}]*(?:demo|alternate\s*take|alt\s*take|alt\s*mix|rough\s*mix)[^\)\]\}]*)[\)\]\}]", re.IGNORECASE), "demo"),
+    (re.compile(r"[\(\[\{]([^\)\]\}]*(?:club\s*mix|extended\s*mix|extended\s*version|radio\s*edit|dub\s*mix|dub)[^\)\]\}]*)[\)\]\}]", re.IGNORECASE), "mix_edit"),
 ]
 
 
+@lru_cache(maxsize=65536)
 def parse_track_title_structure(title: str) -> Dict[str, Any]:
     """
     Parses a track title into structured components:
@@ -227,7 +235,7 @@ def parse_track_title_structure(title: str) -> Dict[str, Any]:
     # 1. Extract features
     features = []
     for pat in FEATURE_PATTERNS:
-        for m in re.finditer(pat, cleaned, re.IGNORECASE):
+        for m in pat.finditer(cleaned):
             f_text = m.group(1).strip()
             if f_text:
                 features.append(normalize_text(f_text))
@@ -236,7 +244,7 @@ def parse_track_title_structure(title: str) -> Dict[str, Any]:
     v_type = None
     v_text = None
     for pat, vtype in VERSION_PATTERNS:
-        m = re.search(pat, cleaned, re.IGNORECASE)
+        m = pat.search(cleaned)
         if m:
             v_type = vtype
             v_text = normalize_text(m.group(1))
@@ -245,11 +253,11 @@ def parse_track_title_structure(title: str) -> Dict[str, Any]:
     # 3. Clean base title
     base_str = cleaned
     for pat, _ in VERSION_PATTERNS:
-        base_str = re.sub(pat, " ", base_str, flags=re.IGNORECASE)
+        base_str = pat.sub(" ", base_str)
     for pat in FEATURE_PATTERNS:
-        base_str = re.sub(pat, " ", base_str, flags=re.IGNORECASE)
+        base_str = pat.sub(" ", base_str)
     for pat in REMASTER_OR_NOISE_PATTERNS:
-        base_str = re.sub(pat, " ", base_str, flags=re.IGNORECASE)
+        base_str = pat.sub(" ", base_str)
 
     base_norm = normalize_text(base_str)
 

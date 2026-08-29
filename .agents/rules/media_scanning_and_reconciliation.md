@@ -82,4 +82,21 @@ Guidelines and invariants for audio file discovery, metadata tag parsing, persis
 - **Intra-Directory Audio Container Conflict Safety**:
   - Stream fallback downloaders (e.g. Bandcamp MP3-128 stream fallback) must check if ANY supported audio file (`.flac`, `.wav`, `.m4a`, `.mp3`, etc.) already exists for that track index/title before writing fallback MP3 stream files.
 
+## 9. P2P Candidate Indexing & High-Performance Verification Invariants
+- **Inverted Candidate Indexing (`PeerCandidateIndex`)**:
+  - Never evaluate releases or tracks via nested $O(N \times M)$ linear scans across thousands of candidate peer directories and files.
+  - Construct an inverted dictionary index (`word_to_dirs` mapping tokens $\ge 3$ characters to candidate directory objects, and `word_to_files` mapping tokens to candidate file objects) immediately following discovery.
+  - Release and track verification must query the inverted index to prune candidate search spaces from thousands down to $\le 20$ candidates in $<1\text{ms}$.
+- **Pre-Parsed Track & Directory Data Structures**:
+  - Pre-parse audio format scores, filename normalization, tokens, and structural title parts (base title, version modifiers, remaster descriptors) **once** during index creation (`CandidateFile` / `CandidateDir`).
+  - Pre-parse expected catalog tracklists once per release (`pre_parse_expected_tracks()`) rather than re-normalizing per comparison.
+- **LRU Caching & Pre-Compiled Regexes for Normalization**:
+  - Decorate frequently called string normalization and distance functions (`normalize_text`, `strip_track_number_and_artist`, `parse_track_title_structure`, `calculate_similarity`) with `@lru_cache(maxsize=65536)`.
+  - Ensure all arguments to `@lru_cache` functions are strictly hashable (`str`, `tuple`, `frozenset`). Never pass mutable `set` or `dict` objects.
+  - Pre-compile all static regular expressions (`re.compile`) at module level.
+  - Fast-path identical strings (`if str1 == str2: return 1.0`) to avoid matrix distance calculations.
+- **Index Synchronization on Remote Browse**:
+  - When fetching complete folder listings from peers via API (`browse_directory`), update the active inverted index via `candidate_index.update_directory(user, dir_name, dir_info)` so that subsequent release and track reconciliation passes immediately benefit from the complete folder file list.
+
+
 
