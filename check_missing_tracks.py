@@ -110,6 +110,45 @@ from functools import lru_cache
 # STRING NORMALIZATION & FUZZY MATCHING HELPERS
 # ==============================================================================
 
+KANJI_DIGITS = {"〇": 0, "零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def parse_kanji_number(kanji_str: str) -> Optional[int]:
+    """Parses Japanese/Chinese Kanji numerals into an integer."""
+    if not kanji_str:
+        return None
+    # Positional digits like 一九九九 -> 1999
+    if all(ch in KANJI_DIGITS for ch in kanji_str) and len(kanji_str) > 1 and "十" not in kanji_str and "百" not in kanji_str and "千" not in kanji_str:
+        return int("".join(str(KANJI_DIGITS[ch]) for ch in kanji_str))
+
+    total = 0
+    num = 0
+    for ch in kanji_str:
+        if ch in KANJI_DIGITS:
+            num = KANJI_DIGITS[ch]
+        elif ch == "十":
+            total += (num if num != 0 else 1) * 10
+            num = 0
+        elif ch == "百":
+            total += (num if num != 0 else 1) * 100
+            num = 0
+        elif ch == "千":
+            total += (num if num != 0 else 1) * 1000
+            num = 0
+    total += num
+    return total
+
+
+def kanji_to_arabic(text: Optional[str]) -> str:
+    """Converts Kanji numerals in text to Arabic decimal numbers."""
+    if not text:
+        return ""
+    def repl(m):
+        val = parse_kanji_number(m.group(0))
+        return str(val) if val is not None else m.group(0)
+    return re.sub(r"[〇零一二三四五六七八九十百千]+", repl, str(text))
+
+
 def katakana_to_hiragana(text: str) -> str:
     """Converts Katakana characters to Hiragana for uniform Japanese phonetic matching."""
     res = []
@@ -126,6 +165,7 @@ def katakana_to_hiragana(text: str) -> str:
 def normalize_text(text: Optional[str]) -> str:
     """
     Normalizes text for robust comparison:
+    - Converts Kanji numerals to Arabic digits (e.g. 九十四 -> 94)
     - Lowercases & unifies Katakana/Hiragana
     - Transliterates unicode (e.g. Japanese to ASCII Romaji approximations)
     - Separates number-letter boundaries (e.g. menson1mix -> menson 1 mix)
@@ -134,6 +174,7 @@ def normalize_text(text: Optional[str]) -> str:
     """
     if not text:
         return ""
+    text = kanji_to_arabic(str(text))
     text = katakana_to_hiragana(text.lower())
     text = unidecode(text)
     # Separate letter-number boundaries
@@ -153,7 +194,8 @@ def strip_track_number_and_artist(filename_no_ext: str) -> str:
     e.g. '01 すてらべえ - Ultra Cutie Gangsta' -> 'Ultra Cutie Gangsta'
     e.g. '2-11 Stellabee - Enemy' -> 'Enemy'
     """
-    cleaned = filename_no_ext.strip()
+    raw = filename_no_ext.strip()
+    cleaned = raw
     # Strip leading track numbers (e.g. '01 - ', '1-02. ', '12 ')
     cleaned = re.sub(r'^(\d+[\-_.]|\d+[\-_.]\d+|\d+)\s*[-_.]*\s*', '', cleaned)
     # If there is an 'Artist - Title' format, take the title
@@ -163,7 +205,7 @@ def strip_track_number_and_artist(filename_no_ext: str) -> str:
     elif ' _ ' in cleaned:
         parts = cleaned.split(' _ ', 1)
         cleaned = parts[1]
-    return cleaned.strip()
+    return cleaned.strip() if cleaned.strip() else raw
 
 
 @lru_cache(maxsize=65536)
@@ -1040,14 +1082,14 @@ class AudioMetadataCache:
 
 def is_distinct_track_title(title_norm: str) -> bool:
     """Determines if a normalized track title is distinct enough to safely match standalone filenames."""
-    if not title_norm or len(title_norm) < 4:
+    if not title_norm or len(title_norm) < 3:
         return False
     if title_norm in GENERIC_OR_COMMON_WORDS:
         return False
     words = title_norm.split()
-    if len(words) >= 2 and len(title_norm) >= 6:
+    if len(words) >= 2 and len(title_norm) >= 4:
         return True
-    if len(words) == 1 and len(title_norm) >= 8 and title_norm not in GENERIC_OR_COMMON_WORDS:
+    if len(words) == 1 and len(title_norm) >= 4 and title_norm not in GENERIC_OR_COMMON_WORDS:
         return True
     return False
 
@@ -1076,52 +1118,69 @@ class AudioFileScanner:
             progress.update(task_id, description="[cyan]Stage 1: Discovering candidate audio files on disk...")
 
         # 1. Compile Artist Alias Patterns (Word boundary)
-        alias_pats = []
-        for a in self.catalog.aliases:
-            norm = normalize_text(a)
-            if norm and len(norm) >= 2:
-                alias_pats.append(re.compile(r"(?:\b|_)" + re.escape(norm) + r"(?:\b|_)", re.IGNORECASE))
+        alias_norms = sorted({normalize_text(a) for a in self.catalog.aliases if normalize_text(a) and len(normalize_text(a)) >= 2}, key=len, reverse=True)
+        alias_regex = re.compile(r"(?:\b|_)(?:" + "|".join(re.escape(a) for a in alias_norms) + r")(?:\b|_)", re.IGNORECASE) if alias_norms else None
 
         # 2. Compile Release Title Patterns
-        rel_pats = []
+        rel_norms_set = set()
         for rel in self.catalog.releases:
             norm = normalize_text(rel.get("title", ""))
-            if norm and len(norm) >= 4 and norm not in GENERIC_OR_COMMON_WORDS:
-                rel_pats.append(re.compile(r"(?:\b|_)" + re.escape(norm) + r"(?:\b|_)", re.IGNORECASE))
-
+            if norm and len(norm) >= 2 and norm not in GENERIC_OR_COMMON_WORDS:
+                rel_norms_set.add(norm)
         for trk in self.catalog.tracks:
             for rel_t in trk.get("all_releases", set()):
                 norm = normalize_text(rel_t)
-                if norm and len(norm) >= 4 and norm not in GENERIC_OR_COMMON_WORDS:
-                    rel_pats.append(re.compile(r"(?:\b|_)" + re.escape(norm) + r"(?:\b|_)", re.IGNORECASE))
+                if norm and len(norm) >= 2 and norm not in GENERIC_OR_COMMON_WORDS:
+                    rel_norms_set.add(norm)
+        rel_norms = sorted(rel_norms_set, key=len, reverse=True)
+        rel_regex = re.compile(r"(?:\b|_)(?:" + "|".join(re.escape(r) for r in rel_norms) + r")(?:\b|_)", re.IGNORECASE) if rel_norms else None
 
         # 3. Compile Distinct Track Title Patterns
-        trk_pats = []
-        for trk in self.catalog.tracks:
-            norm = trk.get("norm_title", "")
-            if is_distinct_track_title(norm):
-                trk_pats.append(re.compile(r"(?:\b|_)" + re.escape(norm) + r"(?:\b|_)", re.IGNORECASE))
+        trk_norms_set = {
+            trk.get("norm_title", "")
+            for trk in self.catalog.tracks
+            if is_distinct_track_title(trk.get("norm_title", ""))
+        }
+        trk_norms = sorted(trk_norms_set, key=len, reverse=True)
+        trk_regex = re.compile(r"(?:\b|_)(?:" + "|".join(re.escape(t) for t in trk_norms) + r")(?:\b|_)", re.IGNORECASE) if trk_norms else None
 
         candidate_paths: List[str] = []
 
         # Stage 1: Walk directory structure (Fast targeted discovery)
+        music_dir_norm = normalize_text(str(self.music_dir))
+        is_direct_downloads = "downloads" in music_dir_norm.split() or self.music_dir.name.lower() in ("downloads", "incomplete")
+
         for root, dirs, files in os.walk(self.music_dir):
             norm_root = normalize_text(root)
-            dir_matches = any(p.search(norm_root) for p in alias_pats) or any(p.search(norm_root) for p in rel_pats)
+            dir_matches = bool((alias_regex and alias_regex.search(norm_root)) or (rel_regex and rel_regex.search(norm_root)))
 
-            for f in files:
-                ext = os.path.splitext(f)[1].lower()
-                if ext not in AUDIO_EXTENSIONS:
-                    continue
+            audio_in_dir = [f for f in files if os.path.splitext(f)[1].lower() in AUDIO_EXTENSIONS]
+            if not audio_in_dir:
+                continue
 
-                full_path = os.path.join(root, f)
+            if self.full_scan or dir_matches:
+                for f in audio_in_dir:
+                    candidate_paths.append(os.path.join(root, f))
+            else:
+                # Check if any track or folder matches catalog patterns
+                matching_files_in_dir = [
+                    f for f in audio_in_dir
+                    if (alias_regex and alias_regex.search(normalize_text(f)))
+                    or (trk_regex and trk_regex.search(normalize_text(f)))
+                    or (rel_regex and rel_regex.search(normalize_text(f)))
+                ]
 
-                if self.full_scan or dir_matches:
-                    candidate_paths.append(full_path)
+                # If multiple tracks in the folder match catalog items, include the whole folder
+                if len(matching_files_in_dir) >= 2 or (matching_files_in_dir and len(matching_files_in_dir) == len(audio_in_dir)):
+                    for f in audio_in_dir:
+                        candidate_paths.append(os.path.join(root, f))
                 else:
-                    norm_f = normalize_text(f)
-                    if any(p.search(norm_f) for p in alias_pats) or any(p.search(norm_f) for p in trk_pats):
-                        candidate_paths.append(full_path)
+                    for f in matching_files_in_dir:
+                        candidate_paths.append(os.path.join(root, f))
+                    if is_direct_downloads:
+                        for f in audio_in_dir:
+                            if os.path.join(root, f) not in candidate_paths and alias_regex and alias_regex.search(normalize_text(f)):
+                                candidate_paths.append(os.path.join(root, f))
 
         total_candidates = len(candidate_paths)
 

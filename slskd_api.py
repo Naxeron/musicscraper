@@ -473,6 +473,42 @@ class SlskdClient:
                         queued.add(fn)
         return queued
 
+    def get_queued_track_fingerprints(self) -> Dict[str, Set[str]]:
+        """
+        Returns multiple fingerprint sets of active, queued, and completed downloads in slskd:
+        - 'full_paths': exact remote filenames/paths
+        - 'base_filenames': lowercase base filenames (e.g. '01 - track.flac')
+        - 'clean_titles': normalized track title tokens stripped of numbers/artists
+        """
+        downloads = self.get_downloads()
+        full_paths = set()
+        base_filenames = set()
+        clean_titles = set()
+
+        for user_transfers in downloads:
+            for d in user_transfers.get("directories", []):
+                for f in d.get("files", []):
+                    fn = f.get("filename")
+                    if not fn:
+                        continue
+                    full_paths.add(fn)
+                    clean_p = fn.replace("/", "\\").split("\\")[-1]
+                    if clean_p:
+                        base_filenames.add(clean_p.lower())
+                        no_ext = os.path.splitext(clean_p)[0]
+                        # Clean leading track numbers
+                        clean_t = re.sub(r"^(\d+[\-_.]|\d+[\-_.]\d+|\d+)\s*[-_.]*\s*", "", no_ext).strip().lower()
+                        if " - " in clean_t:
+                            clean_t = clean_t.split(" - ", 1)[1].strip()
+                        if clean_t:
+                            clean_titles.add(clean_t)
+
+        return {
+            "full_paths": full_paths,
+            "base_filenames": base_filenames,
+            "clean_titles": clean_titles,
+        }
+
     def get_transfers_summary(self) -> Dict[str, Any]:
         """Returns aggregated summary of download queues and active transfer speeds."""
         downloads = self.get_downloads()

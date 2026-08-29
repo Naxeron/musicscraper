@@ -46,9 +46,9 @@ Usage:
 Commands:
   upgrade   Scan local library for low-quality files (< 320kbps or lossy),
             find verified higher-quality releases (FLAC/320) on Soulseek, and queue
-            Example: python3 main.py upgrade "/mnt/music/Library"
-            Example: python3 main.py upgrade "/mnt/music/Library/goreshit" --dry-run
-            Example: python3 main.py upgrade "/mnt/music/Library" --max-bitrate 192 --format 320
+            Example: python3 main.py upgrade "mnt/music/"
+            Example: python3 main.py upgrade "mnt/music//goreshit" --dry-run
+            Example: python3 main.py upgrade "mnt/music/" --max-bitrate 192 --format 320
 
   soulseek  Search Soulseek (via slskd) for full artist discographies,
             reconcile tracklists against MusicBrainz, and queue downloads
@@ -66,8 +66,8 @@ Commands:
 
   tag       Apply intelligent genre tags to artists, albums, & tracks via Last.fm
             (Cascades track->album->artist tags, filters noise, formats ID3/Vorbis)
-            Example: python3 main.py tag "/mnt/music/Library/goreshit" --dry-run
-            Example: python3 main.py tag "/mnt/music/Library" --skip-existing
+            Example: python3 main.py tag "mnt/music//goreshit" --dry-run
+            Example: python3 main.py tag "mnt/music/" --skip-existing
 
   bandcamp  Download albums, tracks, or full artist discographies from Bandcamp
             Example: python3 main.py bandcamp goreshit -f flac

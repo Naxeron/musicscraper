@@ -50,6 +50,7 @@ from check_missing_tracks import (
     DiscographyReconciler,
     ReportGenerator,
     normalize_text,
+    kanji_to_arabic,
     strip_track_number_and_artist,
     calculate_similarity,
     parse_track_title_structure,
@@ -95,6 +96,7 @@ def katakana_to_hiragana(text: str) -> str:
 def normalize_track_title(text: Optional[str]) -> str:
     """
     Comprehensive string normalization:
+    - Converts Kanji numerals to Arabic digits (e.g. 九十四 -> 94)
     - Katakana to Hiragana conversion
     - Polish & European diacritic translation before unidecode
     - Transliterates unicode to ASCII
@@ -103,7 +105,8 @@ def normalize_track_title(text: Optional[str]) -> str:
     """
     if not text:
         return ""
-    norm = katakana_to_hiragana(text.lower())
+    norm = kanji_to_arabic(str(text))
+    norm = katakana_to_hiragana(norm.lower())
     norm = norm.translate(POLISH_DIACRITICS_MAP)
     norm = unidecode(norm)
     norm = re.sub(r"([a-zA-Z])([0-9])", r"\1 \2", norm)
@@ -558,7 +561,7 @@ class SlskdArtistScraper:
             self.music_dir = Path(music_dir).resolve()
         else:
             self.music_dir = None
-            for cand in [Path("/mnt/music/Library"), Path("/mnt/music"), Path("/mnt/library"), Path.home() / "Music"]:
+            for cand in [Path("mnt/music/"), Path("/mnt/music"), Path("/mnt/library"), Path.home() / "Music"]:
                 if cand.exists() and any(cand.iterdir()):
                     self.music_dir = cand
                     break
@@ -583,6 +586,7 @@ class SlskdArtistScraper:
 
         # Audit & download state
         self.queued_directories: List[Dict[str, Any]] = []
+        self.slskd_fingerprints: Dict[str, Set[str]] = {}
         self.already_downloading_files: Set[str] = set()
         self.verified_releases: List[Dict[str, Any]] = []
         self.unresolved_releases: List[Dict[str, Any]] = []
@@ -606,7 +610,8 @@ class SlskdArtistScraper:
         console.print(f"[green]✔ Connected to slskd[/green] (Soulseek User: [bold]{slsk_user}[/bold] | Server: [dim]{server_state}[/dim])")
 
         # Refresh currently active/queued downloads in slskd
-        self.already_downloading_files = self.client.get_queued_filenames()
+        self.slskd_fingerprints = self.client.get_queued_track_fingerprints() if hasattr(self.client, "get_queued_track_fingerprints") else {}
+        self.already_downloading_files = self.slskd_fingerprints.get("full_paths", self.client.get_queued_filenames())
         if self.already_downloading_files:
             console.print(f"[dim]Active/queued in slskd: {len(self.already_downloading_files)} files[/dim]")
 
@@ -743,13 +748,38 @@ class SlskdArtistScraper:
             norm_t = mb.get("norm_title", "")
             if norm_t:
                 self.local_found_map[norm_t] = lt
+            clean_t = clean_tokens(mb.get("title", ""))
+            if clean_t:
+                self.local_found_map[clean_t] = lt
+            lt_title = lt.get("title", "")
+            if lt_title:
+                self.local_found_map[normalize_text(lt_title)] = lt
+                self.local_found_map[clean_tokens(lt_title)] = lt
+            for rid in (mb.get("recording_ids", set()) | lt.get("mb_rec_ids", set())):
+                if rid:
+                    self.local_found_map[f"mbid:{rid}"] = lt
 
         for rel in self.catalog.releases:
             rel_title = rel.get("title", "")
             norm_rel = normalize_text(rel_title)
+            token_rel = clean_tokens(rel_title)
             rel_tracks = [t for t in self.catalog.tracks if t.get("norm_release") == norm_rel or rel_title in t.get("all_releases", set())]
-            if rel_tracks and all(t.get("norm_title") in self.local_found_map for t in rel_tracks):
+            if rel_tracks and all(
+                t.get("norm_title") in self.local_found_map
+                or clean_tokens(t.get("title", "")) in self.local_found_map
+                or any(f"mbid:{rid}" in self.local_found_map for rid in t.get("recording_ids", set()))
+                for t in rel_tracks
+            ):
                 self.local_found_releases.add(norm_rel)
+                if token_rel:
+                    self.local_found_releases.add(token_rel)
+
+        self.reconciled_release_keys.update(self.local_found_releases)
+        for rel_k in list(self.local_found_releases):
+            for t in self.catalog.tracks:
+                if t.get("norm_release") == rel_k or clean_tokens(t.get("release_title", "")) == rel_k:
+                    self.covered_track_titles.add(t.get("norm_title", ""))
+                    self.covered_track_titles.add(clean_tokens(t.get("title", "")))
 
         console.print(f"[green]✔ Library Status:[/green] [bold]{len(found_items)}[/bold] artist tracks / [bold]{len(self.local_found_releases)}[/bold] releases already in library.")
 
@@ -1276,7 +1306,24 @@ class SlskdArtistScraper:
         queued_dirs_set: Set[Tuple[str, str]] = set()
         queued_release_keys: Set[str] = set()
         queued_track_keys: Set[str] = set()
-        queued_files_set: Set[str] = set(self.already_downloading_files)
+
+        # Multi-layer active/completed transfer deduplication
+        fps = self.client.get_queued_track_fingerprints() if hasattr(self.client, "get_queued_track_fingerprints") else {}
+        queued_files_set: Set[str] = set(self.already_downloading_files) | fps.get("full_paths", set())
+        queued_base_names: Set[str] = set(fps.get("base_filenames", set()))
+        queued_clean_titles: Set[str] = set(fps.get("clean_titles", set()))
+
+        def is_track_already_found(t_title: str) -> bool:
+            if not t_title:
+                return False
+            norm_t = normalize_text(t_title)
+            clean_t = clean_tokens(t_title)
+            return (
+                norm_t in self.local_found_map
+                or (clean_t and clean_t in self.local_found_map)
+                or norm_t in queued_clean_titles
+                or (clean_t and clean_t in queued_clean_titles)
+            )
 
         def is_loose_dump(d_path: str) -> bool:
             parts = [p.strip().lower() for p in sanitize_remote_path(d_path).split("\\") if p.strip()]
@@ -1287,14 +1334,14 @@ class SlskdArtistScraper:
                 return True
             return any(k in last for k in ("soundcloud singles", "loose tracks", "random singles", "singles", "various singles", "dump", "archive"))
 
-        # 1. Queue Primary Release Directories (Full Folders)
+        # 1. Queue Primary Release Directories (Full Folders or Missing Tracks Only)
         for item in self.verified_releases:
             rel_title = item.get("release_title", "")
             norm_rel = normalize_text(rel_title)
             clean_rel = clean_tokens(rel_title)
 
             # Prevent duplicate queueing of the same release
-            if norm_rel in queued_release_keys or (clean_rel and clean_rel in queued_release_keys):
+            if norm_rel in queued_release_keys or (clean_rel and clean_rel in queued_release_keys) or norm_rel in self.local_found_releases or (clean_rel and clean_rel in self.local_found_releases):
                 continue
 
             match = item["best_match"]
@@ -1327,10 +1374,47 @@ class SlskdArtistScraper:
                 except Exception:
                     pass
 
+            expected_tracks = [
+                t for t in self.catalog.tracks
+                if t.get("norm_release") == norm_rel or rel_title in t.get("all_releases", set())
+            ]
+            already_found_expected = [
+                t for t in expected_tracks
+                if is_track_already_found(t.get("title", ""))
+            ]
+
+            # If partial album (some tracks already present on disk), only download the genuinely missing tracks
+            is_partial_album = (len(already_found_expected) > 0 and len(already_found_expected) < len(expected_tracks))
+            missing_expected_norm = {
+                t.get("norm_title") for t in expected_tracks if not is_track_already_found(t.get("title", ""))
+            } | {
+                clean_tokens(t.get("title", "")) for t in expected_tracks if not is_track_already_found(t.get("title", ""))
+            }
+
             files_to_enqueue = []
             for f in dir_files:
                 base = f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1]
-                if is_audio_file(base) or is_supporting_file(base):
+                if is_audio_file(base):
+                    full_fn = f.get("full_filename") or f.get("filename")
+                    base_clean = re.sub(r"^(\d+[\-_.]|\d+[\-_.]\d+|\d+)\s*[-_.]*\s*", "", os.path.splitext(base)[0]).strip()
+                    norm_base = normalize_text(base_clean)
+                    clean_base = clean_tokens(base_clean)
+
+                    # If partial album, only include files matching the missing tracks
+                    if is_partial_album:
+                        is_missing_file = (
+                            norm_base in missing_expected_norm
+                            or clean_base in missing_expected_norm
+                            or any(m in norm_base for m in missing_expected_norm if len(m) >= 4)
+                        )
+                        if not is_missing_file:
+                            continue
+
+                    if full_fn and full_fn not in queued_files_set and base.lower() not in queued_base_names:
+                        files_to_enqueue.append({"filename": full_fn, "size": f.get("size", 0)})
+                        queued_files_set.add(full_fn)
+                        queued_base_names.add(base.lower())
+                elif is_supporting_file(base) and not is_partial_album:
                     full_fn = f.get("full_filename") or f.get("filename")
                     if full_fn and full_fn not in queued_files_set:
                         files_to_enqueue.append({"filename": full_fn, "size": f.get("size", 0)})
@@ -1350,7 +1434,7 @@ class SlskdArtistScraper:
                             queued_track_keys.add(clean_tokens(exp))
 
                     self.queued_directories.append({
-                        "type": "Primary Release",
+                        "type": "Primary Release (Missing Tracks)" if is_partial_album else "Primary Release",
                         "title": item["release_title"],
                         "user": user,
                         "directory": dir_name,
@@ -1371,8 +1455,11 @@ class SlskdArtistScraper:
             norm_track = normalize_text(track_title)
             clean_track = clean_tokens(track_title)
 
-            # Skip if track already queued in another directory
-            if (norm_track and norm_track in queued_track_keys) or (clean_track and clean_track in queued_track_keys):
+            # Skip if track already in local library or queued in another directory
+            if (
+                (norm_track and (norm_track in queued_track_keys or norm_track in self.local_found_map))
+                or (clean_track and (clean_track in queued_track_keys or clean_track in self.local_found_map))
+            ):
                 continue
 
             match = item["best_match"]
@@ -1388,13 +1475,19 @@ class SlskdArtistScraper:
                 and not is_loose_dump(dir_name)
                 and (norm_rel not in queued_release_keys)
                 and (not clean_rel or clean_rel not in queued_release_keys)
+                and (norm_rel not in self.local_found_releases)
+                and (not clean_rel or clean_rel not in self.local_found_releases)
             )
 
             if not download_full_dir:
                 full_fn = match.get("full_filename")
-                files_to_enqueue = [{"filename": full_fn, "size": match.get("size", 0)}] if full_fn and full_fn not in queued_files_set else []
-                if files_to_enqueue:
+                base_fn = match.get("matched_file", "")
+                files_to_enqueue = []
+                if full_fn and full_fn not in queued_files_set and (not base_fn or base_fn.lower() not in queued_base_names):
+                    files_to_enqueue.append({"filename": full_fn, "size": match.get("size", 0)})
                     queued_files_set.add(full_fn)
+                    if base_fn:
+                        queued_base_names.add(base_fn.lower())
             else:
                 dir_files = match.get("dir_info", {}).get("full_directory_files") or match.get("dir_info", {}).get("matched_search_files", [])
                 files_to_enqueue = []
@@ -1402,9 +1495,11 @@ class SlskdArtistScraper:
                     base = f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1]
                     if is_audio_file(base) or is_supporting_file(base):
                         full_fn = f.get("full_filename") or f.get("filename")
-                        if full_fn and full_fn not in queued_files_set:
+                        if full_fn and full_fn not in queued_files_set and (not is_audio_file(base) or base.lower() not in queued_base_names):
                             files_to_enqueue.append({"filename": full_fn, "size": f.get("size", 0)})
                             queued_files_set.add(full_fn)
+                            if is_audio_file(base):
+                                queued_base_names.add(base.lower())
 
             if files_to_enqueue:
                 try:
@@ -1438,26 +1533,29 @@ class SlskdArtistScraper:
             norm_track = normalize_text(track_title)
             clean_track = clean_tokens(track_title)
 
-            # Skip if track already queued in a release or compilation
-            if (norm_track and norm_track in queued_track_keys) or (clean_track and clean_track in queued_track_keys):
+            # Skip if track already in local library or queued in a release/compilation
+            if (
+                (norm_track and (norm_track in queued_track_keys or norm_track in self.local_found_map))
+                or (clean_track and (clean_track in queued_track_keys or clean_track in self.local_found_map))
+            ):
                 continue
 
             match = item["best_match"]
             user = match["user"]
             dir_name = match["directory"]
-            dir_key = (user, dir_name)
-
-            if dir_key in queued_dirs_set:
-                continue
 
             full_fn = match.get("full_filename")
-            files_to_enqueue = [{"filename": full_fn, "size": match.get("size", 0)}] if full_fn and full_fn not in queued_files_set else []
+            base_fn = match.get("matched_file", "")
+            files_to_enqueue = []
+            if full_fn and full_fn not in queued_files_set and (not base_fn or base_fn.lower() not in queued_base_names):
+                files_to_enqueue.append({"filename": full_fn, "size": match.get("size", 0)})
+                queued_files_set.add(full_fn)
+                if base_fn:
+                    queued_base_names.add(base_fn.lower())
 
             if files_to_enqueue:
                 try:
                     self.client.enqueue_download(user, files_to_enqueue)
-                    queued_dirs_set.add(dir_key)
-                    queued_files_set.add(full_fn)
                     if norm_track:
                         queued_track_keys.add(norm_track)
                     if clean_track:

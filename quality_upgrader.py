@@ -1167,16 +1167,16 @@ def main():
         epilog="""
 Examples:
   # Scan your music library and upgrade any lossy files to FLAC:
-  python3 quality_upgrader.py /mnt/music/Library
+  python3 quality_upgrader.py mnt/music/
 
   # Preview upgrades with dry-run mode:
-  python3 quality_upgrader.py /mnt/music/Library/goreshit --dry-run
+  python3 quality_upgrader.py mnt/music//goreshit --dry-run
 
   # Upgrade files with bitrate <= 192 kbps to MP3-320 or FLAC:
-  python3 quality_upgrader.py /mnt/music/Library --max-bitrate 192 --format 320
+  python3 quality_upgrader.py mnt/music/ --max-bitrate 192 --format 320
 
   # Upgrade a specific album folder to FLAC:
-  python3 quality_upgrader.py "/mnt/music/Library/Mekuso/First Album" --format flac
+  python3 quality_upgrader.py "mnt/music//Mekuso/First Album" --format flac
         """
     )
     parser.add_argument("path", nargs="?", default=None, help="Target music directory, artist folder, album folder, or single audio file")
@@ -1194,7 +1194,7 @@ Examples:
 
     target_path = args.path
     if not target_path:
-        for cand in [Path("/mnt/music/Library"), Path("/mnt/music"), Path("/mnt/library"), Path.home() / "Music", Path("./downloads"), Path(".")]:
+        for cand in [Path("mnt/music/"), Path("/mnt/music"), Path("/mnt/library"), Path.home() / "Music", Path("./downloads"), Path(".")]:
             if cand.exists() and any(cand.iterdir() if cand.is_dir() else [cand]):
                 target_path = str(cand)
                 break

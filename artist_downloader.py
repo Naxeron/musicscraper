@@ -204,7 +204,7 @@ class ArtistDownloadOrchestrator:
             self.music_dir = Path(music_dir).resolve()
         else:
             self.music_dir = None
-            for cand in [Path("/mnt/music/Library"), Path("/mnt/music"), Path("/mnt/library"), Path.home() / "Music"]:
+            for cand in [Path("mnt/music/"), Path("/mnt/music"), Path("/mnt/library"), Path.home() / "Music"]:
                 if cand.exists() and any(cand.iterdir()):
                     self.music_dir = cand
                     break

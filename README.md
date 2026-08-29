@@ -40,17 +40,17 @@ Run any tool in the suite through a single clean command:
 
 ```bash
 # Scan library and find higher-quality FLAC/320 releases on Soulseek
-python3 main.py upgrade "/mnt/music/Library"
-python3 main.py upgrade "/mnt/music/Library/goreshit" --dry-run
-python3 main.py upgrade "/mnt/music/Library" --max-bitrate 192 --format 320
+python3 main.py upgrade "mnt/music/"
+python3 main.py upgrade "mnt/music//goreshit" --dry-run
+python3 main.py upgrade "mnt/music/" --max-bitrate 192 --format 320
 
 # Search Soulseek for complete artist discography
 python3 main.py soulseek "Mekuso"
 python3 main.py soulseek "Mekuso" --dry-run
 
 # Tag music files with Last.fm genre tags (preview with dry-run)
-python3 main.py tag "/mnt/music/Library/goreshit" --dry-run
-python3 main.py tag "/mnt/music/Library" --skip-existing
+python3 main.py tag "mnt/music//goreshit" --dry-run
+python3 main.py tag "mnt/music/" --skip-existing
 
 # Download and audit full artist discography using MusicBrainz
 python3 main.py artist "96-glass"
@@ -86,23 +86,23 @@ Scans your local or server music library for low-quality or lossy audio files (e
 
 #### Scan Library and Upgrade Low-Quality Files to FLAC (Lossless)
 ```bash
-python3 main.py upgrade "/mnt/music/Library"
-python3 quality_upgrader.py "/mnt/music/Library"
+python3 main.py upgrade "mnt/music/"
+python3 quality_upgrader.py "mnt/music/"
 ```
 
 #### Preview Upgrades for an Artist (Dry-Run)
 ```bash
-python3 main.py upgrade "/mnt/music/Library/goreshit" --dry-run
+python3 main.py upgrade "mnt/music//goreshit" --dry-run
 ```
 
 #### Target Files Below a Specific Bitrate (e.g. <= 192 kbps to MP3 320kbps)
 ```bash
-python3 main.py upgrade "/mnt/music/Library" --max-bitrate 192 --format 320
+python3 main.py upgrade "mnt/music/" --max-bitrate 192 --format 320
 ```
 
 #### Upgrade a Specific Album Folder
 ```bash
-python3 main.py upgrade "/mnt/music/Library/Mekuso/First Album" --format flac
+python3 main.py upgrade "mnt/music//Mekuso/First Album" --format flac
 ```
 
 ### Command-Line Options:
@@ -138,22 +138,22 @@ Automatically queries Last.fm community metadata to accurately tag artists, albu
 
 #### Preview Genre Tags on an Artist Folder (Dry-Run)
 ```bash
-python3 main.py tag "/mnt/music/Library/goreshit" --dry-run
+python3 main.py tag "mnt/music//goreshit" --dry-run
 ```
 
 #### Apply Genre Tags to Untagged Files Only
 ```bash
-python3 main.py tag "/mnt/music/Library" --skip-existing
+python3 main.py tag "mnt/music/" --skip-existing
 ```
 
 #### Append Last.fm Genres to Existing File Tags
 ```bash
-python3 main.py tag "/mnt/music/Library/Wan Bushi" --append
+python3 main.py tag "mnt/music//Wan Bushi" --append
 ```
 
 #### Tag with Blended Weights and Custom Separator
 ```bash
-python3 main.py tag "/mnt/music/Library/Nizikawa" --strategy blend --limit 4 --separator " / "
+python3 main.py tag "mnt/music//Nizikawa" --strategy blend --limit 4 --separator " / "
 ```
 
 #### Direct Query Mode (Inspect Last.fm Tags Without Modifying Files)

@@ -1339,19 +1339,19 @@ def parse_args():
         epilog="""
 Examples:
   # Preview genre tags for an entire artist or album folder (Dry-Run):
-  python3 lastfm_genre_tagger.py "/mnt/music/Library/goreshit" --dry-run
+  python3 lastfm_genre_tagger.py "mnt/music//goreshit" --dry-run
 
   # Apply genre tags to an artist folder (Overwrite existing genres):
-  python3 lastfm_genre_tagger.py "/mnt/music/Library/Nizikawa"
+  python3 lastfm_genre_tagger.py "mnt/music//Nizikawa"
 
   # Only tag files that have missing/empty genre tags:
-  python3 lastfm_genre_tagger.py "/mnt/music/Library" --skip-existing
+  python3 lastfm_genre_tagger.py "mnt/music/" --skip-existing
 
   # Append Last.fm genres to existing genre tags:
-  python3 lastfm_genre_tagger.py "/mnt/music/Library/Wan Bushi" --append
+  python3 lastfm_genre_tagger.py "mnt/music//Wan Bushi" --append
 
   # Tag with blended weights and save up to 4 genres separated by '/':
-  python3 lastfm_genre_tagger.py "/mnt/music/Library" --strategy blend --limit 4 --separator " / "
+  python3 lastfm_genre_tagger.py "mnt/music/" --strategy blend --limit 4 --separator " / "
 
   # Test Last.fm tags directly for an artist or track without modifying files:
   python3 lastfm_genre_tagger.py --artist "Audiotist" --album "Music Obsession"
