@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MusicScraper Web GUI</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-icon">🎵</div>
+        <div class="brand-text">
+          <h2>MusicScraper</h2>
+          <span class="version">v1.0 Web GUI</span>
+        </div>
+      </div>
+
+      <nav class="nav-menu">
+        <button class="nav-item active" data-tab="dashboard">
+          <span class="icon">📊</span> <span class="label">Dashboard</span>
+        </button>
+        <button class="nav-item" data-tab="auditor">
+          <span class="icon">🔍</span> <span class="label">Discog Auditor</span>
+        </button>
+        <button class="nav-item" data-tab="soulseek">
+          <span class="icon">⚡</span> <span class="label">Soulseek Search</span>
+        </button>
+        <button class="nav-item" data-tab="artist">
+          <span class="icon">🚀</span> <span class="label">Artist Downloader</span>
+        </button>
+        <button class="nav-item" data-tab="quality">
+          <span class="icon">💎</span> <span class="label">Quality Upgrader</span>
+        </button>
+        <button class="nav-item" data-tab="tagger">
+          <span class="icon">🏷️</span> <span class="label">Genre Tagger</span>
+        </button>
+        <button class="nav-item" data-tab="scrapers">
+          <span class="icon">🌐</span> <span class="label">Web Scrapers</span>
+        </button>
+        <button class="nav-item" data-tab="cleaner">
+          <span class="icon">🧹</span> <span class="label">Folder Cleaner</span>
+        </button>
+        <button class="nav-item" data-tab="tasks">
+          <span class="icon">📜</span> <span class="label">Live Console</span>
+          <span id="active-tasks-badge" class="badge-count" style="display: none;">0</span>
+        </button>
+        <button class="nav-item" data-tab="settings">
+          <span class="icon">⚙️</span> <span class="label">Settings</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="service-pill" id="pill-slskd">
+          <span class="status-dot"></span> slskd
+        </div>
+        <div class="service-pill" id="pill-mb">
+          <span class="status-dot online"></span> MusicBrainz
+        </div>
+        <div class="service-pill" id="pill-navidrome">
+          <span class="status-dot"></span> Navidrome
+        </div>
+        <div class="service-pill" id="pill-lastfm">
+          <span class="status-dot"></span> Last.fm
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Content View -->
+    <main class="main-content">
+      <!-- Global Top Bar -->
+      <header class="top-bar">
+        <div class="top-left">
+          <h1 id="current-page-title">Dashboard</h1>
+        </div>
+        <div class="top-right">
+          <div id="global-task-banner" class="task-banner hidden">
+            <span class="spinner-inline"></span>
+            <span id="global-task-name">Running task...</span>
+            <button class="btn btn-xs btn-outline" id="btn-view-global-task">View Logs</button>
+          </div>
+          <button class="btn btn-sm btn-secondary" id="btn-refresh-status">↻ Refresh Status</button>
+        </div>
+      </header>
+
+      <div class="view-container">
+        <!-- TAB 1: DASHBOARD -->
+        <section id="view-dashboard" class="tab-pane active">
+          <div class="grid grid-4 mb-4">
+            <div class="stat-card">
+              <div class="stat-title">Soulseek (slskd)</div>
+              <div class="stat-value" id="dash-slskd-status">Checking...</div>
+              <div class="stat-sub" id="dash-slskd-user">User: -</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-title">Navidrome Server</div>
+              <div class="stat-value" id="dash-nav-status">Checking...</div>
+              <div class="stat-sub" id="dash-nav-url">-</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-title">MusicBrainz & Last.fm</div>
+              <div class="stat-value text-green">Online</div>
+              <div class="stat-sub" id="dash-lastfm-status">Last.fm: Checking...</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-title">Library Path</div>
+              <div class="stat-value text-truncate" id="dash-lib-status">-</div>
+              <div class="stat-sub" id="dash-lib-exists">Path verification...</div>
+            </div>
+          </div>
+
+          <div class="grid grid-2 mb-4">
+            <div class="card">
+              <div class="card-header">
+                <h3>⚡ Quick Actions</h3>
+              </div>
+              <div class="card-body quick-actions-grid">
+                <button class="btn btn-outline" onclick="switchTab('auditor')">
+                  🔍 Audit Artist Discography
+                </button>
+                <button class="btn btn-outline" onclick="switchTab('soulseek')">
+                  ⚡ Search Soulseek Direct
+                </button>
+                <button class="btn btn-outline" onclick="switchTab('artist')">
+                  🚀 Download Full Artist
+                </button>
+                <button class="btn btn-outline" onclick="switchTab('quality')">
+                  💎 Scan & Upgrade Bitrates
+                </button>
+                <button class="btn btn-outline" onclick="switchTab('tagger')">
+                  🏷️ Auto-Tag Last.fm Genres
+                </button>
+                <button class="btn btn-outline" onclick="switchTab('cleaner')">
+                  🧹 Clean Empty Folders
+                </button>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <h3>📜 Recent Tasks</h3>
+                <button class="btn btn-xs btn-outline" onclick="switchTab('tasks')">All Logs</button>
+              </div>
+              <div class="card-body">
+                <div id="dash-recent-tasks" class="task-list-compact">
+                  <div class="text-muted">No recent tasks executed.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3>📥 Active Soulseek Transfers</h3>
+              <button class="btn btn-xs btn-outline" id="btn-refresh-transfers">↻ Refresh</button>
+            </div>
+            <div class="card-body">
+              <div class="table-responsive">
+                <table class="data-table" id="table-slskd-transfers">
+                  <thead>
+                    <tr>
+                      <th>User</th>
+                      <th>Filename</th>
+                      <th>Size</th>
+                      <th>Speed</th>
+                      <th>Status</th>
+                      <th>Progress</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr><td colspan="6" class="text-center text-muted">No active transfers or slskd not connected.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 2: DISCOGRAPHY AUDITOR -->
+        <section id="view-auditor" class="tab-pane">
+          <div class="card mb-4">
+            <div class="card-header">
+              <h3>🔍 MusicBrainz Discography Auditor</h3>
+            </div>
+            <div class="card-body">
+              <form id="form-audit" class="form-row">
+                <div class="form-group flex-2">
+                  <label for="audit-artist">Artist Name or MusicBrainz ID (MBID):</label>
+                  <input type="text" id="audit-artist" placeholder="e.g. Aphex Twin, Boards of Canada, Daft Punk" required>
+                </div>
+                <div class="form-group flex-2">
+                  <label for="audit-dir">Music Library Directory:</label>
+                  <input type="text" id="audit-dir" placeholder="/path/to/music">
+                </div>
+                <div class="form-group-checkboxes">
+                  <label class="checkbox-label">
+                    <input type="checkbox" id="audit-full-scan"> Deep Full Scan
+                  </label>
+                  <label class="checkbox-label">
+                    <input type="checkbox" id="audit-force-refresh"> Refresh MB Cache
+                  </label>
+                </div>
+                <div class="form-actions">
+                  <button type="submit" class="btn btn-primary" id="btn-run-audit">Start Audit</button>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          <!-- Audit Results Panel -->
+          <div id="audit-results-panel" class="hidden">
+            <div class="grid grid-4 mb-4">
+              <div class="stat-card">
+                <div class="stat-title">Catalog Artist</div>
+                <div class="stat-value" id="audit-res-artist">-</div>
+                <div class="stat-sub" id="audit-res-mbid">MBID: -</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-title">Discography Completion</div>
+                <div class="stat-value" id="audit-res-pct">0%</div>
+                <div class="stat-sub" id="audit-res-ratio">0 / 0 tracks</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-title">Found in Library</div>
+                <div class="stat-value text-green" id="audit-res-found">0</div>
+                <div class="stat-sub">Local or Navidrome</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-title">Missing Tracks</div>
+                <div class="stat-value text-red" id="audit-res-missing">0</div>
+                <div class="stat-sub">Ready for download</div>
+              </div>
+            </div>
+
+            <div class="card mb-4">
+              <div class="card-header space-between">
+                <div class="header-left">
+                  <h3>💿 Release Breakdown</h3>
+                  <div class="btn-group">
+                    <button class="btn btn-xs btn-outline active" data-filter-audit="all">All</button>
+                    <button class="btn btn-xs btn-outline" data-filter-audit="missing">Has Missing</button>
+                    <button class="btn btn-xs btn-outline" data-filter-audit="complete">100% Found</button>
+                  </div>
+                </div>
+                <div class="header-right">
+                  <button class="btn btn-sm btn-outline" id="btn-export-audit-json">Export JSON</button>
+                  <button class="btn btn-sm btn-outline" id="btn-export-audit-txt">Export Missing TXT</button>
+                  <button class="btn btn-sm btn-primary" id="btn-audit-send-soulseek">⚡ Search Missing on Soulseek</button>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="table-responsive">
+                  <table class="data-table" id="table-audit-releases">
+                    <thead>
+                      <tr>
+                        <th>Year</th>
+                        <th>Type</th>
+                        <th>Release Title</th>
+                        <th>Tracks Found</th>
+                        <th>Progress</th>
+                        <th>Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="tbody-audit-releases">
+                      <tr><td colspan="6" class="text-center text-muted">No audit executed yet.</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 3: SOULSEEK DISCOVERY -->
+        <section id="view-soulseek" class="tab-pane">
+          <div class="card mb-4">
+            <div class="card-header">
+              <h3>⚡ Soulseek Search & Queue</h3>
+            </div>
+            <div class="card-body">
+              <form id="form-soulseek-search" class="form-row">
+                <div class="form-group flex-3">
+                  <label for="slsk-query">Search Query (Artist, Album, or Track):</label>
+                  <input type="text" id="slsk-query" placeholder="e.g. Aphex Twin Selected Ambient Works" required>
+                </div>
+                <div class="form-group flex-1">
+                  <label for="slsk-format">Preferred Format:</label>
+                  <select id="slsk-format">
+                    <option value="flac">Lossless (FLAC)</option>
+                    <option value="mp3-320">MP3 320kbps</option>
+                  </select>
+                </div>
+                <div class="form-group flex-1">
+                  <label for="slsk-timeout">Search Timeout (s):</label>
+                  <input type="number" id="slsk-timeout" value="15" min="5" max="60">
+                </div>
+                <div class="form-actions">
+                  <button type="submit" class="btn btn-primary" id="btn-run-slsk">Search Soulseek</button>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          <div class="card mb-4">
+            <div class="card-header space-between">
+              <h3>Discovered Peer Directories</h3>
+              <div class="text-muted" id="slsk-results-count">0 directories found</div>
+            </div>
+            <div class="card-body">
+              <div id="slsk-results-container" class="folder-results-list">
+                <div class="text-center text-muted py-4">Enter a query above to discover files from Soulseek peers.</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 4: ARTIST DOWNLOADER -->
+        <section id="view-artist" class="tab-pane">
+          <div class="card mb-4">
+            <div class="card-header">
+              <h3>🚀 Multi-Source Artist Downloader (MB + Bandcamp + Soulseek)</h3>
+            </div>
+            <div class="card-body">
+              <form id="form-artist-dl" class="form-grid">
+                <div class="form-group">
+                  <label for="artist-dl-name">Artist Name / MBID:</label>
+                  <input type="text" id="artist-dl-name" placeholder="e.g. Boards of Canada" required>
+                </div>
+                <div class="form-group">
+                  <label for="artist-dl-format">Preferred Audio Format:</label>
+                  <select id="artist-dl-format">
+                    <option value="flac">FLAC (Lossless)</option>
+                    <option value="mp3-320">MP3 (320 kbps)</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="artist-dl-output">Output Directory:</label>
+                  <input type="text" id="artist-dl-output" placeholder="/mnt/music/downloads">
+                </div>
+                <div class="form-group">
+                  <label for="artist-dl-lib">Library Directory (Pre-scan):</label>
+                  <input type="text" id="artist-dl-lib" placeholder="/mnt/music">
+                </div>
+                <div class="form-group-full form-checkbox-group">
+                  <label class="checkbox-label">
+                    <input type="checkbox" id="artist-dl-use-bc" checked> Enable Official Bandcamp Scraper
+                  </label>
+                  <label class="checkbox-label">
+                    <input type="checkbox" id="artist-dl-use-slsk" checked> Enable Soulseek / slskd Queueing
+                  </label>
+                  <label class="checkbox-label">
+                    <input type="checkbox" id="artist-dl-dry-run"> Dry-Run Preview (Do not transfer)
+                  </label>
+                </div>
+                <div class="form-actions-full">
+                  <button type="submit" class="btn btn-primary btn-lg">Launch Artist Orchestrator</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 5: QUALITY UPGRADER -->
+        <section id="view-quality" class="tab-pane">
+          <div class="card mb-4">
+            <div class="card-header">
+              <h3>💎 Audio Quality Scanner & Soulseek Upgrader</h3>
+            </div>
+            <div class="card-body">
+              <form id="form-quality" class="form-row">
+                <div class="form-group flex-2">
+                  <label for="quality-lib-dir">Music Library Directory:</label>
+                  <input type="text" id="quality-lib-dir" placeholder="/mnt/music">
+                </div>
+                <div class="form-group flex-2">
+                  <label for="quality-artist-filter">Artist Filter (Optional):</label>
+                  <input type="text" id="quality-artist-filter" placeholder="e.g. Aphex Twin">
+                </div>
+                <div class="form-group flex-1">
+                  <label for="quality-target-fmt">Target Quality:</label>
+                  <select id="quality-target-fmt">
+                    <option value="flac">FLAC (Lossless)</option>
+                    <option value="mp3-320">MP3 320k</option>
+                  </select>
+                </div>
+                <div class="form-actions">
+                  <button type="button" class="btn btn-secondary" id="btn-scan-quality">1. Scan Candidates</button>
+                  <button type="button" class="btn btn-primary" id="btn-upgrade-quality">2. Upgrade via Soulseek</button>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header space-between">
+              <h3>Upgrade Candidates Found</h3>
+              <div class="text-muted" id="quality-candidate-count">0 tracks</div>
+            </div>
+            <div class="card-body">
+              <div class="table-responsive">
+                <table class="data-table" id="table-quality-candidates">
+                  <thead>
+                    <tr>
+                      <th>Artist</th>
+                      <th>Album</th>
+                      <th>Track Title</th>
+                      <th>Current Bitrate / Format</th>
+                      <th>Target</th>
+                      <th>Filename</th>
+                    </tr>
+                  </thead>
+                  <tbody id="tbody-quality-candidates">
+                    <tr><td colspan="6" class="text-center text-muted">Click "Scan Candidates" to scan your library.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 6: GENRE TAGGER -->
+        <section id="view-tagger" class="tab-pane">
+          <div class="card mb-4">
+            <div class="card-header">
+              <h3>🏷️ Last.fm Automated Genre Tagger</h3>
+            </div>
+            <div class="card-body">
+              <form id="form-tagger" class="form-grid">
+                <div class="form-group">
+                  <label for="tagger-path">Target Folder or File:</label>
+                  <input type="text" id="tagger-path" placeholder="/mnt/music/ArtistName" required>
+                </div>
+                <div class="form-group">
+                  <label for="tagger-strategy">Tagging Strategy:</label>
+                  <select id="tagger-strategy">
+                    <option value="cascade">Cascade (Track -> Album -> Artist fallback)</option>
+                    <option value="blend">Blend (Combine Artist + Album tags)</option>
+                    <option value="artist">Artist Only</option>
+                    <option value="album">Album Only</option>
+                    <option value="track">Track Only</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="tagger-limit">Max Genres Per Track:</label>
+                  <input type="number" id="tagger-limit" value="3" min="1" max="10">
+                </div>
+                <div class="form-group">
+                  <label for="tagger-mode">Write Mode:</label>
+                  <select id="tagger-mode">
+                    <option value="overwrite">Overwrite existing genres</option>
+                    <option value="skip_existing">Skip if genre already present</option>
+                    <option value="append">Append to existing genres</option>
+                  </select>
+                </div>
+                <div class="form-group-full form-checkbox-group">
+                  <label class="checkbox-label">
+                    <input type="checkbox" id="tagger-dry-run" checked> Dry-Run (Preview tags without writing files)
+                  </label>
+                </div>
+                <div class="form-actions-full">
+                  <button type="submit" class="btn btn-primary btn-lg">Start Genre Tagging</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 7: WEB SCRAPERS -->
+        <section id="view-scrapers" class="tab-pane">
+          <div class="grid grid-2 mb-4">
+            <div class="card">
+              <div class="card-header">
+                <h3>Bandcamp Downloader</h3>
+              </div>
+              <div class="card-body">
+                <form id="form-bc-dl">
+                  <div class="form-group mb-3">
+                    <label for="bc-targets">Bandcamp Artist Subdomains or URLs (one per line):</label>
+                    <textarea id="bc-targets" rows="4" placeholder="https://artistname.bandcamp.com&#10;https://artistname.bandcamp.com/album/example" required></textarea>
+                  </div>
+                  <div class="form-group mb-3">
+                    <label for="bc-format">Preferred Format:</label>
+                    <select id="bc-format">
+                      <option value="mp3-320">MP3-320 (Best standard compatibility)</option>
+                      <option value="flac">FLAC (Lossless when available)</option>
+                    </select>
+                  </div>
+                  <div class="form-group mb-3">
+                    <label for="bc-output">Output Directory:</label>
+                    <input type="text" id="bc-output" placeholder="/mnt/music/downloads">
+                  </div>
+                  <div class="form-checkbox-group mb-3">
+                    <label class="checkbox-label">
+                      <input type="checkbox" id="bc-fallback" checked> Enable MP3-128 stream fallback
+                    </label>
+                  </div>
+                  <button type="submit" class="btn btn-primary">Start Bandcamp Downloads</button>
+                </form>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <h3>Universal Web Release Crawler</h3>
+              </div>
+              <div class="card-body">
+                <form id="form-crawl-dl">
+                  <div class="form-group mb-3">
+                    <label for="crawl-url">Target Web Page URL to Crawl:</label>
+                    <input type="url" id="crawl-url" placeholder="https://dochakuso.example.com/releases" required>
+                  </div>
+                  <div class="form-group mb-3">
+                    <label for="crawl-workers">Worker Threads:</label>
+                    <input type="number" id="crawl-workers" value="4" min="1" max="16">
+                  </div>
+                  <div class="form-group mb-3">
+                    <label for="crawl-output">Output Directory:</label>
+                    <input type="text" id="crawl-output" placeholder="/mnt/music/downloads">
+                  </div>
+                  <div class="form-checkbox-group mb-3">
+                    <label class="checkbox-label">
+                      <input type="checkbox" id="crawl-overwrite"> Overwrite existing files
+                    </label>
+                  </div>
+                  <button type="submit" class="btn btn-primary">Crawl & Download Releases</button>
+                </form>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 8: FOLDER CLEANER -->
+        <section id="view-cleaner" class="tab-pane">
+          <div class="card mb-4">
+            <div class="card-header">
+              <h3>🧹 Empty & Non-Music Folder Cleaner</h3>
+            </div>
+            <div class="card-body">
+              <form id="form-cleaner" class="form-row">
+                <div class="form-group flex-3">
+                  <label for="cleaner-path">Directory to Scan and Clean:</label>
+                  <input type="text" id="cleaner-path" placeholder="/mnt/music/downloads" required>
+                </div>
+                <div class="form-group-checkboxes">
+                  <label class="checkbox-label">
+                    <input type="checkbox" id="cleaner-execute"> Execute Deletion (Unchecked = Preview Dry-run)
+                  </label>
+                </div>
+                <div class="form-actions">
+                  <button type="submit" class="btn btn-primary">Scan & Clean</button>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header space-between">
+              <h3>Folders Identified for Removal</h3>
+              <div class="text-muted" id="cleaner-count">0 folders</div>
+            </div>
+            <div class="card-body">
+              <ul class="clean-folder-list" id="list-cleaner-folders">
+                <li class="text-muted">Run cleaner scan above to preview removable folders.</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 9: LIVE TASKS & LOG CONSOLE -->
+        <section id="view-tasks" class="tab-pane">
+          <div class="grid grid-sidebar mb-4">
+            <div class="card">
+              <div class="card-header space-between">
+                <h3>Task History</h3>
+                <button class="btn btn-xs btn-outline" id="btn-refresh-task-list">↻</button>
+              </div>
+              <div class="card-body p-0">
+                <div class="task-list-nav" id="task-list-sidebar">
+                  <div class="p-3 text-muted">Loading tasks...</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header space-between">
+                <div class="task-detail-header">
+                  <h3 id="current-task-title">Select a Task</h3>
+                  <span id="current-task-status-badge" class="badge">idle</span>
+                </div>
+                <div class="task-controls">
+                  <label class="checkbox-label font-xs">
+                    <input type="checkbox" id="chk-autoscroll" checked> Auto-Scroll
+                  </label>
+                  <button class="btn btn-xs btn-danger" id="btn-cancel-task" disabled>Cancel Task</button>
+                </div>
+              </div>
+              <div class="card-body p-0">
+                <div class="progress-bar-container">
+                  <div class="progress-bar-fill" id="current-task-progress-bar" style="width: 0%;"></div>
+                </div>
+                <div class="terminal-log" id="terminal-log-viewer">
+                  <div class="log-line text-muted">No task logs active. Select a task or start a job from the navigation tabs.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 10: SETTINGS -->
+        <section id="view-settings" class="tab-pane">
+          <div class="card mb-4">
+            <div class="card-header">
+              <h3>⚙️ Configuration & Service Integrations</h3>
+            </div>
+            <div class="card-body">
+              <form id="form-settings" class="form-grid">
+                <div class="form-group">
+                  <label for="cfg-lib-dir">Default Library Path:</label>
+                  <input type="text" id="cfg-lib-dir">
+                </div>
+                <div class="form-group">
+                  <label for="cfg-out-dir">Default Output / Download Path:</label>
+                  <input type="text" id="cfg-out-dir">
+                </div>
+                <div class="form-group">
+                  <label for="cfg-slskd-url">Soulseek / slskd URL:</label>
+                  <input type="text" id="cfg-slskd-url" placeholder="http://localhost:5030">
+                </div>
+                <div class="form-group">
+                  <label for="cfg-slskd-user">slskd Username (Optional):</label>
+                  <input type="text" id="cfg-slskd-user">
+                </div>
+                <div class="form-group">
+                  <label for="cfg-slskd-pass">slskd Password (Optional):</label>
+                  <input type="password" id="cfg-slskd-pass">
+                </div>
+                <div class="form-group">
+                  <label for="cfg-lastfm-key">Last.fm API Key:</label>
+                  <input type="text" id="cfg-lastfm-key">
+                </div>
+                <div class="form-group">
+                  <label for="cfg-nav-url">Navidrome URL (Optional):</label>
+                  <input type="text" id="cfg-nav-url">
+                </div>
+                <div class="form-group">
+                  <label for="cfg-nav-user">Navidrome Username:</label>
+                  <input type="text" id="cfg-nav-user">
+                </div>
+                <div class="form-group">
+                  <label for="cfg-nav-token">Navidrome Token / Password:</label>
+                  <input type="password" id="cfg-nav-token">
+                </div>
+                <div class="form-group">
+                  <label for="cfg-bc-email">Bandcamp Email (For free downloads):</label>
+                  <input type="email" id="cfg-bc-email">
+                </div>
+                <div class="form-actions-full">
+                  <button type="submit" class="btn btn-primary btn-lg">Save Configuration</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

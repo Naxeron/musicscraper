@@ -71,6 +71,14 @@ class AudioMetadata:
     def norm_album(self) -> str:
         return normalize_text(self.album)
 
+    @property
+    def format(self) -> str:
+        return self.format_label or self.file_type or ""
+
+    @property
+    def bitrate(self) -> int:
+        return self.bitrate_kbps
+
 
 class AudioQualityAnalyzer:
     """Inspects audio stream parameters and computes standardized quality scores."""

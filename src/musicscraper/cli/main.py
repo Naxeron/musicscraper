@@ -97,6 +97,12 @@ def build_parser() -> argparse.ArgumentParser:
     clean_p.add_argument("--execute", "-y", action="store_true", help="Perform actual deletion (default is dry-run)")
     clean_p.add_argument("-v", "--verbose", action="store_true", help="Verbose log of retained folders")
 
+    # 9. Web GUI Subcommand
+    web_p = subparsers.add_parser("web", aliases=["gui"], help="Launch MusicScraper Web GUI server")
+    web_p.add_argument("--host", default="127.0.0.1", help="Host interface to bind (default: 127.0.0.1)")
+    web_p.add_argument("-p", "--port", type=int, default=8080, help="Port to listen on (default: 8080)")
+    web_p.add_argument("--open", action="store_true", help="Automatically open GUI in default web browser")
+
     return parser
 
 
@@ -225,6 +231,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif args.command == "clean":
         cleaner = FolderCleanerService()
         cleaner.clean(target_dir=Path(args.path), dry_run=not args.execute, verbose=args.verbose)
+        return 0
+
+    elif args.command in ("web", "gui"):
+        from musicscraper.web.server import start_server
+        import webbrowser
+        httpd = start_server(host=args.host, port=args.port)
+        url = f"http://{args.host}:{args.port}"
+        console.print(f"[bold green]✔ MusicScraper Web GUI running at:[/bold green] [bold cyan]{url}[/bold cyan]")
+        console.print("[dim]Press Ctrl+C to stop server.[/dim]")
+        if args.open:
+            webbrowser.open(url)
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Shutting down Web GUI server...[/yellow]")
+            httpd.shutdown()
         return 0
 
     return 0
