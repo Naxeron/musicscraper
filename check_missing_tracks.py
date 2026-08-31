@@ -193,18 +193,36 @@ def strip_track_number_and_artist(filename_no_ext: str) -> str:
     Cleans a filename to extract the track title:
     e.g. '01 すてらべえ - Ultra Cutie Gangsta' -> 'Ultra Cutie Gangsta'
     e.g. '2-11 Stellabee - Enemy' -> 'Enemy'
+    e.g. 'Aphex Twin - Syro - 03 - produk 29' -> 'produk 29'
+    e.g. 'Aphex Twin (On)-[WAP 39CD]-[01]-On' -> 'On'
     """
     raw = filename_no_ext.strip()
     cleaned = raw
-    # Strip leading track numbers (e.g. '01 - ', '1-02. ', '12 ')
-    cleaned = re.sub(r'^(\d+[\-_.]|\d+[\-_.]\d+|\d+)\s*[-_.]*\s*', '', cleaned)
-    # If there is an 'Artist - Title' format, take the title
+    # Strip leading track numbers with delimiters (e.g. '01 - ', '01. ', '1-02 ', '01_ ')
+    cleaned = re.sub(r'^(?:\d{1,4}\s*[-._]+\s*|\d+[-._]\d+\s*[-._]*\s*)', '', cleaned)
+    # Strip leading 2-digit 0-prefixed track numbers (e.g. '01 Chinaski', '05 180db_')
+    cleaned = re.sub(r'^0\d\s+', '', cleaned)
+    # Strip bracketed track numbers (e.g. '[01] ', '-[01]-')
+    cleaned = re.sub(r'-\[\d+\]-', ' - ', cleaned)
+    cleaned = re.sub(r'^\[\d+\]\s*[-._]*\s*', '', cleaned)
+
+    # If there is an 'Artist - Title' or 'Artist - Album - 01 - Title' format, take the title
     if ' - ' in cleaned:
-        parts = cleaned.split(' - ', 1)
-        cleaned = parts[1]
+        parts = cleaned.split(' - ')
+        cleaned = parts[-1].strip()
+        cleaned = re.sub(r'^(?:\d{1,4}\s*[-._]+\s*|\d+[-._]\d+\s*[-._]*\s*)', '', cleaned)
+        cleaned = re.sub(r'^0\d\s+', '', cleaned)
     elif ' _ ' in cleaned:
-        parts = cleaned.split(' _ ', 1)
-        cleaned = parts[1]
+        parts = cleaned.split(' _ ')
+        cleaned = parts[-1].strip()
+        cleaned = re.sub(r'^(?:\d{1,4}\s*[-._]+\s*|\d+[-._]\d+\s*[-._]*\s*)', '', cleaned)
+        cleaned = re.sub(r'^0\d\s+', '', cleaned)
+    elif ']-[' in cleaned:
+        parts = cleaned.split(']-[')
+        cleaned = parts[-1].rstrip(']').strip()
+        cleaned = re.sub(r'^(?:\d{1,4}\s*[-._]+\s*|\d+[-._]\d+\s*[-._]*\s*)', '', cleaned)
+        cleaned = re.sub(r'^0\d\s+', '', cleaned)
+
     return cleaned.strip() if cleaned.strip() else raw
 
 
@@ -230,6 +248,7 @@ REMASTER_OR_NOISE_PATTERNS = [
     re.compile(r"[\(\[\{]?bonus\s*track[\)\]\}]?", re.IGNORECASE),
     re.compile(r"[\(\[\{]?(?:original\s*mix|original\s*version|album\s*version|main\s*version)[\)\]\}]?", re.IGNORECASE),
     re.compile(r"[\(\[\{]?(?:flac|mp3|320kbps|24bit|lossless|wav|vbr|cd|web|vinyl|rip|official\s*audio|official\s*video|mv|lyrics)[\)\]\}]?", re.IGNORECASE),
+    re.compile(r"\[\s*[\d.]+\s*(?:bpm)?\s*\]", re.IGNORECASE),
 ]
 
 FEATURE_PATTERNS = [
@@ -552,10 +571,13 @@ class MusicBrainzClient:
                 includes=['recordings', 'release-groups', 'artist-credits', 'media', 'url-rels']
             )
             rels = res.get('release-list', [])
-            releases_artist.extend(rels)
-            if len(rels) < limit or len(releases_artist) >= int(res.get('release-count', 0)):
+            if not rels:
                 break
-            offset += limit
+            releases_artist.extend(rels)
+            total_count = int(res.get('release-count', 0))
+            if len(releases_artist) >= total_count:
+                break
+            offset += len(rels)
 
         # 3. Browse Releases where artist is a track artist (Compilations, VA, Splits)
         releases_track_artist = []
@@ -568,10 +590,13 @@ class MusicBrainzClient:
                 includes=['recordings', 'release-groups', 'artist-credits', 'media', 'url-rels']
             )
             rels = res.get('release-list', [])
-            releases_track_artist.extend(rels)
-            if len(rels) < limit or len(releases_track_artist) >= int(res.get('release-count', 0)):
+            if not rels:
                 break
-            offset += limit
+            releases_track_artist.extend(rels)
+            total_count = int(res.get('release-count', 0))
+            if len(releases_track_artist) >= total_count:
+                break
+            offset += len(rels)
 
         # 4. Browse all recordings directly linked to artist
         recordings = []
@@ -584,10 +609,13 @@ class MusicBrainzClient:
                 includes=['artist-credits', 'work-rels', 'url-rels']
             )
             recs = res.get('recording-list', [])
-            recordings.extend(recs)
-            if len(recs) < limit or len(recordings) >= int(res.get('recording-count', 0)):
+            if not recs:
                 break
-            offset += limit
+            recordings.extend(recs)
+            total_count = int(res.get('recording-count', 0))
+            if len(recordings) >= total_count:
+                break
+            offset += len(recs)
 
         # 5. Browse release groups
         release_groups = []
@@ -600,10 +628,13 @@ class MusicBrainzClient:
                 includes=['artist-credits', 'url-rels']
             )
             rgs = res.get('release-group-list', [])
-            release_groups.extend(rgs)
-            if len(rgs) < limit or len(release_groups) >= int(res.get('release-group-count', 0)):
+            if not rgs:
                 break
-            offset += limit
+            release_groups.extend(rgs)
+            total_count = int(res.get('release-group-count', 0))
+            if len(release_groups) >= total_count:
+                break
+            offset += len(rgs)
 
         full_data = {
             "artist": artist_data,

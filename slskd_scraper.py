@@ -397,6 +397,14 @@ def pre_parse_single_track(track_title: str) -> Dict[str, Any]:
     clean_words = list(_tokenize_words_cached(clean_base)) or words
     sig_words = {w for w in clean_words if len(w) >= 3 and w not in DIR_STOP_WORDS}
     concat = "".join(clean_words)
+
+    # Core base title stripping bracketed/parenthesized descriptors (e.g. "produk 29 [101]" -> "produk 29")
+    core_title = re.sub(r"\[.*?\]|\(.*?\)", " ", track_title).strip()
+    core_base = strip_track_number_and_artist(core_title)
+    core_words = list(_tokenize_words_cached(core_base))
+    core_concat = "".join(core_words)
+    core_sig_words = {w for w in core_words if len(w) >= 3 and w not in DIR_STOP_WORDS}
+
     return {
         "title": track_title,
         "p_struct": p_struct,
@@ -405,6 +413,10 @@ def pre_parse_single_track(track_title: str) -> Dict[str, Any]:
         "clean_words": clean_words,
         "sig_words": sig_words,
         "concat": concat,
+        "core_base": core_base,
+        "core_words": core_words,
+        "core_sig_words": core_sig_words,
+        "core_concat": core_concat,
     }
 
 
@@ -436,8 +448,15 @@ def is_track_title_match_fast(
     if not p_cand:
         return False
 
+    struct_exp = p_exp["p_struct"] if "p_struct" in p_exp else p_exp
     # 0. Version compatibility check
-    if not are_versions_compatible(p_exp["version_type"], p_exp["version_text"], p_cand["version_type"], p_cand["version_text"]):
+    if not are_versions_compatible(struct_exp["version_type"], struct_exp["version_text"], p_cand["version_type"], p_cand["version_text"]):
+        return False
+
+    # Check for distinct version / take numbers in base_norm (e.g. "goose and gary v 1" vs "goose and gary v 2")
+    v_exp = struct_exp["base_norm"].split()[-1] if struct_exp.get("base_norm") else ""
+    v_cand = cand.clean_base.split()[-1] if cand.clean_base else ""
+    if v_exp.isdigit() and v_cand.isdigit() and v_exp != v_cand:
         return False
 
     if not exp_words:
@@ -445,32 +464,41 @@ def is_track_title_match_fast(
 
     file_words = cand.words
     clean_file_words = cand.clean_words
+    core_exp_words = p_exp.get("core_words", [])
+    core_concat = p_exp.get("core_concat", "")
 
-    # 1. Direct token sequence match
+    # 1. Direct token sequence match (expected title or core title words must be contained in candidate filename)
     exact_match = (
-        is_sublist(exp_words, file_words) or
         is_sublist(clean_exp_words, clean_file_words) or
         is_sublist(clean_exp_words, file_words) or
-        is_sublist(exp_words, clean_file_words)
+        is_sublist(exp_words, clean_file_words) or
+        is_sublist(exp_words, file_words) or
+        (core_exp_words and (
+            is_sublist(core_exp_words, clean_file_words) or
+            is_sublist(core_exp_words, file_words)
+        ))
     )
 
-    # 2. Check concatenated tokens
-    if not exact_match and len(exp_concat) >= 3:
-        if exp_concat in cand.concat or cand.concat in exp_concat:
+    # 2. Check concatenated tokens (exact match or expected contained in candidate filename)
+    if not exact_match:
+        if len(exp_concat) >= 3 and (exp_concat == cand.concat or (len(exp_concat) >= 4 and exp_concat in cand.concat)):
+            exact_match = True
+        elif core_concat and len(core_concat) >= 3 and (core_concat == cand.concat or (len(core_concat) >= 4 and core_concat in cand.concat)):
             exact_match = True
 
-    # 3. Fuzzy similarity fallback
-    if not exact_match and len(exp_concat) >= 4:
+    # 3. High fuzzy similarity fallback (requiring threshold >= 0.88 and shared sig words)
+    if not exact_match and len(exp_concat) >= 4 and len(cand.concat) >= 4:
         if (exp_sig_words & cand.sig_words) or not exp_sig_words:
-            sim = calculate_similarity(p_exp["base_norm"], cand.clean_base)
-            if sim >= 0.82:
+            sim = calculate_similarity(struct_exp["base_norm"], cand.clean_base)
+            if sim >= 0.88:
                 exact_match = True
 
     if not exact_match:
         return False
 
-    # 4. Contextual validation for very short titles
-    if len(clean_exp_words) <= 1 or len(exp_concat) <= 3:
+    # 4. Contextual validation for very short titles (<= 3 chars or common stop words)
+    chk_concat = core_concat or exp_concat
+    if len(chk_concat) <= 3 or chk_concat in DIR_STOP_WORDS:
         dir_norm = clean_tokens(dir_path)
         file_norm = cand.concat
         has_artist_context = any(clean_tokens(alias) in dir_norm or clean_tokens(alias) in file_norm for alias in artist_aliases if len(alias) >= 3)
@@ -742,6 +770,18 @@ class SlskdArtistScraper:
         reconciler = DiscographyReconciler(catalog=self.catalog, local_tracks=local_tracks)
         found_items, _ = reconciler.reconcile()
 
+        for dt in local_tracks:
+            lt_title = dt.get("title", "")
+            if lt_title:
+                self.local_found_map[normalize_text(lt_title)] = dt
+                self.local_found_map[clean_tokens(lt_title)] = dt
+            fn = dt.get("filename", "")
+            if fn:
+                base_clean = strip_track_number_and_artist(os.path.splitext(fn)[0])
+                if base_clean:
+                    self.local_found_map[normalize_text(base_clean)] = dt
+                    self.local_found_map[clean_tokens(base_clean)] = dt
+
         for item in found_items:
             mb = item["mb_track"]
             lt = item["local_track"]
@@ -804,8 +844,12 @@ class SlskdArtistScraper:
                 continue
 
             q1 = clean_search_phrase(f"{self.catalog.name} {rel_title}")
-            if q1:
+            if q1 and q1 not in queries:
                 queries.append(q1)
+
+            clean_rel = clean_search_phrase(re.sub(r"[\(\[\{].*?[\)\]\}]", "", rel_title))
+            if clean_rel and len(clean_rel) >= 5 and clean_rel.lower() not in DIR_STOP_WORDS and clean_rel not in queries:
+                queries.append(clean_rel)
 
         # Tier 3: Major Compilations & Split Releases Missing from Local Library
         comp_releases = self.raw_mb_data.get("releases_track_artist", [])
@@ -1031,10 +1075,31 @@ class SlskdArtistScraper:
                             cf, self.all_artist_aliases, rel_title, cd.dir_name
                         ) for cf in cd.audio_files):
                             matched_cnt += 1
-                    if matched_cnt >= 2 and (matched_cnt / len(expected_tracks) >= 0.60):
+                    if matched_cnt >= 2 and (matched_cnt / len(expected_tracks) >= 0.50):
                         dir_matches = True
 
                 if dir_matches and cd.audio_files:
+                    # Automatically fetch full folder listing if folder name matched release
+                    if cd.dir_info.get("full_directory_files") is None:
+                        try:
+                            nodes = self.client.browse_directory(cd.user, cd.dir_name)
+                            if nodes:
+                                files = []
+                                for node in nodes:
+                                    node_name = node.get("name", cd.dir_name)
+                                    for f in node.get("files", []):
+                                        fn = f.get("filename", "")
+                                        full_fn = fn if ("\\" in fn or "/" in fn) else f"{node_name}\\{fn}"
+                                        f_copy = dict(f)
+                                        f_copy["full_filename"] = full_fn
+                                        f_copy["base_filename"] = fn
+                                        files.append(f_copy)
+                                if files:
+                                    cd.dir_info["full_directory_files"] = files
+                                    cd = self.candidate_index.update_directory(cd.user, cd.dir_name, cd.dir_info)
+                        except Exception:
+                            pass
+
                     match_data = self._evaluate_indexed_directory(cd, parsed_expected, expected_tracks, rel_title)
                     if match_data and match_data["match_ratio"] >= (0.60 if len(expected_tracks) >= 3 else 0.99):
                         candidate_matches.append(match_data)
@@ -1234,6 +1299,10 @@ class SlskdArtistScraper:
             # Skip if track belongs to an album that was already reconciled / verified in full
             if norm_rel and norm_rel in self.reconciled_release_keys:
                 continue
+            # Do not download isolated tracks for multi-track albums (>= 2 tracks) in standalone pass
+            rel_tracks_count = len([x for x in self.catalog.tracks if x.get("norm_release") == norm_rel]) if norm_rel else 0
+            if rel_tracks_count >= 2 and not self.singles_only:
+                continue
             standalone_candidates.append(t)
 
         if not standalone_candidates:
@@ -1318,9 +1387,14 @@ class SlskdArtistScraper:
                 return False
             norm_t = normalize_text(t_title)
             clean_t = clean_tokens(t_title)
+            core_t = re.sub(r"\[.*?\]|\(.*?\)", " ", t_title).strip()
+            norm_core = normalize_text(core_t)
+            clean_core = clean_tokens(core_t)
             return (
                 norm_t in self.local_found_map
                 or (clean_t and clean_t in self.local_found_map)
+                or (norm_core and norm_core in self.local_found_map)
+                or (clean_core and clean_core in self.local_found_map)
                 or norm_t in queued_clean_titles
                 or (clean_t and clean_t in queued_clean_titles)
             )
@@ -1378,34 +1452,47 @@ class SlskdArtistScraper:
                 t for t in self.catalog.tracks
                 if t.get("norm_release") == norm_rel or rel_title in t.get("all_releases", set())
             ]
+            parsed_expected = pre_parse_expected_tracks(expected_tracks)
             already_found_expected = [
                 t for t in expected_tracks
                 if is_track_already_found(t.get("title", ""))
             ]
 
+            # If all expected tracks are already satisfied, skip release
+            if len(already_found_expected) >= len(expected_tracks) and len(expected_tracks) > 0:
+                continue
+
             # If partial album (some tracks already present on disk), only download the genuinely missing tracks
             is_partial_album = (len(already_found_expected) > 0 and len(already_found_expected) < len(expected_tracks))
-            missing_expected_norm = {
-                t.get("norm_title") for t in expected_tracks if not is_track_already_found(t.get("title", ""))
-            } | {
-                clean_tokens(t.get("title", "")) for t in expected_tracks if not is_track_already_found(t.get("title", ""))
-            }
 
             files_to_enqueue = []
             for f in dir_files:
                 base = f.get("base_filename") or extract_dir_and_filename(f.get("filename", ""))[1]
                 if is_audio_file(base):
                     full_fn = f.get("full_filename") or f.get("filename")
-                    base_clean = re.sub(r"^(\d+[\-_.]|\d+[\-_.]\d+|\d+)\s*[-_.]*\s*", "", os.path.splitext(base)[0]).strip()
-                    norm_base = normalize_text(base_clean)
-                    clean_base = clean_tokens(base_clean)
+                    cf_tmp = CandidateFile(user, dir_name, f)
 
-                    # If partial album, only include files matching the missing tracks
+                    # Strictly skip any audio file that matches a track already found on disk or queued
+                    is_already_present = any(
+                        is_track_already_found(pe.get("title", ""))
+                        and is_track_title_match_fast(
+                            pe["p_struct"], pe["words"], pe["clean_words"], pe["sig_words"], pe["concat"],
+                            cf_tmp, self.all_artist_aliases, rel_title, dir_name
+                        )
+                        for pe in parsed_expected
+                    )
+                    if is_already_present:
+                        continue
+
+                    # If partial album, ensure the file actually matches one of the missing tracks
                     if is_partial_album:
-                        is_missing_file = (
-                            norm_base in missing_expected_norm
-                            or clean_base in missing_expected_norm
-                            or any(m in norm_base for m in missing_expected_norm if len(m) >= 4)
+                        is_missing_file = any(
+                            is_track_title_match_fast(
+                                pe["p_struct"], pe["words"], pe["clean_words"], pe["sig_words"], pe["concat"],
+                                cf_tmp, self.all_artist_aliases, rel_title, dir_name
+                            )
+                            for pe in parsed_expected
+                            if not is_track_already_found(pe.get("title", ""))
                         )
                         if not is_missing_file:
                             continue
@@ -1473,6 +1560,7 @@ class SlskdArtistScraper:
             download_full_dir = (
                 not self.singles_only
                 and not is_loose_dump(dir_name)
+                and is_dir_name_match(rel_title, dir_name)
                 and (norm_rel not in queued_release_keys)
                 and (not clean_rel or clean_rel not in queued_release_keys)
                 and (norm_rel not in self.local_found_releases)
