@@ -171,6 +171,97 @@ def browse_library(subpath: str = "") -> Dict[str, Any]:
     }
 
 
+_library_releases_cache: Dict[str, Any] = {"timestamp": 0, "releases": []}
+
+
+def get_library_releases(refresh: bool = False, search: str = "", filter_mode: str = "all") -> Dict[str, Any]:
+    """Scans and retrieves all releases present in the music library."""
+    global _library_releases_cache
+    from musicscraper.services.library import LibraryReleaseService
+
+    now = time.time()
+    if refresh or not _library_releases_cache["releases"] or (now - _library_releases_cache["timestamp"] > 300):
+        service = LibraryReleaseService()
+        releases = service.scan_library_releases(force_rescan=refresh)
+        _library_releases_cache = {"timestamp": now, "releases": releases}
+
+    all_releases = _library_releases_cache["releases"]
+
+    # Compute global summary metrics
+    total_releases = len(all_releases)
+    complete_releases = sum(1 for r in all_releases if r.get("status") == "complete")
+    has_missing_releases = sum(1 for r in all_releases if r.get("status") == "has_missing")
+    total_local_tracks = sum(r.get("found_count", len(r.get("tracks", []))) for r in all_releases)
+    total_missing_tracks = sum(r.get("missing_count", 0) for r in all_releases)
+
+    # Filter releases
+    filtered = list(all_releases)
+    if search:
+        s_lower = search.lower().strip()
+        filtered = [
+            r for r in filtered
+            if s_lower in r.get("artist", "").lower()
+            or s_lower in r.get("title", "").lower()
+            or s_lower in r.get("folder_path", "").lower()
+        ]
+
+    if filter_mode == "missing":
+        filtered = [r for r in filtered if r.get("status") == "has_missing" or r.get("missing_count", 0) > 0]
+    elif filter_mode == "complete":
+        filtered = [r for r in filtered if r.get("status") == "complete" and r.get("missing_count", 0) == 0]
+
+    return {
+        "summary": {
+            "total_releases": total_releases,
+            "complete_releases": complete_releases,
+            "has_missing_releases": has_missing_releases,
+            "total_local_tracks": total_local_tracks,
+            "total_missing_tracks": total_missing_tracks,
+        },
+        "count": len(filtered),
+        "releases": filtered
+    }
+
+
+def get_library_release_details(release_id: str, audit: bool = True, force_refresh: bool = False) -> Dict[str, Any]:
+    """Retrieves full tracklist and metadata for a specific release, with optional MusicBrainz audit."""
+    global _library_releases_cache
+    from musicscraper.services.library import LibraryReleaseService
+
+    if not _library_releases_cache["releases"]:
+        get_library_releases()
+
+    matched_rel = None
+    for idx, r in enumerate(_library_releases_cache["releases"]):
+        if r.get("id") == release_id or r.get("mb_release_id") == release_id:
+            matched_rel = r
+            break
+
+    if not matched_rel:
+        # Fallback to fresh scan
+        get_library_releases(refresh=True)
+        for idx, r in enumerate(_library_releases_cache["releases"]):
+            if r.get("id") == release_id or r.get("mb_release_id") == release_id:
+                matched_rel = r
+                break
+
+    if not matched_rel:
+        raise ValueError(f"Release ID '{release_id}' not found in library.")
+
+    if audit:
+        service = LibraryReleaseService()
+        audited = service.audit_release(matched_rel, force_refresh=force_refresh)
+        # Update cache in place
+        for idx, r in enumerate(_library_releases_cache["releases"]):
+            if r.get("id") == release_id:
+                _library_releases_cache["releases"][idx] = audited
+                break
+        return audited
+
+    return matched_rel
+
+
+
 # ==============================================================================
 # Task Execution Handlers
 # ==============================================================================
@@ -571,6 +662,141 @@ def run_clean_folders_task(task: BackgroundTask) -> Dict[str, Any]:
     }
 
 
+def run_library_scan_task(task: BackgroundTask) -> Dict[str, Any]:
+    """Scans and caches all releases present in the music library."""
+    global _library_releases_cache
+    from musicscraper.services.library import LibraryReleaseService
+
+    library_dir = Path(task.params.get("library_dir", str(Config.DEFAULT_LIBRARY_DIR)))
+    force_rescan = bool(task.params.get("force_rescan", True))
+
+    task.update_progress(10, f"Scanning audio files in library: {library_dir}...")
+    service = LibraryReleaseService()
+
+    def on_prog(done, total, msg):
+        pct = 10 + int((done / max(1, total)) * 75)
+        task.update_progress(pct, f"{msg} ({done}/{total})")
+
+    releases = service.scan_library_releases(
+        library_dir=library_dir,
+        force_rescan=force_rescan,
+        on_progress=on_prog
+    )
+
+    _library_releases_cache = {"timestamp": time.time(), "releases": releases}
+    task.update_progress(100, f"Discovered and organized {len(releases)} releases in library.")
+    return {
+        "releases_count": len(releases),
+        "complete_count": sum(1 for r in releases if r.get("status") == "complete"),
+        "missing_count": sum(1 for r in releases if r.get("status") == "has_missing"),
+    }
+
+
+def run_release_missing_download_task(task: BackgroundTask) -> Dict[str, Any]:
+    """Searches Soulseek and downloads all missing tracks for a specific release."""
+    from musicscraper.services.library import LibraryReleaseService
+
+    artist = task.params.get("artist", "").strip()
+    release_title = task.params.get("release_title", "").strip()
+    missing_tracks = task.params.get("missing_tracks", [])
+    format_pref = task.params.get("format", "flac")
+    dry_run = bool(task.params.get("dry_run", False))
+    timeout = float(task.params.get("timeout", 25.0))
+
+    if not artist or not release_title:
+        raise ValueError("Artist and release title are required to download missing tracks.")
+
+    if not missing_tracks:
+        task.update_progress(100, "No missing tracks specified for download.")
+        return {"status": "skipped", "queued_count": 0}
+
+    task.update_progress(10, f"Searching Soulseek for {len(missing_tracks)} missing tracks of '{artist} - {release_title}'...")
+    service = LibraryReleaseService()
+
+    def on_prog(done, total, msg):
+        task.update_progress(done, msg)
+
+    res = service.download_missing_tracks(
+        artist=artist,
+        release_title=release_title,
+        missing_tracks=missing_tracks,
+        preferred_format=format_pref,
+        search_timeout=timeout,
+        dry_run=dry_run,
+        on_progress=on_prog
+    )
+
+    task.update_progress(100, f"Queued {res.get('queued_count', 0)} of {len(missing_tracks)} missing tracks.")
+    return res
+
+
+def run_track_soulseek_download_task(task: BackgroundTask) -> Dict[str, Any]:
+    """Searches Soulseek and downloads a single missing track."""
+    from musicscraper.services.library import LibraryReleaseService
+
+    artist = task.params.get("artist", "").strip()
+    release_title = task.params.get("release_title", "").strip()
+    track_title = task.params.get("track_title", "").strip()
+    format_pref = task.params.get("format", "flac")
+    dry_run = bool(task.params.get("dry_run", False))
+    timeout = float(task.params.get("timeout", 20.0))
+
+    if not artist or not track_title:
+        raise ValueError("Artist and track title are required.")
+
+    task.update_progress(15, f"Searching Soulseek for single track '{artist} - {track_title}'...")
+    service = LibraryReleaseService()
+    res = service.download_single_missing_track(
+        artist=artist,
+        release_title=release_title,
+        track_title=track_title,
+        preferred_format=format_pref,
+        search_timeout=timeout,
+        dry_run=dry_run
+    )
+
+    if res.get("success"):
+        task.update_progress(100, f"Queued '{track_title}' from peer '{res.get('user')}'.")
+    else:
+        task.update_progress(100, f"No peer candidates found for '{track_title}'.")
+
+    return res
+
+
+def run_library_audit_all_task(task: BackgroundTask) -> Dict[str, Any]:
+    """Audits all library releases against MusicBrainz to find missing tracks across the entire library."""
+    global _library_releases_cache
+    from musicscraper.services.library import LibraryReleaseService
+
+    library_dir = Path(task.params.get("library_dir", str(Config.DEFAULT_LIBRARY_DIR)))
+    force_refresh = bool(task.params.get("force_refresh", True))
+
+    task.update_progress(10, "Starting MusicBrainz audit for all library releases...")
+    service = LibraryReleaseService()
+
+    def on_prog(done, total, msg):
+        pct = 10 + int((done / max(1, total)) * 85)
+        task.update_progress(pct, f"[{done}/{total}] {msg}")
+
+    audited = service.audit_all_releases(
+        library_dir=library_dir,
+        force_refresh=force_refresh,
+        on_progress=on_prog
+    )
+
+    _library_releases_cache = {"timestamp": time.time(), "releases": audited}
+
+    has_missing = sum(1 for r in audited if r.get("status") == "has_missing")
+    total_missing_trks = sum(r.get("missing_count", 0) for r in audited)
+
+    task.update_progress(100, f"Library audit complete: {has_missing} releases have missing tracks ({total_missing_trks} missing tracks total).")
+    return {
+        "total_releases": len(audited),
+        "has_missing_releases": has_missing,
+        "total_missing_tracks": total_missing_trks,
+    }
+
+
 TASK_DISPATCHER = {
     "audit": run_audit_task,
     "soulseek_search": run_soulseek_search_task,
@@ -582,6 +808,10 @@ TASK_DISPATCHER = {
     "bandcamp_download": run_bandcamp_download_task,
     "universal_scrape": run_universal_scrape_task,
     "clean_folders": run_clean_folders_task,
+    "library_scan": run_library_scan_task,
+    "library_audit_all": run_library_audit_all_task,
+    "release_missing_download": run_release_missing_download_task,
+    "track_soulseek_download": run_track_soulseek_download_task,
 }
 
 
@@ -598,3 +828,5 @@ def launch_task(task_type: str, params: Dict[str, Any], name: Optional[str] = No
         target_fn=fn,
         params=params
     )
+
+

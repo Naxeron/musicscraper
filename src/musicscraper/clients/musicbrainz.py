@@ -616,3 +616,51 @@ class MusicBrainzClient:
                 pass
 
         return full_data
+
+    def get_release_by_id(self, release_id: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+        """Fetches detailed release information including medium tracklist, recordings, and artist credits."""
+        cache_file = self.cache_dir / f"release_{release_id}.json"
+        if self.use_cache and not force_refresh and cache_file.exists():
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+
+        try:
+            res = musicbrainzngs.get_release_by_id(
+                release_id,
+                includes=['recordings', 'media', 'artist-credits', 'release-groups', 'url-rels']
+            )
+            rel_data = res.get('release', {})
+            if self.use_cache and rel_data:
+                try:
+                    with open(cache_file, "w", encoding="utf-8") as f:
+                        json.dump(rel_data, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+            return rel_data
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not fetch MusicBrainz release '{release_id}': {e}[/yellow]")
+            return None
+
+    def search_release(self, release_title: str, artist_name: Optional[str] = None, limit: int = 5) -> List[Dict[str, Any]]:
+        """Searches MusicBrainz for releases matching a title and optional artist name."""
+        query_parts = []
+        if release_title:
+            query_parts.append(f'release:"{release_title}"')
+        if artist_name:
+            query_parts.append(f'artist:"{artist_name}"')
+
+        query_str = " AND ".join(query_parts) if query_parts else release_title
+        try:
+            res = musicbrainzngs.search_releases(query=query_str, limit=limit)
+            return res.get('release-list', [])
+        except Exception:
+            try:
+                res = musicbrainzngs.search_releases(release=release_title, artist=artist_name, limit=limit)
+                return res.get('release-list', [])
+            except Exception as e:
+                console.print(f"[yellow]Warning: MusicBrainz release search error for '{query_str}': {e}[/yellow]")
+                return []
+

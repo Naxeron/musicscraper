@@ -22,6 +22,9 @@
         <button class="nav-item active" data-tab="dashboard">
           <span class="icon">📊</span> <span class="label">Dashboard</span>
         </button>
+        <button class="nav-item" data-tab="releases">
+          <span class="icon">💿</span> <span class="label">Library Releases</span>
+        </button>
         <button class="nav-item" data-tab="auditor">
           <span class="icon">🔍</span> <span class="label">Discog Auditor</span>
         </button>
@@ -117,6 +120,9 @@
                 <h3>⚡ Quick Actions</h3>
               </div>
               <div class="card-body quick-actions-grid">
+                <button class="btn btn-outline" onclick="switchTab('releases')">
+                  💿 Browse Library Releases
+                </button>
                 <button class="btn btn-outline" onclick="switchTab('auditor')">
                   🔍 Audit Artist Discography
                 </button>
@@ -175,6 +181,185 @@
                 </table>
               </div>
             </div>
+          </div>
+        </section>
+
+        <!-- TAB: LIBRARY RELEASES & MISSING TRACKS DOWNLOADER -->
+        <section id="view-releases" class="tab-pane">
+          <!-- Summary Metrics Cards -->
+          <div class="grid grid-4 mb-4">
+            <div class="stat-card">
+              <div class="stat-title">Library Releases</div>
+              <div class="stat-value" id="lib-rel-total-count">0</div>
+              <div class="stat-sub" id="lib-rel-tracks-total">0 local tracks</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-title">100% Complete</div>
+              <div class="stat-value text-green" id="lib-rel-complete-count">0</div>
+              <div class="stat-sub">Fully intact albums</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-title">Releases with Missing</div>
+              <div class="stat-value text-red" id="lib-rel-missing-count">0</div>
+              <div class="stat-sub" id="lib-rel-missing-tracks-sub">0 missing tracks</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-title">Soulseek Sync</div>
+              <div class="stat-value text-cyan" id="lib-rel-slsk-status">Ready</div>
+              <div class="stat-sub">slskd download queue</div>
+            </div>
+          </div>
+
+          <!-- Two-Panel Workspace -->
+          <div class="two-panel-container">
+            <!-- Left Panel: Releases List Master View -->
+            <aside class="panel-left">
+              <div class="panel-header">
+                <div class="panel-header-top">
+                  <h3>💿 Releases in Library</h3>
+                  <div class="btn-group">
+                    <button class="btn btn-xs btn-outline" id="btn-rescan-releases" title="Rescan library from disk">
+                      ↻ Rescan
+                    </button>
+                    <button class="btn btn-xs btn-primary" id="btn-audit-all-releases" title="Audit all releases against MusicBrainz to find missing tracks">
+                      🔍 Audit All (MB)
+                    </button>
+                  </div>
+                </div>
+                <!-- Search & Filters -->
+                <div class="panel-search-box">
+                  <span class="search-icon">🔍</span>
+                  <input type="text" id="lib-release-search" placeholder="Filter artist or album...">
+                  <button class="search-clear-btn hidden" id="btn-clear-release-search" title="Clear">✕</button>
+                </div>
+                <div class="panel-filter-row">
+                  <div class="btn-group flex-1">
+                    <button class="btn btn-xs btn-outline active" data-filter-release="all">All</button>
+                    <button class="btn btn-xs btn-outline" data-filter-release="missing">Missing</button>
+                    <button class="btn btn-xs btn-outline" data-filter-release="complete">Complete</button>
+                  </div>
+                  <select id="lib-release-sort" class="sort-select">
+                    <option value="artist">Sort: Artist</option>
+                    <option value="title">Sort: Album</option>
+                    <option value="year">Sort: Year</option>
+                    <option value="missing">Sort: Most Missing</option>
+                    <option value="tracks">Sort: Track Count</option>
+                  </select>
+                </div>
+
+                <!-- Live Visual Scan Progress Card -->
+                <div class="scan-progress-card hidden" id="lib-scan-progress-card">
+                  <div class="scan-progress-header">
+                    <span class="scan-progress-title" id="lib-scan-progress-title">
+                      <span class="spinner-inline"></span> Scanning library...
+                    </span>
+                    <span class="scan-progress-pct" id="lib-scan-progress-pct">0%</span>
+                  </div>
+                  <div class="scan-progress-bar">
+                    <div class="scan-progress-fill" id="lib-scan-progress-fill" style="width: 0%;"></div>
+                  </div>
+                  <div class="scan-progress-sub" id="lib-scan-progress-sub">Reading audio metadata from disk...</div>
+                </div>
+              </div>
+
+              <!-- Releases Scrollable List -->
+              <div class="panel-body p-0">
+                <div class="releases-master-list" id="releases-master-list">
+                  <div class="empty-state-card">
+                    <div class="spinner-inline"></div>
+                    <div class="text-muted mt-2">Loading library releases...</div>
+                  </div>
+                </div>
+              </div>
+            </aside>
+
+            <!-- Right Panel: Selected Release Detail View -->
+            <main class="panel-right" id="panel-release-details">
+              <!-- Empty State when nothing is selected -->
+              <div class="release-empty-state" id="release-empty-placeholder">
+                <div class="empty-icon">💿</div>
+                <h3>No Release Selected</h3>
+                <p class="text-muted">Select an album or release from the left panel to inspect tracks, compare against MusicBrainz, and initiate Soulseek downloads for missing tracks.</p>
+              </div>
+
+              <!-- Content when release is selected -->
+              <div class="release-detail-content hidden" id="release-detail-wrapper">
+                <!-- Release Hero Header -->
+                <div class="release-hero-card">
+                  <div class="release-hero-art">
+                    <span class="hero-vinyl-icon">🎵</span>
+                  </div>
+                  <div class="release-hero-info">
+                    <div class="release-hero-title-row">
+                      <h2 id="rel-det-title">Album Title</h2>
+                      <span class="badge" id="rel-det-badge-status">Status</span>
+                    </div>
+                    <div class="release-hero-artist" id="rel-det-artist">Artist Name</div>
+                    <div class="release-hero-meta">
+                      <span id="rel-det-year">Year: -</span> •
+                      <span id="rel-det-path" class="text-truncate">Folder: -</span> •
+                      <span id="rel-det-mbid-wrapper">MBID: <span id="rel-det-mbid" class="text-muted">Unlinked</span></span>
+                    </div>
+                    <!-- Completion Progress Bar -->
+                    <div class="release-progress-section">
+                      <div class="progress-info-row">
+                        <span id="rel-det-track-counts">0 / 0 tracks (0%)</span>
+                        <span id="rel-det-missing-highlight" class="text-red">0 missing</span>
+                      </div>
+                      <div class="progress-bar-container">
+                        <div class="progress-bar-fill" id="rel-det-progress-fill" style="width: 0%;"></div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Release Actions Bar -->
+                <div class="release-actions-bar">
+                  <div class="actions-left">
+                    <button class="btn btn-primary" id="btn-rel-download-missing">
+                      ⚡ Download All Missing Tracks
+                    </button>
+                    <button class="btn btn-outline" id="btn-rel-audit-mb">
+                      🔍 Re-Audit with MusicBrainz
+                    </button>
+                  </div>
+                  <div class="actions-right">
+                    <button class="btn btn-outline" id="btn-rel-search-soulseek">
+                      🔎 Search Soulseek
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Release Tracklist Table Card -->
+                <div class="card">
+                  <div class="card-header space-between">
+                    <h3>Tracks Breakdown</h3>
+                    <div class="format-pills-list" id="rel-det-formats-list">
+                      <!-- Format badges -->
+                    </div>
+                  </div>
+                  <div class="card-body p-0">
+                    <div class="table-responsive">
+                      <table class="data-table" id="table-release-tracks">
+                        <thead>
+                          <tr>
+                            <th style="width: 40px;">#</th>
+                            <th>Track Title</th>
+                            <th>Status</th>
+                            <th>Audio Format / Bitrate</th>
+                            <th>File / Details</th>
+                            <th style="text-align: right; width: 140px;">Action</th>
+                          </tr>
+                        </thead>
+                        <tbody id="tbody-release-tracks">
+                          <tr><td colspan="6" class="text-center text-muted">Select a release to view tracks.</td></tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </main>
           </div>
         </section>
 

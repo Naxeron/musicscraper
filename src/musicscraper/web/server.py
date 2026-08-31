@@ -74,6 +74,22 @@ class MusicScraperHTTPRequestHandler(BaseHTTPRequestHandler):
             subpath = query.get("path", [""])[0]
             return self._send_json_response(api.browse_library(subpath))
 
+        elif path == "/api/library/releases":
+            refresh = query.get("refresh", ["false"])[0].lower() == "true"
+            search = query.get("search", [""])[0]
+            filter_mode = query.get("filter", ["all"])[0].lower()
+            return self._send_json_response(api.get_library_releases(refresh=refresh, search=search, filter_mode=filter_mode))
+
+        elif path.startswith("/api/library/releases/"):
+            rel_id = path[len("/api/library/releases/"):].strip("/")
+            audit = query.get("audit", ["true"])[0].lower() == "true"
+            refresh = query.get("refresh", ["false"])[0].lower() == "true"
+            try:
+                details = api.get_library_release_details(rel_id, audit=audit, force_refresh=refresh)
+                return self._send_json_response(details)
+            except Exception as e:
+                return self._send_error_json(str(e), status_code=404)
+
         # 3. REST API: Task Management
         elif path == "/api/tasks":
             limit = int(query.get("limit", [50])[0])
@@ -118,7 +134,16 @@ class MusicScraperHTTPRequestHandler(BaseHTTPRequestHandler):
             updated = api.update_system_config(body)
             return self._send_json_response({"success": True, "config": updated})
 
-        # 2. Run Background Task
+        # 2. Re-audit library release
+        elif path.startswith("/api/library/releases/") and path.endswith("/audit"):
+            rel_id = path[len("/api/library/releases/"): -len("/audit")].strip("/")
+            try:
+                details = api.get_library_release_details(rel_id, audit=True, force_refresh=True)
+                return self._send_json_response({"success": True, "release": details})
+            except Exception as e:
+                return self._send_error_json(str(e), status_code=400)
+
+        # 3. Run Background Task
         elif path == "/api/tasks/run":
             task_type = body.get("type")
             params = body.get("params", {})
@@ -135,7 +160,7 @@ class MusicScraperHTTPRequestHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send_error_json(str(e), status_code=400)
 
-        # 3. Cancel Task
+        # 4. Cancel Task
         elif path.startswith("/api/tasks/") and path.endswith("/cancel"):
             task_id = path[len("/api/tasks/"): -len("/cancel")].strip("/")
             success = global_task_manager.cancel_task(task_id)
@@ -145,6 +170,7 @@ class MusicScraperHTTPRequestHandler(BaseHTTPRequestHandler):
                 return self._send_error_json(f"Could not cancel task {task_id}", status_code=400)
 
         return self._send_error_json(f"Endpoint not found: {self.path}", status_code=404)
+
 
     def _serve_static_file(self, filename: str, content_type: str) -> None:
         file_path = STATIC_DIR / filename

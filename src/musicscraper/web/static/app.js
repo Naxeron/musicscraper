@@ -11,6 +11,12 @@ const AppState = {
   tasks: [],
   auditResult: null,
   qualityCandidates: [],
+  libraryReleases: [],
+  selectedReleaseId: null,
+  selectedReleaseData: null,
+  releaseFilter: 'all',
+  releaseSearchQuery: '',
+  releaseSortBy: 'artist',
 };
 
 // ==============================================================================
@@ -20,10 +26,12 @@ const AppState = {
 document.addEventListener('DOMContentLoaded', () => {
   setupNavigation();
   setupForms();
+  setupLibraryReleases();
   refreshSystemStatus();
   loadConfig();
   refreshTaskList();
   refreshTransfers();
+  loadLibraryReleases();
 
   // Periodic poll for status & transfers every 15s
   setInterval(refreshSystemStatus, 15000);
@@ -70,9 +78,15 @@ function switchTab(tabId) {
     targetPane.classList.add('active');
   }
 
+  // If opening releases tab and not yet loaded, load releases
+  if (tabId === 'releases' && AppState.libraryReleases.length === 0) {
+    loadLibraryReleases();
+  }
+
   // Update title
   const titles = {
     dashboard: 'System Dashboard',
+    releases: 'Library Releases & Missing Track Downloader',
     auditor: 'Discography Auditor',
     soulseek: 'Soulseek Peer Discovery & Transfers',
     artist: 'Multi-Source Artist Downloader',
@@ -85,6 +99,7 @@ function switchTab(tabId) {
   };
   document.getElementById('current-page-title').textContent = titles[tabId] || 'MusicScraper';
 }
+
 
 // ==============================================================================
 // System Status & Configuration
@@ -299,6 +314,12 @@ async function refreshTaskList() {
       hideGlobalTaskBanner();
     }
 
+    // Live update visual scan progress in Library Releases panel
+    const activeScanTask = AppState.tasks.find(
+      (t) => (t.type === 'library_scan' || t.type === 'library_audit_all') && (t.status === 'running' || t.status === 'pending')
+    );
+    updateLibraryScanProgress(activeScanTask);
+
     // Render Dashboard Compact List
     renderDashTaskList();
 
@@ -308,6 +329,7 @@ async function refreshTaskList() {
     console.error('Error refreshing task list:', err);
   }
 }
+
 
 function renderDashTaskList() {
   const container = document.getElementById('dash-recent-tasks');
@@ -457,8 +479,11 @@ function handleTaskResultUpdate(task) {
     renderQualityCandidates(task.result);
   } else if (task.type === 'clean_folders') {
     renderCleanerResults(task.result);
+  } else if (task.type === 'library_scan' || task.type === 'release_missing_download' || task.type === 'track_soulseek_download') {
+    loadLibraryReleases(false);
   }
 }
+
 
 // ==============================================================================
 // Feature Specific Controllers
@@ -834,8 +859,483 @@ function renderCleanerResults(result) {
 }
 
 // ==============================================================================
+// Library Releases & Missing Track Downloader Controller
+// ==============================================================================
+
+let scanCompleteTimeout = null;
+
+function updateLibraryScanProgress(task) {
+  const card = document.getElementById('lib-scan-progress-card');
+  const btnRescan = document.getElementById('btn-rescan-releases');
+  const btnAuditAll = document.getElementById('btn-audit-all-releases');
+
+  if (!card) return;
+
+  if (task) {
+    if (scanCompleteTimeout) {
+      clearTimeout(scanCompleteTimeout);
+      scanCompleteTimeout = null;
+    }
+
+    card.classList.remove('hidden');
+    card.classList.remove('scan-complete');
+
+    const titleEl = document.getElementById('lib-scan-progress-title');
+    const pctEl = document.getElementById('lib-scan-progress-pct');
+    const fillEl = document.getElementById('lib-scan-progress-fill');
+    const subEl = document.getElementById('lib-scan-progress-sub');
+
+    const pct = task.progress || 0;
+    if (titleEl) {
+      titleEl.innerHTML = `<span class="spinner-inline"></span> ${escapeHtml(task.name || 'Scanning library...')}`;
+    }
+    if (pctEl) pctEl.textContent = `${pct}%`;
+    if (fillEl) fillEl.style.width = `${pct}%`;
+    if (subEl) subEl.textContent = task.stage || 'Scanning audio files from disk...';
+
+    if (btnRescan) btnRescan.classList.add('btn-spinning');
+    if (btnAuditAll) btnAuditAll.classList.add('btn-spinning');
+  } else {
+    if (btnRescan) btnRescan.classList.remove('btn-spinning');
+    if (btnAuditAll) btnAuditAll.classList.remove('btn-spinning');
+
+    // If card was showing active progress, show completion state before hiding
+    if (!card.classList.contains('hidden') && !card.classList.contains('scan-complete')) {
+      card.classList.add('scan-complete');
+      const titleEl = document.getElementById('lib-scan-progress-title');
+      const pctEl = document.getElementById('lib-scan-progress-pct');
+      const fillEl = document.getElementById('lib-scan-progress-fill');
+      const subEl = document.getElementById('lib-scan-progress-sub');
+
+      if (titleEl) titleEl.innerHTML = '✔ Scan Complete';
+      if (pctEl) pctEl.textContent = '100%';
+      if (fillEl) fillEl.style.width = '100%';
+      if (subEl) subEl.textContent = 'Library releases up to date.';
+
+      // Reload releases smoothly without flickering
+      loadLibraryReleases(false);
+
+      scanCompleteTimeout = setTimeout(() => {
+        card.classList.add('hidden');
+      }, 3000);
+    }
+  }
+}
+
+function setupLibraryReleases() {
+  // Rescan button
+  const btnRescan = document.getElementById('btn-rescan-releases');
+  if (btnRescan) {
+    btnRescan.addEventListener('click', async () => {
+      const task = await startTask('library_scan', { force_rescan: true }, 'Rescan Music Library');
+      if (task) {
+        updateLibraryScanProgress(task);
+      }
+    });
+  }
+
+  // Audit All MB button
+  const btnAuditAll = document.getElementById('btn-audit-all-releases');
+  if (btnAuditAll) {
+    btnAuditAll.addEventListener('click', async () => {
+      const task = await startTask('library_audit_all', { force_refresh: true }, 'Audit All Releases (MusicBrainz)');
+      if (task) {
+        updateLibraryScanProgress(task);
+      }
+    });
+  }
+
+
+
+  // Filter buttons
+  document.querySelectorAll('[data-filter-release]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('[data-filter-release]').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      AppState.releaseFilter = btn.getAttribute('data-filter-release');
+      loadLibraryReleases(false);
+    });
+  });
+
+  // Search input
+  const searchInput = document.getElementById('lib-release-search');
+  const clearBtn = document.getElementById('btn-clear-release-search');
+
+  if (searchInput) {
+    let searchDebounce = null;
+    searchInput.addEventListener('input', (e) => {
+      AppState.releaseSearchQuery = e.target.value;
+      if (clearBtn) {
+        clearBtn.classList.toggle('hidden', !e.target.value);
+      }
+      if (searchDebounce) clearTimeout(searchDebounce);
+      searchDebounce = setTimeout(() => {
+        loadLibraryReleases(false);
+      }, 250);
+    });
+  }
+
+  if (clearBtn) {
+    clearBtn.addEventListener('click', () => {
+      if (searchInput) searchInput.value = '';
+      clearBtn.classList.add('hidden');
+      AppState.releaseSearchQuery = '';
+      loadLibraryReleases(false);
+    });
+  }
+
+  // Sort dropdown
+  const sortSelect = document.getElementById('lib-release-sort');
+  if (sortSelect) {
+    sortSelect.addEventListener('change', (e) => {
+      AppState.releaseSortBy = e.target.value;
+      renderReleasesList();
+    });
+  }
+
+  // Release action buttons
+  const btnDownloadMissing = document.getElementById('btn-rel-download-missing');
+  if (btnDownloadMissing) {
+    btnDownloadMissing.addEventListener('click', () => {
+      if (AppState.selectedReleaseData) {
+        downloadMissingForRelease(AppState.selectedReleaseData);
+      }
+    });
+  }
+
+  const btnAuditMB = document.getElementById('btn-rel-audit-mb');
+  if (btnAuditMB) {
+    btnAuditMB.addEventListener('click', () => {
+      auditSelectedRelease();
+    });
+  }
+
+  const btnSearchSlsk = document.getElementById('btn-rel-search-soulseek');
+  if (btnSearchSlsk) {
+    btnSearchSlsk.addEventListener('click', () => {
+      searchSoulseekForSelectedRelease();
+    });
+  }
+}
+
+async function loadLibraryReleases(refresh = false) {
+  const masterList = document.getElementById('releases-master-list');
+  if (!masterList) return;
+
+  if (refresh) {
+    masterList.innerHTML = '<div class="empty-state-card"><div class="spinner-inline"></div><div class="text-muted mt-2">Scanning library on disk...</div></div>';
+  }
+
+  try {
+    const queryParams = new URLSearchParams({
+      refresh: refresh ? 'true' : 'false',
+      search: AppState.releaseSearchQuery || '',
+      filter: AppState.releaseFilter || 'all',
+    });
+    const res = await fetch(`/api/library/releases?${queryParams.toString()}`);
+    if (!res.ok) return;
+    const data = await res.json();
+
+    AppState.libraryReleases = data.releases || [];
+
+    // Update Summary Header Cards
+    if (data.summary) {
+      const elTotal = document.getElementById('lib-rel-total-count');
+      const elComp = document.getElementById('lib-rel-complete-count');
+      const elMiss = document.getElementById('lib-rel-missing-count');
+      const elTrkTotal = document.getElementById('lib-rel-tracks-total');
+      const elMissSub = document.getElementById('lib-rel-missing-tracks-sub');
+
+      if (elTotal) elTotal.textContent = data.summary.total_releases || 0;
+      if (elComp) elComp.textContent = data.summary.complete_releases || 0;
+      if (elMiss) elMiss.textContent = data.summary.has_missing_releases || 0;
+      if (elTrkTotal) elTrkTotal.textContent = `${data.summary.total_local_tracks || 0} local tracks`;
+      if (elMissSub) elMissSub.textContent = `${data.summary.total_missing_tracks || 0} missing tracks`;
+    }
+
+    renderReleasesList();
+
+    // If an existing release was selected, ensure it remains rendered
+    if (AppState.selectedReleaseId && AppState.selectedReleaseData && AppState.selectedReleaseData.id === AppState.selectedReleaseId) {
+      renderReleaseDetails(AppState.selectedReleaseData);
+    }
+  } catch (err) {
+    console.error('Error loading library releases:', err);
+    masterList.innerHTML = `<div class="empty-state-card text-red">Failed to load releases: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function renderReleasesList() {
+  const masterList = document.getElementById('releases-master-list');
+  if (!masterList) return;
+
+  if (!AppState.libraryReleases || AppState.libraryReleases.length === 0) {
+    masterList.innerHTML = '<div class="empty-state-card"><div class="text-muted">No releases matching current filters.</div></div>';
+    return;
+  }
+
+  // Sort releases
+  const sorted = [...AppState.libraryReleases].sort((a, b) => {
+    const sortBy = AppState.releaseSortBy || 'artist';
+    if (sortBy === 'title') {
+      return (a.title || '').localeCompare(b.title || '');
+    } else if (sortBy === 'year') {
+      return (b.year || '').localeCompare(a.year || '');
+    } else if (sortBy === 'missing') {
+      return (b.missing_count || 0) - (a.missing_count || 0);
+    } else if (sortBy === 'tracks') {
+      return (b.found_count || 0) - (a.found_count || 0);
+    }
+    // Default: artist
+    const artCmp = (a.artist || '').localeCompare(b.artist || '');
+    if (artCmp !== 0) return artCmp;
+    return (a.title || '').localeCompare(b.title || '');
+  });
+
+  masterList.innerHTML = sorted.map((r) => {
+    const isComplete = r.status === 'complete' || (r.missing_count === 0 && r.found_count > 0);
+    const badgeClass = isComplete ? 'badge-found' : 'badge-missing';
+    const missingText = r.missing_count > 0 ? `${r.missing_count} missing` : (isComplete ? 'Complete' : `${r.found_count} tracks`);
+    const isSelected = AppState.selectedReleaseId === r.id;
+
+    return `
+      <div class="release-list-item ${isSelected ? 'active' : ''}" onclick="selectLibraryRelease('${r.id}')">
+        <div class="release-item-art">💿</div>
+        <div class="release-item-details">
+          <div class="release-item-title">${escapeHtml(r.title)}</div>
+          <div class="release-item-artist">${escapeHtml(r.artist)} ${r.year ? `(${r.year})` : ''}</div>
+          <div class="release-item-tags">
+            <span class="badge ${badgeClass}">${missingText}</span>
+            <span class="badge font-mono">${r.found_count}${r.total_tracks_expected > r.found_count ? ` / ${r.total_tracks_expected}` : ''} trks</span>
+            ${(r.formats || []).map((f) => `<span class="badge">${escapeHtml(f)}</span>`).join('')}
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+async function selectLibraryRelease(releaseId, audit = true) {
+  AppState.selectedReleaseId = releaseId;
+  renderReleasesList();
+
+  const placeholder = document.getElementById('release-empty-placeholder');
+  const detailWrapper = document.getElementById('release-detail-wrapper');
+
+  if (placeholder) placeholder.classList.add('hidden');
+  if (detailWrapper) detailWrapper.classList.remove('hidden');
+
+  // If we already have full audited data for this release in memory, render that immediately
+  if (AppState.selectedReleaseData && AppState.selectedReleaseData.id === releaseId && AppState.selectedReleaseData.tracks && AppState.selectedReleaseData.tracks.length > 0) {
+    renderReleaseDetails(AppState.selectedReleaseData);
+  } else {
+    // Otherwise find in master list for quick immediate display
+    const localRel = AppState.libraryReleases.find((r) => r.id === releaseId);
+    if (localRel) {
+      renderReleaseDetails(localRel);
+    }
+  }
+
+  // Fetch full audited details from server if requested
+  try {
+    const res = await fetch(`/api/library/releases/${releaseId}?audit=${audit ? 'true' : 'false'}`);
+    if (!res.ok) return;
+    const releaseData = await res.json();
+    AppState.selectedReleaseData = releaseData;
+    renderReleaseDetails(releaseData);
+
+    // Sync master list release object with audited data
+    const idx = AppState.libraryReleases.findIndex((r) => r.id === releaseId);
+    if (idx !== -1) {
+      AppState.libraryReleases[idx] = { ...AppState.libraryReleases[idx], ...releaseData };
+      renderReleasesList();
+    }
+  } catch (err) {
+    console.error('Error fetching release details:', err);
+  }
+}
+
+
+function renderReleaseDetails(rel) {
+  AppState.selectedReleaseData = rel;
+
+  const elTitle = document.getElementById('rel-det-title');
+  const elArtist = document.getElementById('rel-det-artist');
+  const elYear = document.getElementById('rel-det-year');
+  const elPath = document.getElementById('rel-det-path');
+  const elMbid = document.getElementById('rel-det-mbid');
+
+  if (elTitle) elTitle.textContent = rel.title || 'Unknown Title';
+  if (elArtist) elArtist.textContent = rel.artist || 'Unknown Artist';
+  if (elYear) elYear.textContent = rel.year ? `Year: ${rel.year}` : 'Year: -';
+  if (elPath) elPath.textContent = `Folder: ${rel.folder_path || '-'}`;
+
+  if (elMbid) {
+    if (rel.mb_release_id) {
+      elMbid.innerHTML = `<a href="https://musicbrainz.org/release/${rel.mb_release_id}" target="_blank" class="text-cyan">${rel.mb_release_id.slice(0, 8)}... ↗</a>`;
+    } else {
+      elMbid.textContent = 'Unlinked (Local match)';
+    }
+  }
+
+  const isComplete = rel.status === 'complete' || (rel.missing_count === 0 && rel.found_count > 0);
+  const statusBadge = document.getElementById('rel-det-badge-status');
+  if (statusBadge) {
+    statusBadge.className = `badge ${isComplete ? 'badge-found' : 'badge-missing'}`;
+    statusBadge.textContent = isComplete ? '100% Complete' : `${rel.missing_count} Missing Tracks`;
+  }
+
+  const total = rel.total_tracks_expected || (rel.tracks ? rel.tracks.length : rel.found_count);
+  const found = rel.found_count || (rel.tracks ? rel.tracks.filter((t) => t.status === 'found').length : 0);
+  const pct = rel.completion_pct !== undefined ? rel.completion_pct : (total > 0 ? ((found / total) * 100).toFixed(0) : 100);
+
+  const elTrackCounts = document.getElementById('rel-det-track-counts');
+  const elMissHigh = document.getElementById('rel-det-missing-highlight');
+  const elProgFill = document.getElementById('rel-det-progress-fill');
+
+  if (elTrackCounts) elTrackCounts.textContent = `${found} / ${total} tracks (${pct}%)`;
+  if (elMissHigh) {
+    elMissHigh.textContent = rel.missing_count > 0 ? `${rel.missing_count} missing` : 'All tracks found';
+    elMissHigh.className = rel.missing_count > 0 ? 'text-red' : 'text-green';
+  }
+  if (elProgFill) elProgFill.style.width = `${pct}%`;
+
+  // Download All Missing Tracks button visibility/state
+  const btnDownloadAll = document.getElementById('btn-rel-download-missing');
+  const missingTracks = (rel.tracks || []).filter((t) => t.status === 'missing');
+  if (btnDownloadAll) {
+    btnDownloadAll.disabled = missingTracks.length === 0;
+    btnDownloadAll.textContent = missingTracks.length > 0 ? `⚡ Download All Missing (${missingTracks.length})` : '✔ All Tracks Downloaded';
+  }
+
+  // Format pills
+  const formatList = document.getElementById('rel-det-formats-list');
+  if (formatList) {
+    formatList.innerHTML = (rel.formats || []).map((f) => `<span class="badge font-mono">${escapeHtml(f)}</span>`).join('');
+  }
+
+  // Tracks Table
+  const tbody = document.getElementById('tbody-release-tracks');
+  if (!tbody) return;
+
+  const tracks = rel.tracks || [];
+
+  if (tracks.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">No track data available. Click "Re-Audit with MusicBrainz" to fetch official tracklist.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = tracks.map((t, idx) => {
+    const isFound = t.status === 'found';
+    const trClass = isFound ? '' : 'track-row-missing';
+    const titleClass = isFound ? 'track-title-found' : 'track-title-missing';
+    const statusBadgeHtml = isFound
+      ? `<span class="badge badge-found">✔ Found</span>`
+      : `<span class="badge badge-missing">✖ Missing</span>`;
+
+    const formatInfo = isFound
+      ? `${escapeHtml(t.format || 'AUDIO')}${t.bitrate ? ` • ${t.bitrate} kbps` : ''}`
+      : '<span class="text-muted">-</span>';
+
+    const detailsInfo = isFound
+      ? `<span class="text-truncate font-mono font-xs" style="max-width: 220px; display: inline-block;">${escapeHtml(t.filename || '-')}</span>`
+      : '<span class="text-muted font-xs">Not in local library</span>';
+
+    const actionButton = !isFound
+      ? `<button class="btn btn-xs btn-primary" onclick="downloadSingleMissingTrack('${escapeHtml(rel.artist)}', '${escapeHtml(rel.title)}', '${escapeHtml(t.title)}')">⚡ Download</button>`
+      : `<button class="btn btn-xs btn-outline" onclick="searchSoulseekForTrack('${escapeHtml(rel.artist)}', '${escapeHtml(t.title)}')">🔍 Search</button>`;
+
+    return `
+      <tr class="${trClass}">
+        <td><span class="text-muted font-mono">${t.track_number || (idx + 1)}</span></td>
+        <td><strong class="${titleClass}">${escapeHtml(t.title)}</strong></td>
+        <td>${statusBadgeHtml}</td>
+        <td>${formatInfo}</td>
+        <td>${detailsInfo}</td>
+        <td style="text-align: right;">${actionButton}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
+async function downloadMissingForRelease(rel) {
+  if (!rel) return;
+  const missingTracks = (rel.tracks || []).filter((t) => t.status === 'missing');
+  if (missingTracks.length === 0) {
+    alert('All tracks for this release are already present in the library!');
+    return;
+  }
+
+  switchTab('tasks');
+  await startTask('release_missing_download', {
+    artist: rel.artist,
+    release_title: rel.title,
+    missing_tracks: missingTracks,
+    format: 'flac',
+  }, `Download Missing: ${rel.artist} - ${rel.title}`);
+}
+
+async function downloadSingleMissingTrack(artist, releaseTitle, trackTitle) {
+  switchTab('tasks');
+  await startTask('track_soulseek_download', {
+    artist,
+    release_title: releaseTitle,
+    track_title: trackTitle,
+    format: 'flac',
+  }, `Download Track: ${artist} - ${trackTitle}`);
+}
+
+function searchSoulseekForTrack(artist, trackTitle) {
+  switchTab('soulseek');
+  const queryEl = document.getElementById('slsk-query');
+  if (queryEl) queryEl.value = `${artist} ${trackTitle}`;
+}
+
+function searchSoulseekForSelectedRelease() {
+  if (!AppState.selectedReleaseData) return;
+  const rel = AppState.selectedReleaseData;
+  switchTab('soulseek');
+  const queryEl = document.getElementById('slsk-query');
+  if (queryEl) queryEl.value = `${rel.artist} ${rel.title}`;
+}
+
+async function auditSelectedRelease() {
+  if (!AppState.selectedReleaseId) return;
+  const relId = AppState.selectedReleaseId;
+  const btn = document.getElementById('btn-rel-audit-mb');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Auditing...';
+  }
+
+  try {
+    const res = await fetch(`/api/library/releases/${relId}/audit`, { method: 'POST' });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.release) {
+        renderReleaseDetails(data.release);
+        // Refresh master list item
+        const idx = AppState.libraryReleases.findIndex((r) => r.id === relId);
+        if (idx !== -1) {
+          AppState.libraryReleases[idx] = data.release;
+          renderReleasesList();
+        }
+      }
+    }
+  } catch (err) {
+    alert(`Audit error: ${err.message}`);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '🔍 Re-Audit with MusicBrainz';
+    }
+  }
+}
+
+// ==============================================================================
 // Utilities
 // ==============================================================================
+
 
 function escapeHtml(str) {
   if (!str) return '';

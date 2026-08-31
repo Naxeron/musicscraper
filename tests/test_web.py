@@ -163,6 +163,39 @@ def test_web_api_task_lifecycle(web_server):
     assert detail_data["name"] == "Test Folder Clean"
 
 
+def test_web_api_library_releases(web_server):
+    """Tests GET /api/library/releases and release missing download task dispatch."""
+    req = urllib.request.urlopen(f"{web_server}/api/library/releases")
+    assert req.status == 200
+    data = json.loads(req.read().decode("utf-8"))
+    assert "summary" in data
+    assert "releases" in data
+    assert "count" in data
+
+    # Test dispatching a release missing download task
+    payload = json.dumps({
+        "type": "release_missing_download",
+        "name": "Download Missing: Test Album",
+        "params": {
+            "artist": "Test Artist",
+            "release_title": "Test Album",
+            "missing_tracks": [{"title": "Track 1"}],
+            "dry_run": True
+        }
+    }).encode("utf-8")
+
+    req_task = urllib.request.Request(
+        f"{web_server}/api/tasks/run",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    resp = urllib.request.urlopen(req_task)
+    assert resp.status == 202
+    res_data = json.loads(resp.read().decode("utf-8"))
+    assert res_data.get("success") is True
+
+
 def test_cli_web_subcommand_parser():
     """Verifies that the CLI parser correctly parses web and gui subcommands."""
     parser = build_parser()
@@ -176,3 +209,4 @@ def test_cli_web_subcommand_parser():
     assert args_gui.command == "gui"
     assert args_gui.host == "127.0.0.1"
     assert args_gui.port == 8080
+
