@@ -51,12 +51,19 @@ Guidelines and invariants for audio file discovery, metadata tag parsing, persis
 - **Explicit Timeouts & IPv4/HTTP Fast Fallbacks**: Use `requests` with explicit timeouts when querying MusicBrainz endpoints to avoid indefinite `urllib` blocking.
 
 ## 7. Soulseek & slskd P2P Discography Discovery Invariants
+- **Non-Latin Unicode Script Preservation**:
+  - `clean_search_phrase()` must **never** run `unidecode()` on non-Latin scripts (Japanese Kanji/Kana, Cyrillic, Chinese, Korean, Greek, etc.). P2P networks (Soulseek/slskd) preserve native Unicode filenames and tags.
+  - Retain Unicode word characters (`re.UNICODE`) and strip only noise punctuation.
+- **Dual-Query Generation (User Query + Canonical Name)**:
+  - Generate release queries for both the user's input query (`<UserArtist> <Release>`) and the canonical catalog name (`<CanonicalArtist> <Release>`), plus distinctive release titles.
+  - Release queries and primary artist names must be prioritized at the head of the search queue. Do not allow obscure aliases to delay release searches.
 - **Curated High-Yield Query Generation**:
-  - Never flood slskd with dozens of granular track searches. Limit artist search generation to 10–15 curated queries (canonical artist name, aliases/alter-egos, missing primary releases, and key compilations).
-  - Dispatch searches in controlled chunks (max 4 concurrent) to prevent slskd internal queue starvation (`state: Queued`).
+  - Never flood slskd with dozens of granular track searches. Limit artist search generation to curated queries (canonical artist name, user input query, missing primary releases, and key compilations).
+  - Dispatch searches in controlled chunks (e.g. up to 8 concurrent) to balance speed and prevent slskd internal queue starvation (`state: Queued`).
 - **slskd Search Polling & Completion Invariants**:
   - In slskd REST API (v0), `GET /api/v0/searches/{id}?includeResponses=true` returns an empty `responses: []` array while `isComplete` is `False` (`state: InProgress`), regardless of `responseCount` or `fileCount`.
   - Never terminate search polling loops prematurely based on intermediate response counts or timers before `isComplete` is `True` (or `"Completed" in state`).
+  - Newly dispatched (cold) searches must be polled across an adaptive observation window (minimum 5–6s) before evaluating completion, ensuring peer responses on the distributed P2P network are not prematurely truncated.
   - Default search timeouts must be set to $\ge 25\text{s}$ (e.g. 25–30s) to allow Soulseek distributed network responses to fully arrive and complete.
   - In-progress searches identified during `use_existing` checks must be attached by their existing ID and polled to completion rather than queried immediately for responses or re-dispatched as duplicates.
 - **Search Result State & Stale Search Purging**:
@@ -97,6 +104,10 @@ Guidelines and invariants for audio file discovery, metadata tag parsing, persis
   - Never evaluate releases or tracks via nested $O(N \times M)$ linear scans across thousands of candidate peer directories and files.
   - Construct an inverted dictionary index (`word_to_dirs` mapping tokens $\ge 3$ characters to candidate directory objects, and `word_to_files` mapping tokens to candidate file objects) immediately following discovery.
   - Release and track verification must query the inverted index to prune candidate search spaces from thousands down to $\le 20$ candidates in $<1\text{ms}$.
+- **Two-Phase Release Evaluation & Batch Directory Browsing**:
+  - **Phase 1**: Perform instant in-memory evaluation on candidate directories populated with search result files.
+  - **Phase 2**: If no candidate directory reaches `min_match_ratio`, concurrently batch-browse the top matching candidate directories via `browse_directories_batch()` and re-evaluate.
+  - Never invoke synchronous, sequential `browse_directory` calls inside loops across dozens of remote peers.
 - **Pre-Parsed Track & Directory Data Structures**:
   - Pre-parse audio format scores, filename normalization, tokens, and structural title parts (base title, version modifiers, remaster descriptors) **once** during index creation (`CandidateFile` / `CandidateDir`).
   - Pre-parse expected catalog tracklists once per release (`pre_parse_expected_tracks()`) rather than re-normalizing per comparison.
@@ -111,6 +122,7 @@ Guidelines and invariants for audio file discovery, metadata tag parsing, persis
 ## 10. Multi-Lingual & Numeric Title Normalization
 - **Kanji Numeral Parsing**: Catalog track titles with Japanese Kanji numbers (e.g. `九十四`, `一`, `十`) must be converted to Arabic digits (`94`) during normalization to ensure alignment with standard numeric file tags.
 - **Purely Numeric Track Title Safety**: Track-number stripping routines (`strip_track_number_and_artist`) must never strip purely numeric titles (e.g., `"94"`, `"1999"`, `"007"`) down to empty strings. If stripping leaves an empty string, fall back to the original non-extension filename.
+
 
 
 

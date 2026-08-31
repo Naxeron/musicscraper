@@ -264,7 +264,8 @@ class SlskdClient:
             pending_queries = list(clean_queries)
 
         # 2. Dispatch remaining searches in parallel chunks
-        chunk_size = max(1, min(max_concurrent, 4))
+        chunk_size = max(1, min(max_concurrent, 8))
+        min_settle_time = min(6.0, timeout / 2)
         for i in range(0, len(pending_queries), chunk_size):
             chunk = pending_queries[i:i + chunk_size]
             chunk_query_ids: Dict[str, str] = {}
@@ -292,14 +293,17 @@ class SlskdClient:
 
             while active_chunk and (time.time() - start_time < timeout):
                 time.sleep(poll_interval)
+                elapsed = time.time() - start_time
                 for q_str, sid in list(active_chunk.items()):
                     try:
                         poll_resp = self._request("GET", f"/api/v0/searches/{sid}?includeResponses=true")
                         if poll_resp.status_code == 200:
                             s_data = poll_resp.json()
                             is_complete = s_data.get("isComplete", False) or "Completed" in s_data.get("state", "")
+                            has_files = s_data.get("fileCount", 0) > 0 or len(s_data.get("responses", [])) > 0
 
-                            if is_complete:
+                            # Allow early completion if complete with files, or if complete and min settle time passed
+                            if is_complete and (has_files or elapsed >= min_settle_time):
                                 results[q_str] = s_data
                                 del active_chunk[q_str]
                                 completed_queries += 1

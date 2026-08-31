@@ -208,3 +208,95 @@ def test_slskd_batch_search_uses_in_progress_existing_search(monkeypatch):
     assert len(results["existing query"]["responses"]) == 1
 
 
+def test_query_generation_includes_user_query_and_canonical():
+    from musicscraper.services.soulseek import SlskdArtistScraper
+    from musicscraper.clients.musicbrainz import ArtistCatalog
+
+    raw_data = {
+        "artist": {"id": "art-jp", "name": "すてらべえ"},
+        "releases_artist": [
+            {
+                "id": "rel-1",
+                "title": "Breakcore Forever",
+                "medium-list": [{"track-list": [{"id": "t1", "title": "Track 1"}]}]
+            }
+        ],
+        "releases_track_artist": [],
+        "recordings": []
+    }
+    cat = ArtistCatalog(raw_data)
+    scraper = SlskdArtistScraper(artist_query="Stellabee", dry_run=True)
+    scraper.catalog = cat
+
+    queries = scraper._generate_all_search_queries()
+    # Must include user query, canonical name, and release queries
+    assert "Stellabee" in queries
+    assert "すてらべえ" in queries
+    assert "Stellabee Breakcore Forever" in queries
+    assert "すてらべえ Breakcore Forever" in queries
+    # Must NOT produce mangled unidecode "suterabee Breakcore Forever"
+    assert "suterabee Breakcore Forever" not in queries
+
+
+def test_candidate_dir_remote_expansion():
+    from musicscraper.services.soulseek import SlskdArtistScraper, CandidateDir, PeerCandidateIndex
+    from musicscraper.clients.musicbrainz import ArtistCatalog
+
+    raw_data = {
+        "artist": {"id": "art-1", "name": "Artist"},
+        "releases_artist": [
+            {
+                "id": "rel-1",
+                "title": "Awesome Album",
+                "medium-list": [
+                    {
+                        "track-list": [
+                            {"id": "t1", "title": "First Song"},
+                            {"id": "t2", "title": "Second Song"},
+                        ]
+                    }
+                ]
+            }
+        ],
+        "releases_track_artist": [],
+        "recordings": []
+    }
+    cat = ArtistCatalog(raw_data)
+    scraper = SlskdArtistScraper(artist_query="Artist", dry_run=True)
+    scraper.catalog = cat
+    scraper.all_artist_aliases = {"artist"}
+
+    # Simulate a peer directory where search results only returned track 1
+    mock_client = MagicMock()
+    mock_client.browse_directories_batch.return_value = {
+        ("peer1", "Music\\Artist - Awesome Album"): [
+            {"filename": "Music\\Artist - Awesome Album\\01 First Song.flac", "size": 1000},
+            {"filename": "Music\\Artist - Awesome Album\\02 Second Song.flac", "size": 2000},
+        ]
+    }
+    scraper.client = mock_client
+
+    scraper.peer_directories = {
+        ("peer1", "Music\\Artist - Awesome Album"): {
+            "user": "peer1",
+            "directory": "Music\\Artist - Awesome Album",
+            "matched_search_files": [
+                {"filename": "Music\\Artist - Awesome Album\\01 First Song.flac", "size": 1000}
+            ],
+            "full_directory_files": None,
+            "speed": 1000,
+            "queue": 0,
+            "has_slot": True,
+        }
+    }
+    scraper.candidate_index = PeerCandidateIndex(scraper.peer_directories)
+
+    scraper._reconcile_primary_releases()
+
+    # browse_directories_batch should have been called to expand the album from 1 track to 2 tracks
+    mock_client.browse_directories_batch.assert_called_once()
+    assert len(scraper.verified_releases) == 1
+    assert scraper.verified_releases[0]["matched_count"] == 2
+    assert scraper.verified_releases[0]["total_count"] == 2
+
+

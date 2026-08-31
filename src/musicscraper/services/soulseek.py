@@ -24,6 +24,7 @@ from musicscraper.core.constants import (
     AUDIO_EXTENSIONS,
     SUPPORTING_EXTENSIONS,
     DIR_STOP_WORDS,
+    GENERIC_OR_COMMON_WORDS,
     POLISH_DIACRITICS_MAP,
 )
 from musicscraper.core.text import (
@@ -481,19 +482,53 @@ class SlskdArtistScraper:
         console.print(f"[green]✔ Library Status:[/green] [bold]{len(found_items)}[/bold] artist tracks / [bold]{len(self.local_found_releases)}[/bold] releases already in library.")
 
     def _generate_all_search_queries(self) -> List[str]:
-        queries: List[str] = [self.catalog.name]
-        for alias in self.catalog.aliases:
-            if alias.lower() != self.catalog.name.lower() and len(alias) >= 3:
-                queries.append(alias)
+        queries: List[str] = []
 
-        for rel in self.catalog.primary_releases:
-            rel_title = rel.get("title", "")
-            norm_rel = normalize_text(rel_title)
-            if not rel_title or norm_rel in self.local_found_releases:
-                continue
-            q1 = clean_search_phrase(f"{self.catalog.name} {rel_title}")
-            if q1 and q1 not in queries:
-                queries.append(q1)
+        # 1. Primary Artist Names (User query + Canonical MB Name)
+        if self.artist_query:
+            q_user = clean_search_phrase(self.artist_query)
+            if q_user and q_user not in queries:
+                queries.append(q_user)
+
+        if self.catalog and self.catalog.name:
+            q_name = clean_search_phrase(self.catalog.name)
+            if q_name and q_name not in queries:
+                queries.append(q_name)
+
+        # 2. Targeted Primary Release Queries (User Query + Release, Canonical Name + Release, Release Title)
+        if self.catalog:
+            for rel in self.catalog.primary_releases:
+                rel_title = rel.get("title", "")
+                norm_rel = normalize_text(rel_title)
+                if not rel_title or norm_rel in self.local_found_releases:
+                    continue
+
+                clean_rel = clean_search_phrase(rel_title)
+
+                # Query with user artist query (e.g. "Stellabee Breakcore Forever")
+                if self.artist_query:
+                    q_user_rel = clean_search_phrase(f"{self.artist_query} {rel_title}")
+                    if q_user_rel and q_user_rel not in queries:
+                        queries.append(q_user_rel)
+
+                # Query with canonical name (e.g. "すてらべえ Breakcore Forever")
+                if self.catalog.name and self.catalog.name.lower() != (self.artist_query or "").lower():
+                    q_canon_rel = clean_search_phrase(f"{self.catalog.name} {rel_title}")
+                    if q_canon_rel and q_canon_rel not in queries:
+                        queries.append(q_canon_rel)
+
+                # If the release title is distinctive (len >= 4 and not generic noise), add release title query
+                if clean_rel and len(clean_rel) >= 4 and clean_rel.lower() not in DIR_STOP_WORDS and clean_rel.lower() not in GENERIC_OR_COMMON_WORDS:
+                    if clean_rel not in queries:
+                        queries.append(clean_rel)
+
+        # 3. Artist Aliases (Ordered by relevance, skipping overly short/symbolic noise)
+        if self.catalog:
+            for alias in self.catalog.aliases:
+                alias_clean = clean_search_phrase(alias)
+                if alias_clean and len(alias_clean) >= 3 and alias_clean.lower() != (self.artist_query or "").lower() and alias_clean.lower() != self.catalog.name.lower():
+                    if alias_clean not in queries:
+                        queries.append(alias_clean)
 
         return list(dict.fromkeys(q for q in queries if q and len(q) >= 3))
 
@@ -652,17 +687,37 @@ class SlskdArtistScraper:
             cand_dirs = self.candidate_index.get_candidate_dirs_for_release(rel_title, parsed_expected, len(expected_tracks))
             candidate_matches: List[Dict[str, Any]] = []
 
+            # Phase 1: Evaluate candidate directories with already indexed search files
+            dirs_needing_browse: List[CandidateDir] = []
             for cd in cand_dirs:
-                if is_dir_name_match_fast(clean_rel, rel_sig_words, cd) and cd.audio_files:
-                    eval_res = self._evaluate_indexed_directory(cd, parsed_expected, expected_tracks, rel_title)
-                    if eval_res and eval_res["match_ratio"] >= self.min_match_ratio:
-                        matched_new_tracks = [
-                            m for m in eval_res["matched_tracks"]
-                            if normalize_text(m["expected"]) not in self.local_found_map
-                        ]
-                        if not matched_new_tracks and len(eval_res["matched_tracks"]) > 0:
-                            continue
-                        candidate_matches.append(eval_res)
+                if is_dir_name_match_fast(clean_rel, rel_sig_words, cd):
+                    if cd.audio_files:
+                        eval_res = self._evaluate_indexed_directory(cd, parsed_expected, expected_tracks, rel_title)
+                        if eval_res and eval_res["match_ratio"] >= self.min_match_ratio:
+                            matched_new_tracks = [
+                                m for m in eval_res["matched_tracks"]
+                                if normalize_text(m["expected"]) not in self.local_found_map
+                            ]
+                            if matched_new_tracks or len(eval_res["matched_tracks"]) == 0:
+                                candidate_matches.append(eval_res)
+                    if (not cd.audio_files or len(cd.audio_files) < len(expected_tracks)) and cd.dir_info.get("full_directory_files") is None:
+                        dirs_needing_browse.append(cd)
+
+            # Phase 2: If no candidate matched, batch browse the top candidate directories
+            if not candidate_matches and dirs_needing_browse:
+                top_to_browse = [(cd.user, cd.dir_name) for cd in dirs_needing_browse[:6]]
+                try:
+                    browse_res = self.client.browse_directories_batch(top_to_browse, max_workers=6)
+                    for (u, d), remote_files in browse_res.items():
+                        if remote_files and (u, d) in self.peer_directories:
+                            self.peer_directories[(u, d)]["full_directory_files"] = remote_files
+                            upd_cd = self.candidate_index.update_directory(u, d, self.peer_directories[(u, d)])
+                            if upd_cd.audio_files:
+                                eval_res = self._evaluate_indexed_directory(upd_cd, parsed_expected, expected_tracks, rel_title)
+                                if eval_res and eval_res["match_ratio"] >= self.min_match_ratio:
+                                    candidate_matches.append(eval_res)
+                except Exception:
+                    pass
 
             if candidate_matches:
                 best = max(candidate_matches, key=lambda x: x["total_score"])
@@ -679,6 +734,8 @@ class SlskdArtistScraper:
                     "files": best["all_dir_files"]
                 })
                 self.queued_directories.append(best)
+                for m in best["matched_tracks"]:
+                    self.covered_track_titles.add(normalize_text(m["expected"]))
                 console.print(f"[green]✔ Matched Album:[/green] [bold]{rel_title}[/bold] ({best['format_label']}) from [cyan]{best['user']}[/cyan] ({len(best['matched_tracks'])}/{len(expected_tracks)} tracks)")
             else:
                 self.unresolved_releases.append(rel)
@@ -689,15 +746,106 @@ class SlskdArtistScraper:
             return
         console.print(f"\n[bold cyan]Verifying Compilation / VA Releases ({len(comp_releases)} releases)...[/bold cyan]")
 
+        if self.candidate_index is None:
+            self.candidate_index = PeerCandidateIndex(self.peer_directories)
+
+        for rel in comp_releases:
+            rel_title = rel.get("title", "")
+            norm_rel = normalize_text(rel_title)
+            if norm_rel in self.local_found_releases or norm_rel in self.reconciled_release_keys:
+                continue
+
+            comp_tracks = [
+                t for t in self.catalog.tracks
+                if (norm_rel in [normalize_text(r) for r in t.get("all_releases", set())]
+                or t.get("norm_release") == norm_rel)
+                and (any(alias.lower() in t.get("artist_credit", "").lower() for alias in self.all_artist_aliases)
+                     or t.get("artist_credit", "").lower() == self.catalog.name.lower()
+                     or not t.get("artist_credit"))
+            ]
+            if not comp_tracks:
+                continue
+
+            for t in comp_tracks:
+                t_title = t.get("title", "")
+                norm_t = normalize_text(t_title)
+                if norm_t in self.local_found_map or norm_t in self.covered_track_titles:
+                    continue
+
+                p_exp = pre_parse_single_track(t_title)
+                cand_files = self.candidate_index.get_candidate_files_for_track(p_exp)
+                matched_cands: List[CandidateFile] = []
+
+                for cf in cand_files:
+                    if is_track_title_match_fast(
+                        p_exp["p_struct"], p_exp["words"], p_exp["clean_words"], p_exp["sig_words"], p_exp["concat"],
+                        cf, self.all_artist_aliases, rel_title, cf.dir_name
+                    ):
+                        matched_cands.append(cf)
+
+                if matched_cands:
+                    best_cf = max(matched_cands, key=lambda c: (
+                        c.fmt_score + (25 if self.preferred_format == "flac" and "FLAC" in c.fmt_label else 0)
+                        - min(c.dir_info.get("queue", 0) / 2, 40)
+                    ))
+                    self.covered_track_titles.add(norm_t)
+                    self.verified_compilation_tracks.append({
+                        "release": rel_title,
+                        "track": t_title,
+                        "user": best_cf.user,
+                        "file": best_cf.raw_file,
+                        "format_label": best_cf.fmt_label,
+                    })
+                    console.print(f"[green]✔ Matched VA Track:[/green] [bold]{t_title}[/bold] ({best_cf.fmt_label}) from [cyan]{best_cf.user}[/cyan] (on '{rel_title}')")
+                else:
+                    self.unresolved_compilation_tracks.append({"release": rel_title, "track": t_title})
+
     def _reconcile_standalone_tracks(self) -> None:
         standalone = [t for t in self.catalog.tracks if t.get("release_type") == "Standalone / Single"]
         if not standalone:
             return
         console.print(f"\n[bold cyan]Verifying Standalone Tracks ({len(standalone)} tracks)...[/bold cyan]")
 
+        if self.candidate_index is None:
+            self.candidate_index = PeerCandidateIndex(self.peer_directories)
+
+        for t in standalone:
+            t_title = t.get("title", "")
+            norm_t = normalize_text(t_title)
+            if norm_t in self.local_found_map or norm_t in self.covered_track_titles:
+                continue
+
+            p_exp = pre_parse_single_track(t_title)
+            cand_files = self.candidate_index.get_candidate_files_for_track(p_exp)
+            matched_cands: List[CandidateFile] = []
+
+            for cf in cand_files:
+                if is_track_title_match_fast(
+                    p_exp["p_struct"], p_exp["words"], p_exp["clean_words"], p_exp["sig_words"], p_exp["concat"],
+                    cf, self.all_artist_aliases, "", cf.dir_name
+                ):
+                    matched_cands.append(cf)
+
+            if matched_cands:
+                best_cf = max(matched_cands, key=lambda c: (
+                    c.fmt_score + (25 if self.preferred_format == "flac" and "FLAC" in c.fmt_label else 0)
+                    - min(c.dir_info.get("queue", 0) / 2, 40)
+                ))
+                self.covered_track_titles.add(norm_t)
+                self.verified_standalone_tracks.append({
+                    "track": t_title,
+                    "user": best_cf.user,
+                    "file": best_cf.raw_file,
+                    "format_label": best_cf.fmt_label,
+                })
+                console.print(f"[green]✔ Matched Single:[/green] [bold]{t_title}[/bold] ({best_cf.fmt_label}) from [cyan]{best_cf.user}[/cyan]")
+            else:
+                self.unresolved_standalone_tracks.append(t)
+
     def _queue_downloads(self) -> None:
-        if not self.queued_directories:
-            console.print("[yellow]No releases to enqueue.[/yellow]")
+        total_items = len(self.queued_directories) + len(self.verified_compilation_tracks) + len(self.verified_standalone_tracks)
+        if total_items == 0:
+            console.print("[yellow]No releases or tracks to enqueue.[/yellow]")
             return
 
         try:
@@ -706,30 +854,55 @@ class SlskdArtistScraper:
         except Exception:
             queued_fps = {"base_filenames": set(), "clean_titles": set(), "full_paths": set()}
 
-        console.print(f"\n[cyan]Enqueuing {len(self.queued_directories)} verified releases into slskd...[/cyan]")
-        for d in self.queued_directories:
+        if self.queued_directories:
+            console.print(f"\n[cyan]Enqueuing {len(self.queued_directories)} verified releases into slskd...[/cyan]")
+            for d in self.queued_directories:
+                try:
+                    files_to_download = []
+                    for f in d["all_dir_files"]:
+                        fn = f.get("filename", "")
+                        if not fn:
+                            continue
+                        clean_p = fn.replace("/", "\\").split("\\")[-1].lower()
+                        if fn in self.already_downloading_files or clean_p in queued_fps["base_filenames"]:
+                            continue
+
+                        files_to_download.append(f)
+                        self.already_downloading_files.add(fn)
+                        queued_fps["base_filenames"].add(clean_p)
+
+                    if not files_to_download:
+                        console.print(f"[dim]↷ Skipping already queued folder:[/dim] {d['directory']} from {d['user']}")
+                        continue
+
+                    self.client.enqueue_download(d["user"], files_to_download)
+                    console.print(f"[green]✔ Enqueued folder:[/green] {d['directory']} from {d['user']} ({len(files_to_download)} files)")
+                except Exception as e:
+                    console.print(f"[red]Failed to enqueue {d['directory']}: {e}[/red]")
+
+        # Enqueue individual standalone / compilation tracks
+        single_tracks_by_user: Dict[str, List[Dict[str, Any]]] = {}
+        for item in self.verified_compilation_tracks + self.verified_standalone_tracks:
+            u = item["user"]
+            f = item["file"]
+            fn = f.get("filename", "")
+            if not fn:
+                continue
+            clean_p = fn.replace("/", "\\").split("\\")[-1].lower()
+            if fn in self.already_downloading_files or clean_p in queued_fps["base_filenames"]:
+                continue
+            if u not in single_tracks_by_user:
+                single_tracks_by_user[u] = []
+            single_tracks_by_user[u].append(f)
+            self.already_downloading_files.add(fn)
+            queued_fps["base_filenames"].add(clean_p)
+
+        for u, files in single_tracks_by_user.items():
             try:
-                files_to_download = []
-                for f in d["all_dir_files"]:
-                    fn = f.get("filename", "")
-                    if not fn:
-                        continue
-                    clean_p = fn.replace("/", "\\").split("\\")[-1].lower()
-                    if fn in self.already_downloading_files or clean_p in queued_fps["base_filenames"]:
-                        continue
-
-                    files_to_download.append(f)
-                    self.already_downloading_files.add(fn)
-                    queued_fps["base_filenames"].add(clean_p)
-
-                if not files_to_download:
-                    console.print(f"[dim]↷ Skipping already queued folder:[/dim] {d['directory']} from {d['user']}")
-                    continue
-
-                self.client.enqueue_download(d["user"], files_to_download)
-                console.print(f"[green]✔ Enqueued folder:[/green] {d['directory']} from {d['user']} ({len(files_to_download)} files)")
+                self.client.enqueue_download(u, files)
+                console.print(f"[green]✔ Enqueued {len(files)} standalone/compilation tracks from [cyan]{u}[/cyan][/green]")
             except Exception as e:
-                console.print(f"[red]Failed to enqueue {d['directory']}: {e}[/red]")
+                console.print(f"[red]Failed to enqueue tracks from {u}: {e}[/red]")
 
     def _print_summary(self) -> None:
         table = Table(title="Soulseek Scraper Summary", box=box.ROUNDED, header_style="bold cyan")
@@ -744,4 +917,11 @@ class SlskdArtistScraper:
         for u in self.unresolved_releases:
             table.add_row(u.get("title", ""), "-", "-", "[red]✖ Unresolved[/red]")
 
+        for t in self.verified_compilation_tracks:
+            table.add_row(f"[VA] {t['track']}", t["user"], t["format_label"], "[green]✔ Enqueued[/green]" if not self.dry_run else "[yellow]Matched (Dry-run)[/yellow]")
+
+        for s in self.verified_standalone_tracks:
+            table.add_row(f"[Single] {s['track']}", s["user"], s["format_label"], "[green]✔ Enqueued[/green]" if not self.dry_run else "[yellow]Matched (Dry-run)[/yellow]")
+
         console.print(table)
+

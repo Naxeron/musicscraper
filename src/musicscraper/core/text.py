@@ -81,12 +81,12 @@ def clean_tokens(text: Optional[str]) -> str:
 
 @lru_cache(maxsize=65536)
 def clean_search_phrase(query: str) -> str:
-    """Cleans punctuation and symbols from a search query for maximum index recall."""
+    """Cleans punctuation and symbols from a search query for maximum index recall, preserving non-Latin scripts."""
     if not query:
         return ""
     q = query.translate(POLISH_DIACRITICS_MAP)
-    q = unidecode(q)
-    q = re.sub(r"[^\w\s\-\.\']", " ", q)
+    q = q.translate(ZENKAKU_TO_HANKAKU)
+    q = re.sub(r"[^\w\s\-\.\']", " ", q, flags=re.UNICODE)
     q = re.sub(r"\s+", " ", q).strip()
     return q
 

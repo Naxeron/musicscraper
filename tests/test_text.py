@@ -13,7 +13,14 @@ from musicscraper.core.text import (
     are_versions_compatible,
     FilenameUtils,
     is_sublist,
+    clean_search_phrase,
 )
+
+
+def test_clean_search_phrase_unicode():
+    assert clean_search_phrase("すてらべえ Breakcore Forever") == "すてらべえ Breakcore Forever"
+    assert clean_search_phrase("Stellabee - Breakcore Forever [2021]") == "Stellabee - Breakcore Forever 2021"
+    assert clean_search_phrase("Кино - Группа крови (1988)") == "Кино - Группа крови 1988"
 
 
 def test_normalize_text_basic():
