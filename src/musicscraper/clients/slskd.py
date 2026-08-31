@@ -391,11 +391,13 @@ class SlskdClient:
         clean_user = re.sub(r"\s*\(.*?\)$", "", username).strip()
         encoded_user = urllib.parse.quote(clean_user, safe="")
 
-        payload = [
-            {"filename": f.get("filename"), "size": f.get("size", 0)}
-            for f in files
-            if f.get("filename")
-        ]
+        seen_filenames = set()
+        payload = []
+        for f in files:
+            fn = f.get("filename")
+            if fn and fn not in seen_filenames:
+                seen_filenames.add(fn)
+                payload.append({"filename": fn, "size": f.get("size", 0)})
 
         if not payload:
             return {"status": "skipped", "count": 0}

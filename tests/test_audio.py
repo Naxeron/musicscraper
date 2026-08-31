@@ -64,3 +64,31 @@ def test_stream_quality_determination():
     label_320, score_320 = AudioQualityAnalyzer.determine_stream_quality({"filename": "track.mp3", "bitRate": 320})
     assert "320" in label_320
     assert score_320 == 80
+
+
+def test_mbid_tag_mapping(monkeypatch):
+    class DummyTags(dict):
+        def items(self):
+            return super().items()
+
+    class DummyMutagenFile:
+        def __init__(self, path):
+            self.tags = DummyTags({
+                "MUSICBRAINZ_TRACKID": ["rec-id-1234"],
+                "MUSICBRAINZ_RECORDINGID": ["rec-id-5678"],
+                "MUSICBRAINZ_RELEASETRACKID": ["trk-id-9999"],
+                "MUSICBRAINZ_ALBUMID": ["rel-id-aaaa"],
+                "MUSICBRAINZ_ARTISTID": ["art-id-bbbb"]
+            })
+            self.info = None
+
+    import mutagen
+    monkeypatch.setattr(mutagen, "File", lambda path: DummyMutagenFile(path))
+
+    meta = AudioQualityAnalyzer.analyze_file(Path("/tmp/test_track.flac"))
+    assert "rec-id-1234" in meta.mb_rec_ids
+    assert "rec-id-5678" in meta.mb_rec_ids
+    assert "trk-id-9999" in meta.mb_track_ids
+    assert "rel-id-aaaa" in meta.mb_release_ids
+    assert "art-id-bbbb" in meta.mb_artist_ids
+

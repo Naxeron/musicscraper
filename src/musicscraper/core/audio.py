@@ -128,12 +128,15 @@ class AudioQualityAnalyzer:
                     # MusicBrainz Tag IDs
                     if k_str in ("MUSICBRAINZ_ALBUMID", "MUSICBRAINZ ALBUM ID", "TXXX:MUSICBRAINZ ALBUM ID"):
                         meta.mb_release_ids.update(x.strip() for x in v_list if x.strip())
-                    elif k_str in ("MUSICBRAINZ_TRACKID", "MUSICBRAINZ TRACK ID", "TXXX:MUSICBRAINZ TRACK ID"):
-                        meta.mb_track_ids.update(x.strip() for x in v_list if x.strip())
+                    elif k_str in (
+                        "MUSICBRAINZ_TRACKID", "MUSICBRAINZ TRACK ID", "TXXX:MUSICBRAINZ TRACK ID",
+                        "MUSICBRAINZ_RECORDINGID", "MUSICBRAINZ RECORDING ID", "TXXX:MUSICBRAINZ RECORDING ID"
+                    ):
+                        meta.mb_rec_ids.update(x.strip() for x in v_list if x.strip())
                     elif k_str in ("MUSICBRAINZ_ARTISTID", "MUSICBRAINZ ARTIST ID", "TXXX:MUSICBRAINZ ARTIST ID"):
                         meta.mb_artist_ids.update(x.strip() for x in v_list if x.strip())
-                    elif k_str in ("MUSICBRAINZ_RELEASETRACKID", "TXXX:MUSICBRAINZ RELEASE TRACK ID"):
-                        meta.mb_rec_ids.update(x.strip() for x in v_list if x.strip())
+                    elif k_str in ("MUSICBRAINZ_RELEASETRACKID", "MUSICBRAINZ RELEASE TRACK ID", "TXXX:MUSICBRAINZ RELEASE TRACK ID"):
+                        meta.mb_track_ids.update(x.strip() for x in v_list if x.strip())
                     elif k_str.startswith("UFID:HTTP://MUSICBRAINZ.ORG"):
                         # Extract UFID
                         try:

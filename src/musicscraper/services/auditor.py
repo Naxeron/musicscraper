@@ -99,6 +99,13 @@ class AudioFileScanner:
 
         # Stage 1: Walk directory
         for root, dirs, files in os.walk(self.music_dir):
+            # Exclude trash, sync-version, and VCS directories in-place
+            dirs[:] = [
+                d for d in dirs
+                if not d.startswith((".Trash", ".stversions", "@eaDir"))
+                and d not in (".git", "__pycache__", ".cache")
+            ]
+
             norm_root = normalize_text(root)
             dir_matches = bool((alias_regex and alias_regex.search(norm_root)) or (rel_regex and rel_regex.search(norm_root)))
 

@@ -106,7 +106,13 @@ class CandidateDir:
         self.all_file_sig_words: Set[str] = set()
         self.has_artwork = False
 
+        seen_files: Set[str] = set()
         for rf in raw_files:
+            fn = (rf.get("filename") or rf.get("full_filename") or "").replace("/", "\\").strip().lower()
+            if fn and fn in seen_files:
+                continue
+            if fn:
+                seen_files.add(fn)
             cf = CandidateFile(user, dir_name, rf, dir_info)
             self.all_dir_files.append(cf)
             if cf.is_audio:
@@ -507,10 +513,14 @@ class SlskdArtistScraper:
                                 "queue": queue,
                                 "has_slot": has_slot,
                                 "matched_search_files": [],
-                                "full_directory_files": None
+                                "full_directory_files": None,
+                                "_seen_files": set()
                             }
-                        self.peer_directories[key]["matched_search_files"].append(f)
-                        total_files += 1
+                        fn_norm = fn.strip().lower()
+                        if fn_norm not in self.peer_directories[key]["_seen_files"]:
+                            self.peer_directories[key]["_seen_files"].add(fn_norm)
+                            self.peer_directories[key]["matched_search_files"].append(f)
+                            total_files += 1
 
         console.print(f"[green]✔ Soulseek Discovery:[/green] Found [bold]{len(self.peer_directories)}[/bold] candidate directories ([dim]{total_files} candidate files[/dim]).")
         self.candidate_index = PeerCandidateIndex(self.peer_directories)
@@ -649,11 +659,27 @@ class SlskdArtistScraper:
             console.print("[yellow]No releases to enqueue.[/yellow]")
             return
 
+        try:
+            self.already_downloading_files = self.client.get_queued_filenames()
+        except Exception:
+            pass
+
         console.print(f"\n[cyan]Enqueuing {len(self.queued_directories)} verified releases into slskd...[/cyan]")
         for d in self.queued_directories:
             try:
-                self.client.enqueue_download(d["user"], d["all_dir_files"])
-                console.print(f"[green]✔ Enqueued folder:[/green] {d['directory']} from {d['user']}")
+                files_to_download = []
+                for f in d["all_dir_files"]:
+                    fn = f.get("filename", "")
+                    if fn and fn not in self.already_downloading_files:
+                        files_to_download.append(f)
+                        self.already_downloading_files.add(fn)
+
+                if not files_to_download:
+                    console.print(f"[dim]↷ Skipping already queued folder:[/dim] {d['directory']} from {d['user']}")
+                    continue
+
+                self.client.enqueue_download(d["user"], files_to_download)
+                console.print(f"[green]✔ Enqueued folder:[/green] {d['directory']} from {d['user']} ({len(files_to_download)} files)")
             except Exception as e:
                 console.print(f"[red]Failed to enqueue {d['directory']}: {e}[/red]")
 
