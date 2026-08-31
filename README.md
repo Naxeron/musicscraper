@@ -22,19 +22,24 @@ A fast, versatile Python toolkit for music collectors and archivers:
 
 ---
 
-## Installation
+## Installation & Setup
 
-Ensure Python 3.8+ is installed, then install dependencies:
-
+### Standard Package Install (Recommended)
+Install in editable development mode:
 ```bash
-pip install -r requirements.txt
+pip install -e .
 ```
+This registers the CLI binaries `musicscraper` and `ms` directly in your environment.
 
-*(Zero external virtual environments or heavy dependencies required. All tools run on standard Python with `requests`, `beautifulsoup4`, `mutagen`, `musicbrainzngs`, `unidecode`, `rich`, and `tqdm`.)*
+### Or Run Directly via Python
+All legacy scripts and `main.py` continue to work with zero breaking changes:
+```bash
+python3 main.py --help
+```
 
 ---
 
-## Unified Dispatcher (`main.py`)
+## Unified CLI (`musicscraper` / `ms` / `main.py`)
 
 Run any tool in the suite through a single clean command:
 

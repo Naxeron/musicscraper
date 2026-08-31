@@ -1,0 +1,3 @@
+"""
+MusicScraper test suite.
+"""

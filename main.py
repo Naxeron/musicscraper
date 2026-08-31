@@ -1,107 +1,19 @@
 #!/usr/bin/env python3
 """
-MusicScraper Toolkit - Unified CLI Entrypoint
-==============================================
-Convenient dispatcher for all MusicScraper tools:
-1. audit    - Check library for missing tracks/albums using MusicBrainz (check_missing_tracks.py)
-2. bandcamp - Download Bandcamp discographies, albums, and tracks (bandcamp_scraper.py)
-3. scrape   - Crawl and download music from web releases (music_scraper.py)
-4. clean    - Remove empty and non-music folders (clean_empty_folders.py)
+MusicScraper - Main Entrypoint & Command Dispatcher.
+Delegates to the modern musicscraper package CLI.
 """
 
 import sys
-import subprocess
 from pathlib import Path
 
-ROOT_DIR = Path(__file__).resolve().parent
+# Ensure src/ is in sys.path when running from repository root
+REPO_ROOT = Path(__file__).resolve().parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
-TOOL_SCRIPTS = {
-    "upgrade": ROOT_DIR / "quality_upgrader.py",
-    "upgrade-quality": ROOT_DIR / "quality_upgrader.py",
-    "quality-upgrade": ROOT_DIR / "quality_upgrader.py",
-    "slskd-upgrade": ROOT_DIR / "quality_upgrader.py",
-    "quality": ROOT_DIR / "quality_upgrader.py",
-    "artist": ROOT_DIR / "artist_downloader.py",
-    "download-artist": ROOT_DIR / "artist_downloader.py",
-    "audit": ROOT_DIR / "check_missing_tracks.py",
-    "soulseek": ROOT_DIR / "slskd_scraper.py",
-    "slskd": ROOT_DIR / "slskd_scraper.py",
-    "bandcamp": ROOT_DIR / "bandcamp_scraper.py",
-    "scrape": ROOT_DIR / "music_scraper.py",
-    "clean": ROOT_DIR / "clean_empty_folders.py",
-    "tag": ROOT_DIR / "lastfm_genre_tagger.py",
-    "genre": ROOT_DIR / "lastfm_genre_tagger.py",
-    "lastfm": ROOT_DIR / "lastfm_genre_tagger.py",
-}
-
-
-def print_help():
-    print("""
-MusicScraper Toolkit - Complete Music Collection & Archival Suite
-==================================================================
-
-Usage:
-  python3 main.py <command> [options]
-
-Commands:
-  upgrade   Scan local library for low-quality files (< 320kbps or lossy),
-            find verified higher-quality releases (FLAC/320) on Soulseek, and queue
-            Example: python3 main.py upgrade "mnt/music/"
-            Example: python3 main.py upgrade "mnt/music//goreshit" --dry-run
-            Example: python3 main.py upgrade "mnt/music/" --max-bitrate 192 --format 320
-
-  soulseek  Search Soulseek (via slskd) for full artist discographies,
-            reconcile tracklists against MusicBrainz, and queue downloads
-            Example: python3 main.py soulseek "Mekuso"
-            Example: python3 main.py soulseek "Mekuso" --dry-run
-            Example: python3 main.py soulseek "kyou1110" --format flac
-
-  artist    Download & audit an artist's full discography across Soulseek,
-            Bandcamp, Archive.org, and web netlabel sources
-            Example: python3 main.py artist "Mekuso" --slskd
-            Example: python3 main.py artist "96-glass"
-
-  audit     Audit your local library against MusicBrainz for missing releases & tracks
-            Example: python3 main.py audit "Stellabee" -d /mnt/music
-
-  tag       Apply intelligent genre tags to artists, albums, & tracks via Last.fm
-            (Cascades track->album->artist tags, filters noise, formats ID3/Vorbis)
-            Example: python3 main.py tag "mnt/music//goreshit" --dry-run
-            Example: python3 main.py tag "mnt/music/" --skip-existing
-
-  bandcamp  Download albums, tracks, or full artist discographies from Bandcamp
-            Example: python3 main.py bandcamp goreshit -f flac
-
-  scrape    Scrape and download releases from websites (MediaFire, Archive.org, Direct)
-            Example: python3 main.py scrape https://dochakuso.net/release.html
-
-  clean     Clean empty and non-music directories from your library or downloads
-            Example: python3 main.py clean ./downloads --force
-
-Run 'python3 main.py <command> --help' for detailed options on any command.
-""")
-
-
-def main():
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
-        print_help()
-        sys.exit(0)
-
-    cmd = sys.argv[1].lower()
-    if cmd not in TOOL_SCRIPTS:
-        print(f"Unknown command: '{cmd}'")
-        print_help()
-        sys.exit(1)
-
-    script_path = TOOL_SCRIPTS[cmd]
-    args = [sys.executable, str(script_path)] + sys.argv[2:]
-
-    try:
-        proc = subprocess.run(args)
-        sys.exit(proc.returncode)
-    except KeyboardInterrupt:
-        sys.exit(130)
-
+from musicscraper.cli.main import main
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
