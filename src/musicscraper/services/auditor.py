@@ -20,7 +20,12 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeEl
 from rich import box
 
 from musicscraper.config import Config
-from musicscraper.core.constants import AUDIO_EXTENSIONS, GENERIC_OR_COMMON_WORDS
+from musicscraper.core.constants import (
+    AUDIO_EXTENSIONS,
+    GENERIC_OR_COMMON_WORDS,
+    IGNORED_SCAN_DIR_NAMES,
+    IGNORED_SCAN_DIR_PREFIXES,
+)
 from musicscraper.core.text import normalize_text, strip_track_number_and_artist
 from musicscraper.core.cache import UnifiedCacheManager
 from musicscraper.core.report import console, BaseReportExporter
@@ -99,12 +104,19 @@ class AudioFileScanner:
 
         # Stage 1: Walk directory
         for root, dirs, files in os.walk(self.music_dir):
-            # Exclude trash, sync-version, and VCS directories in-place
+            # Exclude incomplete, staging, trash, sync-version, and VCS directories in-place
             dirs[:] = [
                 d for d in dirs
-                if not d.startswith((".Trash", ".stversions", "@eaDir"))
-                and d not in (".git", "__pycache__", ".cache")
+                if not d.startswith(IGNORED_SCAN_DIR_PREFIXES)
+                and d.lower() not in IGNORED_SCAN_DIR_NAMES
             ]
+
+            try:
+                rel_parts = Path(root).relative_to(self.music_dir).parts
+                if any(p.lower() in IGNORED_SCAN_DIR_NAMES or p.startswith(IGNORED_SCAN_DIR_PREFIXES) for p in rel_parts):
+                    continue
+            except ValueError:
+                pass
 
             norm_root = normalize_text(root)
             dir_matches = bool((alias_regex and alias_regex.search(norm_root)) or (rel_regex and rel_regex.search(norm_root)))

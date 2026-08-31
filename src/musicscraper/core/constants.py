@@ -48,6 +48,20 @@ COMMON_JUNK_FILES: Set[str] = {
     ".directory", ".trash", "ehthumbs.db", "folder.htt"
 }
 
+# Directories to ignore during library scanning (incomplete downloads, trash, temp, VCS)
+IGNORED_SCAN_DIR_NAMES: Set[str] = {
+    "incomplete", ".incomplete", "_incomplete",
+    "tmp", ".tmp", "temp", ".temp",
+    "partial", "partials", ".part",
+    ".stversions", "@eadir", ".git",
+    "__pycache__", ".cache", "lost+found",
+    ".trash", "trash"
+}
+
+IGNORED_SCAN_DIR_PREFIXES: tuple = (
+    ".trash", ".Trash", ".stversions", "@eaDir", ".git", ".cache"
+)
+
 # Compilation / Various Artists Directory Markers
 VA_DIR_MARKERS: Set[str] = {
     "various", "various artists", "compilation", "compilations",
