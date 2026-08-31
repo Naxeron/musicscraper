@@ -334,7 +334,7 @@ class SlskdArtistScraper:
         music_dir: Optional[Path] = None,
         preferred_format: str = "flac",
         min_match_ratio: float = 0.70,
-        search_timeout: float = 14.0,
+        search_timeout: float = 25.0,
         dry_run: bool = False,
         singles_only: bool = False,
         threads: int = 6,
@@ -508,8 +508,17 @@ class SlskdArtistScraper:
             TimeElapsedColumn(),
             console=console
         ) as progress:
-            task = progress.add_task("Searching Soulseek network...", total=len(all_queries))
-            batch_results = self.client.batch_search(all_queries, timeout=self.search_timeout, poll_interval=1.0)
+            task = progress.add_task(f"Searching Soulseek network (0/{len(all_queries)} queries completed)...", total=len(all_queries))
+
+            def _update_progress(completed: int, total: int, last_query: str) -> None:
+                progress.update(task, completed=completed, description=f"Searching Soulseek ({completed}/{total} completed: {last_query})...")
+
+            batch_results = self.client.batch_search(
+                all_queries,
+                timeout=self.search_timeout,
+                poll_interval=1.0,
+                on_progress=_update_progress
+            )
             progress.update(task, completed=len(all_queries), description="Processing responses...")
 
             total_files = 0

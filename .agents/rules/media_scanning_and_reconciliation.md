@@ -54,6 +54,11 @@ Guidelines and invariants for audio file discovery, metadata tag parsing, persis
 - **Curated High-Yield Query Generation**:
   - Never flood slskd with dozens of granular track searches. Limit artist search generation to 10–15 curated queries (canonical artist name, aliases/alter-egos, missing primary releases, and key compilations).
   - Dispatch searches in controlled chunks (max 4 concurrent) to prevent slskd internal queue starvation (`state: Queued`).
+- **slskd Search Polling & Completion Invariants**:
+  - In slskd REST API (v0), `GET /api/v0/searches/{id}?includeResponses=true` returns an empty `responses: []` array while `isComplete` is `False` (`state: InProgress`), regardless of `responseCount` or `fileCount`.
+  - Never terminate search polling loops prematurely based on intermediate response counts or timers before `isComplete` is `True` (or `"Completed" in state`).
+  - Default search timeouts must be set to $\ge 25\text{s}$ (e.g. 25–30s) to allow Soulseek distributed network responses to fully arrive and complete.
+  - In-progress searches identified during `use_existing` checks must be attached by their existing ID and polled to completion rather than queried immediately for responses or re-dispatched as duplicates.
 - **Search Result State & Stale Search Purging**:
   - Clean up stale 0-file/timed-out searches from slskd history before initiating fresh batches.
   - In-progress searches must remain tracked in polling pools.

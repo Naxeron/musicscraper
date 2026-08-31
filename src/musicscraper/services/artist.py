@@ -30,7 +30,8 @@ class ArtistDownloadOrchestrator:
         dry_run: bool = False,
         use_bandcamp: bool = True,
         use_soulseek: bool = True,
-        email: Optional[str] = None
+        email: Optional[str] = None,
+        search_timeout: float = 25.0
     ):
         self.artist_query = artist_query.strip()
         self.output_dir = Path(output_dir or Config.DEFAULT_OUTPUT_DIR).resolve()
@@ -40,6 +41,7 @@ class ArtistDownloadOrchestrator:
         self.use_bandcamp = use_bandcamp
         self.use_soulseek = use_soulseek
         self.email = email or Config.BANDCAMP_EMAIL
+        self.search_timeout = search_timeout
 
         self.auditor = AuditorService()
         self.bc_engine = BandcampEngine(
@@ -110,6 +112,7 @@ class ArtistDownloadOrchestrator:
                     artist_query=catalog.name,
                     music_dir=self.library_dir,
                     preferred_format=self.preferred_format,
+                    search_timeout=self.search_timeout,
                     dry_run=self.dry_run
                 )
                 slsk_res = slsk_scraper.run()

@@ -95,7 +95,7 @@ class SoulseekQualityUpgrader:
         slskd_client: Optional[SlskdClient] = None,
         preferred_format: str = "flac",
         dry_run: bool = False,
-        search_timeout: float = 12.0
+        search_timeout: float = 25.0
     ):
         self.client = slskd_client or SlskdClient()
         self.preferred_format = preferred_format.lower()

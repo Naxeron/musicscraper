@@ -45,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     slsk_p.add_argument("--music-dir", "-d", default=str(Config.DEFAULT_LIBRARY_DIR), help="Path to local library for pre-scan")
     slsk_p.add_argument("-f", "--format", default="flac", choices=["flac", "mp3-320"], help="Preferred audio format (default: flac)")
     slsk_p.add_argument("--min-match", type=float, default=0.70, help="Minimum tracklist match ratio (default: 0.70)")
+    slsk_p.add_argument("-t", "--timeout", type=float, default=25.0, help="Soulseek search timeout in seconds (default: 25.0)")
     slsk_p.add_argument("--dry-run", action="store_true", help="Scan and verify matches without queueing transfers")
 
     # 3. Artist Subcommand
@@ -53,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     artist_p.add_argument("-o", "--output-dir", default=str(Config.DEFAULT_OUTPUT_DIR), help="Output directory")
     artist_p.add_argument("-d", "--library-dir", default=str(Config.DEFAULT_LIBRARY_DIR), help="Local library path for pre-scan")
     artist_p.add_argument("-f", "--format", default="flac", choices=["flac", "mp3-320"], help="Preferred audio format")
+    artist_p.add_argument("-t", "--timeout", type=float, default=25.0, help="Soulseek search timeout in seconds (default: 25.0)")
     artist_p.add_argument("--no-bandcamp", action="store_true", help="Disable Bandcamp downloading")
     artist_p.add_argument("--no-soulseek", action="store_true", help="Disable Soulseek queueing")
     artist_p.add_argument("--dry-run", action="store_true", help="Preview downloads without downloading")
@@ -62,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     upg_p.add_argument("-d", "--library-dir", default=str(Config.DEFAULT_LIBRARY_DIR), help="Path to music library")
     upg_p.add_argument("-a", "--artist", help="Filter quality scan to a specific artist")
     upg_p.add_argument("-f", "--format", default="flac", choices=["flac", "mp3-320"], help="Target audio format")
+    upg_p.add_argument("-t", "--timeout", type=float, default=25.0, help="Soulseek search timeout in seconds (default: 25.0)")
     upg_p.add_argument("--dry-run", action="store_true", help="Identify upgrade candidates without queueing transfers")
 
     # 5. Genre Tagger Subcommand
@@ -134,6 +137,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             music_dir=Path(args.music_dir) if args.music_dir else None,
             preferred_format=args.format,
             min_match_ratio=args.min_match,
+            search_timeout=args.timeout,
             dry_run=args.dry_run
         )
         scraper.run()
@@ -147,7 +151,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             preferred_format=args.format,
             dry_run=args.dry_run,
             use_bandcamp=not args.no_bandcamp,
-            use_soulseek=not args.no_soulseek
+            use_soulseek=not args.no_soulseek,
+            search_timeout=args.timeout
         )
         orchestrator.run()
         return 0
@@ -160,7 +165,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         candidates = scanner.scan(artist_filter=args.artist)
         upgrader = SoulseekQualityUpgrader(
             preferred_format=args.format,
-            dry_run=args.dry_run
+            dry_run=args.dry_run,
+            search_timeout=args.timeout
         )
         upgrader.upgrade_candidates(candidates)
         return 0

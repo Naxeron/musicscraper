@@ -7,7 +7,7 @@ import re
 import time
 import urllib.parse
 import threading
-from typing import Dict, List, Optional, Any, Union, Tuple, Set
+from typing import Dict, List, Optional, Any, Union, Tuple, Set, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -128,13 +128,12 @@ class SlskdClient:
     def search(
         self,
         query: str,
-        timeout: float = 12.0,
+        timeout: float = 25.0,
         poll_interval: float = 1.0,
-        min_responses: int = 10,
         use_existing: bool = True,
         delete_after: bool = False
     ) -> Dict[str, Any]:
-        """Initiates a search on the Soulseek network and polls for responses."""
+        """Initiates a search on the Soulseek network and polls until completion."""
         clean_q = query.strip()
         if not clean_q:
             return {"responses": [], "responseCount": 0, "fileCount": 0}
@@ -178,15 +177,19 @@ class SlskdClient:
                     continue
 
                 last_data = poll_resp.json()
-                is_complete = last_data.get("isComplete", False)
-                state = last_data.get("state", "")
-                response_count = last_data.get("responseCount", 0)
-                file_count = last_data.get("fileCount", 0)
+                is_complete = last_data.get("isComplete", False) or "Completed" in last_data.get("state", "")
 
-                if is_complete or "Completed" in state:
+                if is_complete:
                     break
-                if response_count >= min_responses and file_count > 0 and (time.time() - start_time) >= 8.0:
-                    break
+            except Exception:
+                pass
+
+        # Final poll if loop timed out before completion
+        if not (last_data.get("isComplete", False) or "Completed" in last_data.get("state", "")):
+            try:
+                poll_resp = self._request("GET", f"/api/v0/searches/{search_id}?includeResponses=true")
+                if poll_resp.status_code == 200:
+                    last_data = poll_resp.json()
             except Exception:
                 pass
 
@@ -201,12 +204,13 @@ class SlskdClient:
     def batch_search(
         self,
         queries: List[str],
-        timeout: float = 14.0,
+        timeout: float = 25.0,
         poll_interval: float = 1.0,
         max_concurrent: int = 8,
-        use_existing: bool = True
+        use_existing: bool = True,
+        on_progress: Optional[Callable[[int, int, str], None]] = None
     ) -> Dict[str, Dict[str, Any]]:
-        """Executes multiple Soulseek searches concurrently."""
+        """Executes multiple Soulseek searches concurrently and waits for completion."""
         clean_queries = list(dict.fromkeys(q.strip() for q in queries if q and q.strip()))
         if not clean_queries:
             return {}
@@ -214,6 +218,8 @@ class SlskdClient:
         results: Dict[str, Dict[str, Any]] = {}
         pending_queries: List[str] = []
         query_to_search_id: Dict[str, str] = {}
+        total_queries = len(clean_queries)
+        completed_queries = 0
 
         # 1. Check existing searches
         if use_existing:
@@ -230,15 +236,18 @@ class SlskdClient:
                 q_lower = q.lower()
                 if q_lower in existing_by_text:
                     matches = existing_by_text[q_lower]
-                    best_s = max(matches, key=lambda x: (x.get("fileCount", 0), 1 if "Completed" in x.get("state", "") else 0))
+                    best_s = max(matches, key=lambda x: (x.get("fileCount", 0), 1 if ("Completed" in x.get("state", "") or x.get("isComplete", False)) else 0))
                     sid = best_s.get("id")
                     st = best_s.get("state", "")
                     is_done = best_s.get("isComplete", False) or "Completed" in st
-                    if best_s.get("fileCount", 0) > 0:
+                    if is_done and best_s.get("fileCount", 0) > 0:
                         try:
                             full_res = self.get_search_results(sid)
                             if full_res.get("responses"):
                                 results[q] = full_res
+                                completed_queries += 1
+                                if on_progress:
+                                    on_progress(completed_queries, total_queries, q)
                                 continue
                         except Exception:
                             pass
@@ -254,7 +263,7 @@ class SlskdClient:
         else:
             pending_queries = list(clean_queries)
 
-        # 2. Dispatch remaining searches
+        # 2. Dispatch remaining searches in parallel chunks
         chunk_size = max(1, min(max_concurrent, 4))
         for i in range(0, len(pending_queries), chunk_size):
             chunk = pending_queries[i:i + chunk_size]
@@ -288,32 +297,28 @@ class SlskdClient:
                         poll_resp = self._request("GET", f"/api/v0/searches/{sid}?includeResponses=true")
                         if poll_resp.status_code == 200:
                             s_data = poll_resp.json()
-                            is_complete = s_data.get("isComplete", False)
-                            state = s_data.get("state", "")
-                            resp_count = s_data.get("responseCount", 0)
-                            file_count = s_data.get("fileCount", 0)
+                            is_complete = s_data.get("isComplete", False) or "Completed" in s_data.get("state", "")
 
-                            if file_count > 0 and len(s_data.get("responses", [])) > 0:
-                                results[q_str] = s_data
-
-                            if is_complete or "Completed" in state:
-                                if q_str not in results or results[q_str].get("fileCount", 0) == 0:
-                                    results[q_str] = s_data
-                                del active_chunk[q_str]
-                            elif resp_count >= 8 and file_count > 0 and (time.time() - start_time) >= 6.0:
+                            if is_complete:
                                 results[q_str] = s_data
                                 del active_chunk[q_str]
+                                completed_queries += 1
+                                if on_progress:
+                                    on_progress(completed_queries, total_queries, q_str)
                     except Exception:
                         pass
 
-            for q_str, sid in active_chunk.items():
-                if q_str not in results or results[q_str].get("fileCount", 0) == 0:
-                    try:
-                        poll_resp = self._request("GET", f"/api/v0/searches/{sid}?includeResponses=true")
-                        if poll_resp.status_code == 200:
-                            results[q_str] = poll_resp.json()
-                    except Exception:
-                        pass
+            # Timeout fallback for any remaining active searches in chunk
+            for q_str, sid in list(active_chunk.items()):
+                try:
+                    poll_resp = self._request("GET", f"/api/v0/searches/{sid}?includeResponses=true")
+                    if poll_resp.status_code == 200:
+                        results[q_str] = poll_resp.json()
+                    completed_queries += 1
+                    if on_progress:
+                        on_progress(completed_queries, total_queries, q_str)
+                except Exception:
+                    pass
 
         return results
 
