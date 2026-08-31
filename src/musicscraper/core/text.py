@@ -69,7 +69,7 @@ def normalize_text(text: Optional[str]) -> str:
     ascii_norm = unidecode(raw).lower()
     clean = re.sub(r"[^\w\s]", " ", ascii_norm)
     clean = re.sub(r"\s+", " ", clean).strip()
-    return clean
+    return clean if clean else ascii_norm.strip()
 
 
 @lru_cache(maxsize=65536)

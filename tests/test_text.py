@@ -21,6 +21,13 @@ def test_normalize_text_basic():
     assert normalize_text("Café") == "cafe"
 
 
+def test_normalize_text_symbols():
+    assert normalize_text("]") == "]"
+    assert normalize_text("???") == "???"
+    assert normalize_text("***") == "***"
+
+
+
 def test_kanji_to_arabic():
     assert kanji_to_arabic("三") == "3"
     assert kanji_to_arabic("十二") == "12"

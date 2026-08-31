@@ -452,8 +452,30 @@ class SlskdArtistScraper:
         for rel in self.catalog.releases:
             rel_title = rel.get("title", "")
             norm_rel = normalize_text(rel_title)
-            rel_tracks = [t for t in self.catalog.tracks if t.get("norm_release") == norm_rel]
-            if rel_tracks and all(t.get("norm_title") in self.local_found_map for t in rel_tracks):
+            rel_tracks = [
+                t for t in self.catalog.tracks
+                if norm_rel in [normalize_text(r) for r in t.get("all_releases", set())]
+                or t.get("norm_release") == norm_rel
+            ]
+            if not rel_tracks:
+                continue
+
+            artist_tracks = [
+                t for t in rel_tracks
+                if any(alias.lower() in t.get("artist_credit", "").lower() for alias in self.all_artist_aliases)
+                or t.get("artist_credit", "").lower() == self.catalog.name.lower()
+            ]
+
+            found_rel_tracks = [t for t in rel_tracks if t.get("norm_title") in self.local_found_map]
+            found_artist_tracks = [t for t in artist_tracks if t.get("norm_title") in self.local_found_map]
+
+            is_complete = False
+            if artist_tracks and len(found_artist_tracks) == len(artist_tracks):
+                is_complete = True
+            elif len(rel_tracks) > 0 and (len(found_rel_tracks) / len(rel_tracks) >= 0.85):
+                is_complete = True
+
+            if is_complete:
                 self.local_found_releases.add(norm_rel)
 
         console.print(f"[green]✔ Library Status:[/green] [bold]{len(found_items)}[/bold] artist tracks / [bold]{len(self.local_found_releases)}[/bold] releases already in library.")
@@ -605,7 +627,11 @@ class SlskdArtistScraper:
                 continue
             self.reconciled_release_keys.add(norm_rel)
 
-            expected_tracks = [t for t in self.catalog.tracks if t.get("norm_release") == norm_rel]
+            expected_tracks = [
+                t for t in self.catalog.tracks
+                if norm_rel in [normalize_text(r) for r in t.get("all_releases", set())]
+                or t.get("norm_release") == norm_rel
+            ]
             if not expected_tracks:
                 continue
 
@@ -621,6 +647,12 @@ class SlskdArtistScraper:
                 if is_dir_name_match_fast(clean_rel, rel_sig_words, cd) and cd.audio_files:
                     eval_res = self._evaluate_indexed_directory(cd, parsed_expected, expected_tracks, rel_title)
                     if eval_res and eval_res["match_ratio"] >= self.min_match_ratio:
+                        matched_new_tracks = [
+                            m for m in eval_res["matched_tracks"]
+                            if normalize_text(m["expected"]) not in self.local_found_map
+                        ]
+                        if not matched_new_tracks and len(eval_res["matched_tracks"]) > 0:
+                            continue
                         candidate_matches.append(eval_res)
 
             if candidate_matches:
@@ -661,8 +693,9 @@ class SlskdArtistScraper:
 
         try:
             self.already_downloading_files = self.client.get_queued_filenames()
+            queued_fps = self.client.get_queued_track_fingerprints()
         except Exception:
-            pass
+            queued_fps = {"base_filenames": set(), "clean_titles": set(), "full_paths": set()}
 
         console.print(f"\n[cyan]Enqueuing {len(self.queued_directories)} verified releases into slskd...[/cyan]")
         for d in self.queued_directories:
@@ -670,9 +703,15 @@ class SlskdArtistScraper:
                 files_to_download = []
                 for f in d["all_dir_files"]:
                     fn = f.get("filename", "")
-                    if fn and fn not in self.already_downloading_files:
-                        files_to_download.append(f)
-                        self.already_downloading_files.add(fn)
+                    if not fn:
+                        continue
+                    clean_p = fn.replace("/", "\\").split("\\")[-1].lower()
+                    if fn in self.already_downloading_files or clean_p in queued_fps["base_filenames"]:
+                        continue
+
+                    files_to_download.append(f)
+                    self.already_downloading_files.add(fn)
+                    queued_fps["base_filenames"].add(clean_p)
 
                 if not files_to_download:
                     console.print(f"[dim]↷ Skipping already queued folder:[/dim] {d['directory']} from {d['user']}")
