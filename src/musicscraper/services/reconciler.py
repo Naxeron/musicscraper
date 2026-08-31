@@ -149,8 +149,12 @@ class DiscographyReconciler:
                 )
 
                 if base_match and ver_compat:
-                    rel_sim = calculate_similarity(mb_rel_norm, lt_album_norm)
-                    path_has_rel = bool(mb_rel_norm and mb_rel_norm in path_norm)
+                    all_rel_norms = [normalize_text(r) for r in mb.get("all_releases", set())] if mb.get("all_releases") else [mb_rel_norm]
+                    if mb_rel_norm and mb_rel_norm not in all_rel_norms:
+                        all_rel_norms.append(mb_rel_norm)
+
+                    rel_sim = max([calculate_similarity(r, lt_album_norm) for r in all_rel_norms], default=0.0)
+                    path_has_rel = any(r and r in path_norm for r in all_rel_norms)
 
                     if rel_sim > 0.7 or path_has_rel or mb.get("release_title") == "Standalone / Other":
                         self.matched[i] = (lt, "Exact Title & Album Match")
