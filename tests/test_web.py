@@ -60,6 +60,13 @@ def test_task_manager_cancellation():
     assert task.cancel_requested is True
 
 
+@pytest.fixture(autouse=True)
+def isolate_env(monkeypatch):
+    """Prevents tests from mutating the local .env file."""
+    from musicscraper.config import Config
+    monkeypatch.setattr(Config, "save_to_env", lambda: True)
+
+
 @pytest.fixture(scope="module")
 def web_server():
     """Spins up a test HTTP server on an ephemeral port."""
@@ -209,4 +216,54 @@ def test_cli_web_subcommand_parser():
     assert args_gui.command == "gui"
     assert args_gui.host == "127.0.0.1"
     assert args_gui.port == 8080
+
+
+def test_web_api_navidrome_credentials(web_server, monkeypatch):
+    """Verifies that Navidrome credentials and status are properly exposed and handled."""
+    from musicscraper.config import Config
+
+    # Check status endpoint exposes navidrome configured status
+    req = urllib.request.urlopen(f"{web_server}/api/status")
+    status_data = json.loads(req.read().decode("utf-8"))
+    assert "navidrome" in status_data["services"]
+    assert "configured" in status_data["services"]["navidrome"]
+
+    # Check config endpoint includes Navidrome user and token flags
+    req_cfg = urllib.request.urlopen(f"{web_server}/api/config")
+    cfg_data = json.loads(req_cfg.read().decode("utf-8"))
+    assert "NAVIDROME_URL" in cfg_data
+    assert "NAVIDROME_USER" in cfg_data
+    assert "NAVIDROME_USERNAME" in cfg_data
+    assert "has_navidrome_token" in cfg_data
+    assert "has_slskd_password" in cfg_data
+
+    # Test updating Navidrome settings without clearing password
+    saved_url = Config.NAVIDROME_URL
+    saved_user = Config.NAVIDROME_USER
+    saved_token = Config.NAVIDROME_TOKEN
+    try:
+        post_data = json.dumps({
+            "NAVIDROME_URL": "http://subsonic.local:4533",
+            "NAVIDROME_USERNAME": "testuser"
+        }).encode("utf-8")
+        req_post = urllib.request.Request(
+            f"{web_server}/api/config",
+            data=post_data,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        resp = urllib.request.urlopen(req_post)
+        assert resp.status == 200
+        res = json.loads(resp.read().decode("utf-8"))
+        assert res["config"]["NAVIDROME_URL"] == "http://subsonic.local:4533"
+        assert res["config"]["NAVIDROME_USER"] == "testuser"
+        # Verify password was preserved (not blanked)
+        assert Config.NAVIDROME_TOKEN == saved_token
+    finally:
+        Config.NAVIDROME_URL = saved_url
+        Config.NAVIDROME_USER = saved_user
+        Config.NAVIDROME_USERNAME = saved_user
+        Config.NAVIDROME_TOKEN = saved_token
+        Config.NAVIDROME_PASSWORD = saved_token
+
 

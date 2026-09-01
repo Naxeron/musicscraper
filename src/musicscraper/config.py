@@ -6,9 +6,20 @@ import os
 from pathlib import Path
 from typing import Optional
 
+ENV_FILE_PATH: Optional[Path] = None
+
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
+    from dotenv import load_dotenv, find_dotenv
+    env_file = find_dotenv(usecwd=True)
+    if not env_file:
+        project_env = Path(__file__).resolve().parent.parent.parent / ".env"
+        if project_env.exists():
+            env_file = str(project_env)
+    if env_file:
+        load_dotenv(dotenv_path=env_file)
+        ENV_FILE_PATH = Path(env_file).resolve()
+    else:
+        load_dotenv()
 except ImportError:
     pass
 
@@ -54,14 +65,63 @@ class Config:
     SLSKD_PASSWORD = os.environ.get("SLSKD_PASSWORD")
     SLSKD_API_KEY = os.environ.get("SLSKD_API_KEY")
 
-    # Navidrome Settings
-    NAVIDROME_URL = os.environ.get("NAVIDROME_URL", "").rstrip("/")
-    NAVIDROME_USER = os.environ.get("NAVIDROME_USER", "")
-    NAVIDROME_TOKEN = os.environ.get("NAVIDROME_TOKEN", "")
-    NAVIDROME_SALT = os.environ.get("NAVIDROME_SALT", "")
+    # Navidrome / Subsonic Settings
+    NAVIDROME_URL = (
+        os.environ.get("NAVIDROME_URL")
+        or os.environ.get("SUBSONIC_URL")
+        or ""
+    ).rstrip("/")
+    NAVIDROME_USER = (
+        os.environ.get("NAVIDROME_USERNAME")
+        or os.environ.get("NAVIDROME_USER")
+        or os.environ.get("SUBSONIC_USERNAME")
+        or os.environ.get("SUBSONIC_USER")
+        or ""
+    )
+    NAVIDROME_USERNAME = NAVIDROME_USER
+    NAVIDROME_TOKEN = (
+        os.environ.get("NAVIDROME_PASSWORD")
+        or os.environ.get("NAVIDROME_TOKEN")
+        or os.environ.get("NAVIDROME_PASS")
+        or os.environ.get("SUBSONIC_PASSWORD")
+        or os.environ.get("SUBSONIC_TOKEN")
+        or ""
+    )
+    NAVIDROME_PASSWORD = NAVIDROME_TOKEN
+    NAVIDROME_SALT = (
+        os.environ.get("NAVIDROME_SALT")
+        or os.environ.get("SUBSONIC_SALT")
+        or ""
+    )
 
     # Bandcamp Account (optional)
     BANDCAMP_EMAIL = os.environ.get("BANDCAMP_EMAIL")
+
+    @classmethod
+    def save_to_env(cls) -> bool:
+        """Persists current configuration to the active .env file if available."""
+        if not ENV_FILE_PATH or not ENV_FILE_PATH.exists():
+            return False
+        try:
+            from dotenv import set_key
+            env_str = str(ENV_FILE_PATH)
+            if cls.SLSKD_URL:
+                set_key(env_str, "SLSKD_URL", cls.SLSKD_URL)
+            if cls.SLSKD_USERNAME:
+                set_key(env_str, "SLSKD_USERNAME", cls.SLSKD_USERNAME)
+            if cls.SLSKD_PASSWORD:
+                set_key(env_str, "SLSKD_PASSWORD", cls.SLSKD_PASSWORD)
+            if cls.NAVIDROME_URL:
+                set_key(env_str, "NAVIDROME_URL", cls.NAVIDROME_URL)
+            if cls.NAVIDROME_USER:
+                set_key(env_str, "NAVIDROME_USERNAME", cls.NAVIDROME_USER)
+            if cls.NAVIDROME_TOKEN:
+                set_key(env_str, "NAVIDROME_PASSWORD", cls.NAVIDROME_TOKEN)
+            if cls.LASTFM_API_KEY:
+                set_key(env_str, "LASTFM_API_KEY", cls.LASTFM_API_KEY)
+            return True
+        except Exception:
+            return False
 
     @classmethod
     def ensure_directories(cls) -> None:

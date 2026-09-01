@@ -31,14 +31,20 @@ class NavidromeScanner:
         timeout: int = 15
     ):
         self.base_url = (base_url or Config.NAVIDROME_URL).rstrip("/")
-        self.username = username or Config.NAVIDROME_USER
-        self.password = password or Config.NAVIDROME_TOKEN
+        self.username = username or Config.NAVIDROME_USER or getattr(Config, "NAVIDROME_USERNAME", "")
+        self.password = password or Config.NAVIDROME_TOKEN or getattr(Config, "NAVIDROME_PASSWORD", "")
         self.catalog = catalog
         self.timeout = timeout
+        self.last_error: Optional[str] = None
 
     def test_connection(self) -> bool:
         """Pings the Navidrome/Subsonic server to verify connectivity and credentials."""
-        if not self.base_url or not self.username:
+        self.last_error = None
+        if not self.base_url:
+            self.last_error = "Navidrome URL not configured"
+            return False
+        if not self.username:
+            self.last_error = "Navidrome username not configured"
             return False
         res = self._api_request("ping", {})
         return res is not None
@@ -59,14 +65,25 @@ class NavidromeScanner:
 
         url = f"{self.base_url}/rest/{endpoint}.view?{urllib.parse.urlencode(req_params)}"
         req = urllib.request.Request(url, headers={"User-Agent": "musicscraper/1.0"})
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                sub_resp = data.get("subsonic-response", {})
-                if sub_resp.get("status") == "ok":
-                    return sub_resp
-        except Exception:
-            pass
+
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    sub_resp = data.get("subsonic-response", {})
+                    if sub_resp.get("status") == "ok":
+                        self.last_error = None
+                        return sub_resp
+                    err = sub_resp.get("error", {})
+                    self.last_error = err.get("message") or f"Subsonic error code {err.get('code')}"
+                    return None
+            except Exception as e:
+                self.last_error = str(e)
+                if attempt == 0 and ("name resolution" in str(e).lower() or "timed out" in str(e).lower()):
+                    import time
+                    time.sleep(0.3)
+                    continue
+                break
         return None
 
     def scan(self, progress: Optional[Progress] = None, task_id: Optional[Any] = None) -> List[Dict[str, Any]]:

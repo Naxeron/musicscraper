@@ -12,10 +12,20 @@ from musicscraper.core.report import console
 from musicscraper.web.tasks import BackgroundTask, global_task_manager
 
 
-def get_system_status() -> Dict[str, Any]:
+_last_status_cache: Optional[Dict[str, Any]] = None
+_last_status_time: float = 0.0
+_STATUS_CACHE_TTL = 5.0  # seconds
+
+
+def get_system_status(force: bool = False) -> Dict[str, Any]:
     """Inspects and returns the status of connected services and local paths."""
+    global _last_status_cache, _last_status_time
+    now = time.time()
+    if not force and _last_status_cache is not None and (now - _last_status_time) < _STATUS_CACHE_TTL:
+        return _last_status_cache
+
     status = {
-        "timestamp": time.time(),
+        "timestamp": now,
         "paths": {
             "library_dir": str(Config.DEFAULT_LIBRARY_DIR),
             "library_exists": Config.DEFAULT_LIBRARY_DIR.exists(),
@@ -26,7 +36,7 @@ def get_system_status() -> Dict[str, Any]:
         },
         "services": {
             "slskd": {"configured": bool(Config.SLSKD_URL), "url": Config.SLSKD_URL, "connected": False, "username": None, "state": None},
-            "navidrome": {"configured": bool(Config.NAVIDROME_URL), "url": Config.NAVIDROME_URL, "connected": False},
+            "navidrome": {"configured": bool(Config.NAVIDROME_URL and (Config.NAVIDROME_USER or getattr(Config, "NAVIDROME_USERNAME", ""))), "url": Config.NAVIDROME_URL, "connected": False},
             "lastfm": {"configured": bool(Config.LASTFM_API_KEY), "connected": False},
             "musicbrainz": {"configured": True, "connected": True},
         }
@@ -45,11 +55,16 @@ def get_system_status() -> Dict[str, Any]:
         status["services"]["slskd"]["error"] = str(e)
 
     # Check Navidrome
-    if Config.NAVIDROME_URL and Config.NAVIDROME_USER:
+    nav_user = Config.NAVIDROME_USER or getattr(Config, "NAVIDROME_USERNAME", "")
+    nav_pass = Config.NAVIDROME_TOKEN or getattr(Config, "NAVIDROME_PASSWORD", "")
+    if Config.NAVIDROME_URL and nav_user:
         try:
             from musicscraper.clients.navidrome import NavidromeScanner
-            nav = NavidromeScanner(base_url=Config.NAVIDROME_URL, username=Config.NAVIDROME_USER, password=Config.NAVIDROME_TOKEN)
-            status["services"]["navidrome"]["connected"] = nav.test_connection()
+            nav = NavidromeScanner(base_url=Config.NAVIDROME_URL, username=nav_user, password=nav_pass, timeout=4)
+            is_connected = nav.test_connection()
+            status["services"]["navidrome"]["connected"] = is_connected
+            if not is_connected and getattr(nav, "last_error", None):
+                status["services"]["navidrome"]["error"] = nav.last_error
         except Exception as e:
             status["services"]["navidrome"]["error"] = str(e)
 
@@ -64,26 +79,34 @@ def get_system_status() -> Dict[str, Any]:
         except Exception as e:
             status["services"]["lastfm"]["error"] = str(e)
 
+    _last_status_cache = status
+    _last_status_time = now
     return status
 
 
 def get_system_config() -> Dict[str, Any]:
     """Returns current environment configurations."""
+    nav_user = Config.NAVIDROME_USER or getattr(Config, "NAVIDROME_USERNAME", "")
+    nav_token = Config.NAVIDROME_TOKEN or getattr(Config, "NAVIDROME_PASSWORD", "")
     return {
         "DEFAULT_LIBRARY_DIR": str(Config.DEFAULT_LIBRARY_DIR),
         "DEFAULT_OUTPUT_DIR": str(Config.DEFAULT_OUTPUT_DIR),
         "CACHE_DIR": str(Config.CACHE_DIR),
         "SLSKD_URL": Config.SLSKD_URL,
         "SLSKD_USERNAME": Config.SLSKD_USERNAME or "",
+        "has_slskd_password": bool(Config.SLSKD_PASSWORD),
         "NAVIDROME_URL": Config.NAVIDROME_URL,
-        "NAVIDROME_USER": Config.NAVIDROME_USER,
+        "NAVIDROME_USER": nav_user,
+        "NAVIDROME_USERNAME": nav_user,
+        "has_navidrome_token": bool(nav_token),
+        "has_navidrome_password": bool(nav_token),
         "LASTFM_API_KEY": Config.LASTFM_API_KEY or "",
         "BANDCAMP_EMAIL": Config.BANDCAMP_EMAIL or "",
     }
 
 
 def update_system_config(updates: Dict[str, Any]) -> Dict[str, Any]:
-    """Updates runtime configuration settings."""
+    """Updates runtime configuration settings and persists to .env."""
     if "DEFAULT_LIBRARY_DIR" in updates:
         Config.DEFAULT_LIBRARY_DIR = Path(updates["DEFAULT_LIBRARY_DIR"]).resolve()
     if "DEFAULT_OUTPUT_DIR" in updates:
@@ -92,18 +115,32 @@ def update_system_config(updates: Dict[str, Any]) -> Dict[str, Any]:
         Config.SLSKD_URL = updates["SLSKD_URL"].rstrip("/")
     if "SLSKD_USERNAME" in updates:
         Config.SLSKD_USERNAME = updates["SLSKD_USERNAME"]
-    if "SLSKD_PASSWORD" in updates:
+    # Only update password if a non-empty string is passed (preserves existing password)
+    if updates.get("SLSKD_PASSWORD"):
         Config.SLSKD_PASSWORD = updates["SLSKD_PASSWORD"]
     if "NAVIDROME_URL" in updates:
         Config.NAVIDROME_URL = updates["NAVIDROME_URL"].rstrip("/")
-    if "NAVIDROME_USER" in updates:
-        Config.NAVIDROME_USER = updates["NAVIDROME_USER"]
-    if "NAVIDROME_TOKEN" in updates:
-        Config.NAVIDROME_TOKEN = updates["NAVIDROME_TOKEN"]
+    if "NAVIDROME_USER" in updates or "NAVIDROME_USERNAME" in updates:
+        user_val = updates.get("NAVIDROME_USER") or updates.get("NAVIDROME_USERNAME") or ""
+        Config.NAVIDROME_USER = user_val
+        Config.NAVIDROME_USERNAME = user_val
+    if updates.get("NAVIDROME_TOKEN"):
+        token_val = updates["NAVIDROME_TOKEN"]
+        Config.NAVIDROME_TOKEN = token_val
+        Config.NAVIDROME_PASSWORD = token_val
+    elif updates.get("NAVIDROME_PASSWORD"):
+        token_val = updates["NAVIDROME_PASSWORD"]
+        Config.NAVIDROME_TOKEN = token_val
+        Config.NAVIDROME_PASSWORD = token_val
     if "LASTFM_API_KEY" in updates:
         Config.LASTFM_API_KEY = updates["LASTFM_API_KEY"]
     if "BANDCAMP_EMAIL" in updates:
         Config.BANDCAMP_EMAIL = updates["BANDCAMP_EMAIL"]
+
+    global _last_status_cache
+    _last_status_cache = None
+
+    Config.save_to_env()
 
     return get_system_config()
 

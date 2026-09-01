@@ -4,6 +4,7 @@ Built directly on Python standard library's http.server with multi-threading.
 """
 
 import os
+import sys
 import json
 import time
 import urllib.parse
@@ -28,19 +29,29 @@ class MusicScraperHTTPRequestHandler(BaseHTTPRequestHandler):
         """Suppresses default noisy stderr request logging."""
         pass
 
+    def handle(self) -> None:
+        """Processes incoming requests, suppressing client disconnect errors gracefully."""
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _send_cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
     def _send_json_response(self, data: Any, status_code: int = 200) -> None:
-        payload = json.dumps(data, default=str).encode("utf-8")
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self._send_cors_headers()
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            payload = json.dumps(data, default=str).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self._send_cors_headers()
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     def _send_error_json(self, message: str, status_code: int = 400) -> None:
         self._send_json_response({"error": message, "success": False}, status_code=status_code)
@@ -65,7 +76,8 @@ class MusicScraperHTTPRequestHandler(BaseHTTPRequestHandler):
 
         # 2. REST API: System Status & Config
         if path == "/api/status":
-            return self._send_json_response(api.get_system_status())
+            force_refresh = query.get("refresh", ["false"])[0].lower() == "true"
+            return self._send_json_response(api.get_system_status(force=force_refresh))
         elif path == "/api/config":
             return self._send_json_response(api.get_system_config())
         elif path == "/api/slskd/transfers":
@@ -186,6 +198,8 @@ class MusicScraperHTTPRequestHandler(BaseHTTPRequestHandler):
             self._send_cors_headers()
             self.end_headers()
             self.wfile.write(content)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
         except Exception as e:
             self._send_error_json(f"Error reading file: {e}", status_code=500)
 
@@ -240,8 +254,18 @@ class MusicScraperHTTPRequestHandler(BaseHTTPRequestHandler):
             task.remove_listener(on_log)
 
 
-def start_server(host: str = "127.0.0.1", port: int = 8080) -> ThreadingHTTPServer:
+class MusicScraperServer(ThreadingHTTPServer):
+    """Threading HTTP server that suppresses noisy broken pipe disconnect errors."""
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        ex_type, _, _ = sys.exc_info()
+        if ex_type in (BrokenPipeError, ConnectionResetError):
+            return
+        super().handle_error(request, client_address)
+
+
+def start_server(host: str = "127.0.0.1", port: int = 8080) -> MusicScraperServer:
     """Starts the threaded HTTP web server."""
     server_address = (host, port)
-    httpd = ThreadingHTTPServer(server_address, MusicScraperHTTPRequestHandler)
+    httpd = MusicScraperServer(server_address, MusicScraperHTTPRequestHandler)
     return httpd

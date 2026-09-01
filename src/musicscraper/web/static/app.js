@@ -145,7 +145,7 @@ async function refreshSystemStatus() {
     } else {
       navEl.textContent = nav?.configured ? 'Offline' : 'Not Configured';
       navEl.className = 'stat-value text-muted';
-      navUrlEl.textContent = nav?.url || 'Configure in Settings';
+      navUrlEl.textContent = nav?.error || nav?.url || 'Configure in Settings';
       pillNav.querySelector('.status-dot').className = 'status-dot offline';
     }
 
@@ -182,9 +182,21 @@ async function loadConfig() {
     document.getElementById('cfg-slskd-url').value = cfg.SLSKD_URL || '';
     document.getElementById('cfg-slskd-user').value = cfg.SLSKD_USERNAME || '';
     document.getElementById('cfg-nav-url').value = cfg.NAVIDROME_URL || '';
-    document.getElementById('cfg-nav-user').value = cfg.NAVIDROME_USER || '';
+    document.getElementById('cfg-nav-user').value = cfg.NAVIDROME_USER || cfg.NAVIDROME_USERNAME || '';
     document.getElementById('cfg-lastfm-key').value = cfg.LASTFM_API_KEY || '';
     document.getElementById('cfg-bc-email').value = cfg.BANDCAMP_EMAIL || '';
+
+    if (cfg.has_slskd_password) {
+      document.getElementById('cfg-slskd-pass').placeholder = '•••••••• (configured in .env)';
+    } else {
+      document.getElementById('cfg-slskd-pass').placeholder = '';
+    }
+
+    if (cfg.has_navidrome_token || cfg.has_navidrome_password) {
+      document.getElementById('cfg-nav-token').placeholder = '•••••••• (configured in .env)';
+    } else {
+      document.getElementById('cfg-nav-token').placeholder = '';
+    }
 
     // Also populate default fields in other tabs
     if (!document.getElementById('audit-dir').value) {
@@ -665,18 +677,28 @@ function setupForms() {
   // 9. Settings Form
   document.getElementById('form-settings').addEventListener('submit', async (e) => {
     e.preventDefault();
+    const slskdPass = document.getElementById('cfg-slskd-pass').value.trim();
+    const navToken = document.getElementById('cfg-nav-token').value.trim();
+
     const updates = {
       DEFAULT_LIBRARY_DIR: document.getElementById('cfg-lib-dir').value.trim(),
       DEFAULT_OUTPUT_DIR: document.getElementById('cfg-out-dir').value.trim(),
       SLSKD_URL: document.getElementById('cfg-slskd-url').value.trim(),
       SLSKD_USERNAME: document.getElementById('cfg-slskd-user').value.trim(),
-      SLSKD_PASSWORD: document.getElementById('cfg-slskd-pass').value.trim(),
       NAVIDROME_URL: document.getElementById('cfg-nav-url').value.trim(),
       NAVIDROME_USER: document.getElementById('cfg-nav-user').value.trim(),
-      NAVIDROME_TOKEN: document.getElementById('cfg-nav-token').value.trim(),
+      NAVIDROME_USERNAME: document.getElementById('cfg-nav-user').value.trim(),
       LASTFM_API_KEY: document.getElementById('cfg-lastfm-key').value.trim(),
       BANDCAMP_EMAIL: document.getElementById('cfg-bc-email').value.trim(),
     };
+
+    if (slskdPass) {
+      updates.SLSKD_PASSWORD = slskdPass;
+    }
+    if (navToken) {
+      updates.NAVIDROME_TOKEN = navToken;
+      updates.NAVIDROME_PASSWORD = navToken;
+    }
 
     try {
       const res = await fetch('/api/config', {
