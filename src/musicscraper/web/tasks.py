@@ -35,14 +35,19 @@ class TaskLogCapture(io.StringIO):
         while "\n" in self._line_buffer:
             line, self._line_buffer = self._line_buffer.split("\n", 1)
             clean_line = line.rstrip("\r")
+            if "\r" in clean_line:
+                clean_line = clean_line.split("\r")[-1]
             if clean_line:
                 self.task.append_log(clean_line)
         return len(s)
 
     def flush(self) -> None:
-        if self._line_buffer.strip():
-            self.task.append_log(self._line_buffer.rstrip("\r\n"))
-            self._line_buffer = ""
+        clean_line = self._line_buffer.rstrip("\r\n")
+        if "\r" in clean_line:
+            clean_line = clean_line.split("\r")[-1]
+        if clean_line.strip():
+            self.task.append_log(clean_line)
+        self._line_buffer = ""
         if self.original_stream:
             try:
                 self.original_stream.flush()
@@ -174,7 +179,9 @@ class TaskManager:
 
         # Temporarily redirect Rich console output
         old_console_file = console.file
+        old_soft_wrap = getattr(console, "soft_wrap", False)
         console.file = capture_stream
+        console.soft_wrap = True
 
         try:
             # Provide task as first argument if expected or via kwargs
@@ -194,6 +201,7 @@ class TaskManager:
             sys.stdout = old_stdout
             sys.stderr = old_stderr
             console.file = old_console_file
+            console.soft_wrap = old_soft_wrap
             task.ended_at = datetime.now(timezone.utc).isoformat()
 
     def get_task(self, task_id: str) -> Optional[BackgroundTask]:

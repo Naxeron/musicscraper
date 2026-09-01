@@ -42,6 +42,38 @@ def test_task_manager_execution():
     assert any("Hello from stdout" in log["message"] for log in task.logs)
 
 
+def test_task_manager_rich_and_carriage_return_capture():
+    """Tests Rich console log capture, soft wrap, and carriage return handling."""
+    from musicscraper.core.report import console
+    import sys
+
+    tm = TaskManager(max_workers=2)
+
+    def rich_task_fn(task: BackgroundTask):
+        console.print("[cyan]Initiating Soulseek download for [bold]4[/bold] missing tracks...[/cyan]")
+        sys.stdout.write("Overwritten line 1\rFinal line content\n")
+        return "ok"
+
+    original_soft_wrap = getattr(console, "soft_wrap", False)
+    task = tm.submit(name="Rich Task", task_type="download", target_fn=rich_task_fn)
+
+    for _ in range(50):
+        if task.status in ("completed", "failed"):
+            break
+        time.sleep(0.05)
+
+    assert task.status == "completed"
+    # Verify console.soft_wrap was restored
+    assert getattr(console, "soft_wrap", False) == original_soft_wrap
+
+    log_messages = [log["message"] for log in task.logs]
+    assert any("Initiating Soulseek download" in msg for msg in log_messages)
+    # Carriage return overwrite must leave only the final portion
+    assert any("Final line content" in msg for msg in log_messages)
+    assert not any("Overwritten line 1" in msg for msg in log_messages)
+    assert not any("\r" in msg for msg in log_messages)
+
+
 def test_task_manager_cancellation():
     """Tests cancelling a task in progress."""
     tm = TaskManager(max_workers=2)

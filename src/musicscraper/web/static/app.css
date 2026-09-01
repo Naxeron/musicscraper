@@ -677,6 +677,48 @@ textarea {
 .log-warn { color: var(--accent-yellow); }
 .log-error { color: var(--accent-red); font-weight: 600; }
 
+/* Terminal ANSI Styles & Colors */
+.ansi-bold { font-weight: 600; }
+.ansi-dim { opacity: 0.65; }
+.ansi-italic { font-style: italic; }
+.ansi-underline { text-decoration: underline; }
+
+.ansi-fg-black { color: #6b7280; }
+.ansi-fg-red { color: var(--accent-red); }
+.ansi-fg-green { color: var(--accent-green); }
+.ansi-fg-yellow { color: var(--accent-yellow); }
+.ansi-fg-blue { color: var(--accent-blue); }
+.ansi-fg-magenta { color: var(--accent-purple); }
+.ansi-fg-cyan { color: var(--accent-cyan); }
+.ansi-fg-white { color: #e6edf3; }
+
+.ansi-fg-bright-black { color: #8b949e; }
+.ansi-fg-bright-red { color: #ff7b72; }
+.ansi-fg-bright-green { color: #56d364; }
+.ansi-fg-bright-yellow { color: #e3b341; }
+.ansi-fg-bright-blue { color: #79c0ff; }
+.ansi-fg-bright-magenta { color: #d2a8ff; }
+.ansi-fg-bright-cyan { color: #56d4dd; }
+.ansi-fg-bright-white { color: #ffffff; }
+
+.ansi-bg-black { background-color: #1f2330; }
+.ansi-bg-red { background-color: rgba(248, 81, 73, 0.25); border-radius: 2px; }
+.ansi-bg-green { background-color: rgba(46, 160, 67, 0.25); border-radius: 2px; }
+.ansi-bg-yellow { background-color: rgba(210, 153, 34, 0.25); border-radius: 2px; }
+.ansi-bg-blue { background-color: rgba(56, 139, 253, 0.25); border-radius: 2px; }
+.ansi-bg-magenta { background-color: rgba(163, 113, 247, 0.25); border-radius: 2px; }
+.ansi-bg-cyan { background-color: rgba(57, 197, 187, 0.25); border-radius: 2px; }
+.ansi-bg-white { background-color: rgba(255, 255, 255, 0.2); border-radius: 2px; }
+
+.ansi-bg-bright-black { background-color: #374151; }
+.ansi-bg-bright-red { background-color: rgba(255, 123, 114, 0.3); border-radius: 2px; }
+.ansi-bg-bright-green { background-color: rgba(86, 211, 100, 0.3); border-radius: 2px; }
+.ansi-bg-bright-yellow { background-color: rgba(227, 179, 65, 0.3); border-radius: 2px; }
+.ansi-bg-bright-blue { background-color: rgba(121, 192, 255, 0.3); border-radius: 2px; }
+.ansi-bg-bright-magenta { background-color: rgba(210, 168, 255, 0.3); border-radius: 2px; }
+.ansi-bg-bright-cyan { background-color: rgba(86, 212, 221, 0.3); border-radius: 2px; }
+.ansi-bg-bright-white { background-color: rgba(255, 255, 255, 0.35); border-radius: 2px; }
+
 /* Task List Sidebar */
 .task-list-nav {
   height: calc(100vh - 220px);
