@@ -288,3 +288,211 @@ def test_download_single_missing_track():
     assert "Pulsewidth" in res["filename"]
     slsk_mock.enqueue_download.assert_called_once()
 
+
+def test_scan_library_various_artists_compilation(tmp_path):
+    """Verifies that compilation releases are properly identified as Various Artists even with 1 track."""
+    music_dir = tmp_path / "music"
+    music_dir.mkdir()
+
+    # 1. Folder with VA directory marker: "VA - Amen Destroyer" with 1 track by Exnoiz
+    va_dir = music_dir / "VA - Amen Destroyer"
+    va_dir.mkdir()
+    (va_dir / "01 - Exnoiz - Destruction.mp3").write_text("dummy")
+
+    # 2. Folder with multiple tracks by different artists
+    comp_dir = music_dir / "Breakcore Sampler"
+    comp_dir.mkdir()
+    (comp_dir / "01 - Bong-Ra - Jungle.flac").write_text("dummy")
+    (comp_dir / "02 - Venetian Snares - Hajnal.flac").write_text("dummy")
+
+    cache_db = tmp_path / "cache.db"
+    cache = UnifiedCacheManager(db_path=cache_db)
+
+    cache.store_audio_metadata(AudioMetadata(
+        path=va_dir / "01 - Exnoiz - Destruction.mp3",
+        title="Destruction",
+        artist="Exnoiz",
+        album_artist="Various Artists",
+        album="Amen Destroyer",
+        track_number="1/10",
+        year="2004",
+        format_label="MP3",
+    ))
+    cache.store_audio_metadata(AudioMetadata(
+        path=comp_dir / "01 - Bong-Ra - Jungle.flac",
+        title="Jungle",
+        artist="Bong-Ra",
+        album="Breakcore Sampler",
+        track_number="1/2",
+        format_label="FLAC",
+    ))
+    cache.store_audio_metadata(AudioMetadata(
+        path=comp_dir / "02 - Venetian Snares - Hajnal.flac",
+        title="Hajnal",
+        artist="Venetian Snares",
+        album="Breakcore Sampler",
+        track_number="2/2",
+        format_label="FLAC",
+    ))
+
+    service = LibraryReleaseService(cache_manager=cache)
+    releases = service.scan_library_releases(library_dir=music_dir, force_rescan=False)
+
+    assert len(releases) == 2
+    amen_rel = next(r for r in releases if r["title"] == "Amen Destroyer")
+    assert amen_rel["artist"] == "Various Artists"
+    assert amen_rel["is_va"] is True
+    assert amen_rel["tracks"][0]["artist"] == "Exnoiz"
+
+    sampler_rel = next(r for r in releases if r["title"] == "Breakcore Sampler")
+    assert sampler_rel["artist"] == "Various Artists"
+    assert sampler_rel["is_va"] is True
+    assert len(sampler_rel["tracks"]) == 2
+
+
+def test_audit_release_various_artists_reconciliation():
+    """Tests auditing a release where local had 1 track by Exnoiz and MusicBrainz returns Various Artists with distinct track artists."""
+    mb_mock = MagicMock()
+    slsk_mock = MagicMock()
+    service = LibraryReleaseService(mb_client=mb_mock, slskd_client=slsk_mock)
+
+    # Mock MusicBrainz response for Amen Destroyer (Various Artists compilation)
+    mb_mock.search_release.return_value = [
+        {"id": "amen-mbid-9999", "title": "Amen Destroyer", "artist-credit": [{"name": "Various Artists"}]}
+    ]
+    mb_mock.get_release_by_id.return_value = {
+        "id": "amen-mbid-9999",
+        "title": "Amen Destroyer",
+        "artist-credit": [{"name": "Various Artists"}],
+        "release-group": {"primary-type": "Compilation"},
+        "medium-list": [{
+            "position": 1,
+            "track-list": [
+                {
+                    "position": 1, "number": "1", "title": "Destruction",
+                    "artist-credit": [{"name": "Exnoiz"}],
+                    "recording": {"id": "rec-exnoiz", "title": "Destruction"}
+                },
+                {
+                    "position": 2, "number": "2", "title": "Amen Terror",
+                    "artist-credit": [{"name": "Venetian Snares"}],
+                    "recording": {"id": "rec-snares", "title": "Amen Terror"}
+                },
+                {
+                    "position": 3, "number": "3", "title": "Mashup Core",
+                    "artist-credit": [{"name": "Bong-Ra"}],
+                    "recording": {"id": "rec-bongra", "title": "Mashup Core"}
+                },
+            ]
+        }]
+    }
+
+    # Local release was mistakenly identified with artist="Exnoiz" because only 1 track was downloaded
+    local_release = {
+        "id": "local-amen-id",
+        "title": "Amen Destroyer",
+        "artist": "Exnoiz",
+        "tracks": [
+            {
+                "filename": "01 - Exnoiz - Destruction.mp3",
+                "title": "Destruction",
+                "artist": "Exnoiz",
+                "track_number": "1",
+                "format": "MP3",
+                "status": "found"
+            }
+        ]
+    }
+
+    audited = service.audit_release(local_release)
+    assert audited["artist"] == "Various Artists"
+    assert audited["is_va"] is True
+    assert audited["found_count"] == 1
+    assert audited["missing_count"] == 2
+    assert audited["status"] == "has_missing"
+
+    # Verify track artists: Track 1 is Exnoiz, Missing Track 2 is Venetian Snares, Missing Track 3 is Bong-Ra
+    tracks = audited["tracks"]
+    assert len(tracks) == 3
+    assert tracks[0]["title"] == "Destruction" and tracks[0]["artist"] == "Exnoiz" and tracks[0]["status"] == "found"
+    assert tracks[1]["title"] == "Amen Terror" and tracks[1]["artist"] == "Venetian Snares" and tracks[1]["status"] == "missing"
+    assert tracks[2]["title"] == "Mashup Core" and tracks[2]["artist"] == "Bong-Ra" and tracks[2]["status"] == "missing"
+
+
+def test_download_missing_tracks_various_artists_orchestration():
+    """Verifies that downloading missing tracks for a compilation searches for each track's actual artist rather than the release artist."""
+    mb_mock = MagicMock()
+    slsk_mock = MagicMock()
+    service = LibraryReleaseService(mb_client=mb_mock, slskd_client=slsk_mock)
+
+    # Soulseek batch search responses for individual missing tracks
+    slsk_mock.search.return_value = {"responses": []}  # No peer directory match, so goes to Stage 2
+    slsk_mock.batch_search.return_value = {
+        "Venetian Snares - Amen Terror": {
+            "responses": [{
+                "username": "BreakcoreHead",
+                "files": [{"filename": "Music\\Venetian Snares - Amen Terror.flac", "size": 30000000}]
+            }]
+        },
+        "Bong-Ra - Mashup Core": {
+            "responses": [{
+                "username": "JungleJunkie",
+                "files": [{"filename": "Music\\Bong-Ra - Mashup Core.flac", "size": 28000000}]
+            }]
+        }
+    }
+
+    missing_tracks = [
+        {"title": "Amen Terror", "artist": "Venetian Snares", "track_number": "2"},
+        {"title": "Mashup Core", "artist": "Bong-Ra", "track_number": "3"},
+    ]
+
+    res = service.download_missing_tracks(
+        artist="Various Artists",
+        release_title="Amen Destroyer",
+        missing_tracks=missing_tracks,
+        preferred_format="flac",
+        dry_run=False
+    )
+
+    assert res["total_missing"] == 2
+    assert res["queued_count"] == 2
+    assert res["resolved_count"] == 2
+
+    # Verify that Soulseek batch_search was called with the individual track artists, NOT "Various Artists" or "Exnoiz"
+    slsk_mock.batch_search.assert_called_once()
+    queries = slsk_mock.batch_search.call_args[0][0]
+    assert "Venetian Snares - Amen Terror" in queries
+    assert "Bong-Ra - Mashup Core" in queries
+    assert not any("Exnoiz" in q for q in queries)
+    assert not any("Various Artists" in q for q in queries)
+
+
+def test_download_single_missing_track_with_track_artist():
+    """Verifies that downloading a single track on a VA release searches for the track artist rather than 'Various Artists'."""
+    mb_mock = MagicMock()
+    slsk_mock = MagicMock()
+    service = LibraryReleaseService(mb_client=mb_mock, slskd_client=slsk_mock)
+
+    slsk_mock.search.return_value = {
+        "responses": [{
+            "username": "BreakcoreHead",
+            "files": [{"filename": "Music\\Venetian Snares - Amen Terror.flac", "size": 30000000}]
+        }]
+    }
+
+    res = service.download_single_missing_track(
+        artist="Various Artists",
+        release_title="Amen Destroyer",
+        track_title="Amen Terror",
+        track_artist="Venetian Snares",
+        dry_run=False
+    )
+
+    assert res["success"] is True
+    assert res["artist"] == "Venetian Snares"
+    # Verify search query was for "Venetian Snares Amen Terror", NOT "Various Artists Amen Terror"
+    slsk_mock.search.assert_called_once()
+    query = slsk_mock.search.call_args[1]["query"]
+    assert query == "Venetian Snares Amen Terror"
+

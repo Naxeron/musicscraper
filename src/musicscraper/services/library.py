@@ -18,6 +18,7 @@ from musicscraper.core.constants import (
     AUDIO_EXTENSIONS,
     IGNORED_SCAN_DIR_NAMES,
     IGNORED_SCAN_DIR_PREFIXES,
+    VA_DIR_MARKERS,
 )
 from musicscraper.core.text import (
     normalize_text,
@@ -31,6 +32,54 @@ from musicscraper.core.cache import UnifiedCacheManager
 from musicscraper.core.report import console
 from musicscraper.clients.musicbrainz import MusicBrainzClient
 from musicscraper.clients.slskd import SlskdClient, SlskdAPIError
+
+
+def _format_artist_credit(ac_list: Any, default: str = "") -> str:
+    """Formats a MusicBrainz artist-credit list into a clean display string."""
+    if not ac_list:
+        return default
+    if isinstance(ac_list, str):
+        return ac_list
+    parts = []
+    for c in ac_list:
+        if isinstance(c, dict):
+            name = c.get("name") or c.get("artist", {}).get("name", "")
+            join = c.get("joinphrase", "")
+            parts.append(name + join)
+        else:
+            parts.append(str(c))
+    return "".join(parts).strip() or default
+
+
+def _is_va_string(name: Optional[str]) -> bool:
+    """Checks if an artist or tag string represents Various Artists."""
+    if not name:
+        return False
+    norm = name.strip().lower()
+    return (
+        norm in VA_DIR_MARKERS
+        or norm in ("various artists", "various", "va", "v.a.", "v/a", "compilation", "compilations")
+    )
+
+
+def _is_va_directory(path: Path) -> bool:
+    """Checks if a folder name or parent directory path matches compilation / VA patterns."""
+    p_name = path.name.lower().strip()
+    gp_name = path.parent.name.lower().strip() if path.parent != path else ""
+    return (
+        p_name in VA_DIR_MARKERS
+        or gp_name in VA_DIR_MARKERS
+        or p_name.startswith("va - ")
+        or p_name.startswith("va-")
+        or p_name.startswith("va ")
+        or p_name.startswith("v.a. - ")
+        or p_name.startswith("various artists - ")
+        or p_name.startswith("various - ")
+        or "[va]" in p_name
+        or "(va)" in p_name
+        or p_name.endswith(" [va]")
+        or p_name.endswith(" (va)")
+    )
 
 
 class LibraryReleaseService:
@@ -106,11 +155,32 @@ class LibraryReleaseService:
         # 3. Group files into Releases
         releases_map: Dict[str, Dict[str, Any]] = {}
 
+        # Pre-analyze directories to detect multi-artist compilation folders
+        folder_artists: Dict[str, Set[str]] = {}
         for meta in all_tracks:
-            artist = meta.album_artist or meta.artist or "Unknown Artist"
-            album = meta.album
-            folder = str(meta.path.parent)
+            folder_key = str(meta.path.parent)
+            art = meta.artist.strip() if meta.artist else ""
+            if art and not _is_va_string(art) and art.lower() != "unknown artist":
+                folder_artists.setdefault(folder_key, set()).add(art.lower())
 
+        for meta in all_tracks:
+            folder = str(meta.path.parent)
+            is_folder_multi_artist = len(folder_artists.get(folder, set())) > 1
+            is_va = (
+                _is_va_string(meta.album_artist)
+                or _is_va_string(meta.artist)
+                or is_folder_multi_artist
+                or _is_va_directory(meta.path.parent)
+            )
+
+            if is_va:
+                artist = "Various Artists"
+                album_artist = "Various Artists"
+            else:
+                artist = meta.album_artist or meta.artist or "Unknown Artist"
+                album_artist = meta.album_artist or artist
+
+            album = meta.album
             # Derive clean album name fallback from parent folder if not tagged
             if not album:
                 folder_name = meta.path.parent.name
@@ -125,6 +195,8 @@ class LibraryReleaseService:
             # Generate unique release key
             if mb_rel_id:
                 rel_key = f"mb_{mb_rel_id}"
+            elif is_va:
+                rel_key = f"va_{norm_album}::{hashlib.md5(folder.encode()).hexdigest()[:8]}"
             elif norm_artist and norm_album:
                 rel_key = f"art_alb_{norm_artist}::{norm_album}"
             else:
@@ -142,7 +214,8 @@ class LibraryReleaseService:
                     "rel_key": rel_key,
                     "title": album,
                     "artist": artist,
-                    "album_artist": meta.album_artist or artist,
+                    "album_artist": album_artist,
+                    "is_va": is_va,
                     "year": meta.year or "",
                     "folder_path": rel_folder,
                     "full_path": str(meta.path.parent),
@@ -343,12 +416,33 @@ class LibraryReleaseService:
         if not mb_release and title:
             search_results = self.mb_client.search_release(release_title=title, artist_name=artist, limit=5)
             if search_results:
-                best_id = search_results[0].get("id")
+                best_cand = None
+                norm_target_title = normalize_text(title)
+                for cand in search_results:
+                    cand_title = normalize_text(cand.get("title", ""))
+                    if cand_title == norm_target_title:
+                        best_cand = cand
+                        break
+                if not best_cand:
+                    best_cand = search_results[0]
+                best_id = best_cand.get("id")
                 if best_id:
                     mb_release = self.mb_client.get_release_by_id(best_id, force_refresh=force_refresh)
 
         # 3. If MB release found, reconcile official tracks against local files
         if mb_release:
+            mb_artist = _format_artist_credit(mb_release.get("artist-credit")) or mb_release.get("artist-credit-phrase", "")
+            rg = mb_release.get("release-group", {})
+            rg_type = (rg.get("primary-type") or "").lower()
+            rg_sec_types = [t.lower() for t in rg.get("secondary-type-list", [])]
+            is_mb_compilation = (
+                rg_type == "compilation"
+                or "compilation" in rg_sec_types
+                or _is_va_string(mb_artist)
+                or release_data.get("is_va", False)
+            )
+            rel_artist = "Various Artists" if is_mb_compilation else (mb_artist or artist)
+
             official_tracks: List[Dict[str, Any]] = []
             media_list = mb_release.get("medium-list", [])
 
@@ -360,11 +454,15 @@ class LibraryReleaseService:
                     trk_title = rec.get("title") or trk.get("title") or "Unknown Track"
                     trk_len = trk.get("length") or rec.get("length")
                     duration_sec = round(int(trk_len) / 1000.0, 1) if trk_len else None
+                    trk_artist = _format_artist_credit(trk.get("artist-credit") or rec.get("artist-credit"))
+                    if not trk_artist:
+                        trk_artist = rel_artist
 
                     official_tracks.append({
                         "disc_number": disc_num,
                         "track_number": trk_num,
                         "title": trk_title,
+                        "artist": trk_artist,
                         "norm_title": normalize_text(trk_title),
                         "mb_recording_id": rec.get("id"),
                         "mb_track_id": trk.get("id"),
@@ -422,11 +520,14 @@ class LibraryReleaseService:
                             matched_local_indices.add(idx)
                             break
 
+                eff_trk_artist = off_trk.get("artist") or (matched_local.get("artist") if matched_local else None) or rel_artist
+
                 if matched_local:
                     reconciled_tracklist.append({
                         "disc_number": off_trk["disc_number"],
                         "track_number": off_trk["track_number"],
                         "title": off_trk["title"],
+                        "artist": eff_trk_artist,
                         "status": "found",
                         "filename": matched_local.get("filename"),
                         "path": matched_local.get("path"),
@@ -442,6 +543,7 @@ class LibraryReleaseService:
                         "disc_number": off_trk["disc_number"],
                         "track_number": off_trk["track_number"],
                         "title": off_trk["title"],
+                        "artist": eff_trk_artist,
                         "status": "missing",
                         "filename": None,
                         "path": None,
@@ -460,6 +562,7 @@ class LibraryReleaseService:
                         "disc_number": 1,
                         "track_number": lt.get("track_number") or "-",
                         "title": lt.get("title") or lt.get("filename"),
+                        "artist": lt.get("artist") or rel_artist,
                         "status": "found",
                         "filename": lt.get("filename"),
                         "path": lt.get("path"),
@@ -471,13 +574,15 @@ class LibraryReleaseService:
                         "mb_recording_id": None
                     })
 
-
             total_tracks = len(reconciled_tracklist)
             found_count = sum(1 for t in reconciled_tracklist if t["status"] == "found")
             missing_count = sum(1 for t in reconciled_tracklist if t["status"] == "missing")
             completion_pct = round((found_count / total_tracks * 100.0), 1) if total_tracks > 0 else 100.0
 
             result = dict(release_data)
+            result["artist"] = rel_artist
+            result["album_artist"] = rel_artist
+            result["is_va"] = is_mb_compilation
             result["mb_release_id"] = mb_release.get("id")
             result["mb_release_title"] = mb_release.get("title")
             result["total_tracks_expected"] = total_tracks
@@ -510,9 +615,20 @@ class LibraryReleaseService:
         if not missing_tracks:
             return {"status": "skipped", "message": "No missing tracks to download.", "queued_count": 0}
 
-        console.print(f"[cyan]Initiating Soulseek download for {len(missing_tracks)} missing tracks of '{artist} - {release_title}'...[/cyan]")
+        # Check if release is compilation / Various Artists
+        is_va = _is_va_string(artist)
+        track_artists = {
+            m.get("artist").strip()
+            for m in missing_tracks
+            if m.get("artist") and not _is_va_string(m.get("artist")) and m.get("artist").strip().lower() != "unknown artist"
+        }
+        if len(track_artists) > 1 or (len(track_artists) == 1 and not is_va and next(iter(track_artists)).lower() != artist.strip().lower()):
+            is_va = True
+
+        effective_artist = "Various Artists" if is_va else artist
+        console.print(f"[cyan]Initiating Soulseek download for {len(missing_tracks)} missing tracks of '{effective_artist} - {release_title}'...[/cyan]")
         if on_progress:
-            on_progress(10, 100, f"Searching Soulseek for album: {artist} {release_title}...")
+            on_progress(10, 100, f"Searching Soulseek for album: {effective_artist} {release_title}...")
 
         queued_files: List[Dict[str, Any]] = []
         resolved_missing: Set[str] = set()
@@ -520,9 +636,24 @@ class LibraryReleaseService:
         # -------------------------------------------------------------
         # STAGE 1: Peer Directory Album Match
         # -------------------------------------------------------------
-        album_query = f"{artist} {release_title}".strip()
-        search_res = self.slskd_client.search(query=album_query, timeout=search_timeout)
-        responses = search_res.get("responses", [])
+        if is_va:
+            album_queries = [f"VA {release_title}".strip(), f"{release_title}".strip()]
+        else:
+            album_queries = [f"{artist} {release_title}".strip()]
+
+        search_res = None
+        for q in album_queries:
+            search_res = self.slskd_client.search(query=q, timeout=search_timeout)
+            if search_res.get("responses"):
+                break
+
+        # Fallback album query if specific query yielded 0 responses
+        if (not search_res or not search_res.get("responses")) and not is_va and len(missing_tracks) >= 2 and release_title:
+            fallback_res = self.slskd_client.search(query=release_title.strip(), timeout=search_timeout)
+            if fallback_res.get("responses"):
+                search_res = fallback_res
+
+        responses = search_res.get("responses", []) if search_res else []
 
         if responses:
             if on_progress:
@@ -552,12 +683,27 @@ class LibraryReleaseService:
                         if m_title in resolved_missing:
                             continue
 
+                        is_placeholder = bool(re.match(r"^Track\s+\d+\s*\(Missing\)$", m_title, re.IGNORECASE))
+                        m_trk_num = m_trk.get("track_num_int")
                         p_missing = parse_track_title_structure(m_title)
 
                         for remote_f in d_files:
                             r_fn = remote_f.get("filename", "")
                             base_fn = os.path.basename(r_fn.replace("\\", "/"))
                             p_remote = parse_track_title_structure(base_fn)
+
+                            # If placeholder, match by track number prefix
+                            if is_placeholder and m_trk_num:
+                                trk_prefix_match = re.match(r"^0*" + str(m_trk_num) + r"[\s._\-]", base_fn)
+                                if trk_prefix_match:
+                                    to_queue_for_peer.append({
+                                        "filename": r_fn,
+                                        "size": remote_f.get("size", 0),
+                                        "title": m_title
+                                    })
+                                    resolved_missing.add(m_title)
+                                    break
+                                continue
 
                             sim = calculate_similarity(p_missing["base_norm"], p_remote["base_norm"])
                             ver_compat = are_versions_compatible(
@@ -590,12 +736,31 @@ class LibraryReleaseService:
             if on_progress:
                 on_progress(60, 100, f"Searching individual Soulseek tracks for {len(remaining_missing)} remaining items...")
 
-            track_queries = [f"{artist} - {m.get('title')}".strip() for m in remaining_missing]
-            batch_results = self.slskd_client.batch_search(track_queries, timeout=search_timeout)
+            track_queries = []
+            trk_query_map: Dict[str, Dict[str, Any]] = {}
 
-            for m_trk in remaining_missing:
+            for m in remaining_missing:
+                m_title = m.get("title", "")
+                m_artist = (m.get("artist") or "").strip()
+                if re.match(r"^Track\s+\d+\s*\(Missing\)$", m_title, re.IGNORECASE):
+                    # Cannot search Soulseek for generic "Track 02 (Missing)"
+                    continue
+
+                if m_artist and not _is_va_string(m_artist) and m_artist.lower() != "unknown artist":
+                    q = f"{m_artist} - {m_title}".strip()
+                elif is_va:
+                    q = f"{m_title}".strip()
+                else:
+                    q = f"{artist} - {m_title}".strip()
+
+                track_queries.append(q)
+                trk_query_map[q] = m
+
+            batch_results = self.slskd_client.batch_search(track_queries, timeout=search_timeout) if track_queries else {}
+
+            for q_key, m_trk in trk_query_map.items():
                 m_title = m_trk.get("title", "")
-                q_key = f"{artist} - {m_title}".strip()
+                m_artist = (m_trk.get("artist") or "").strip()
                 s_data = batch_results.get(q_key, {})
                 s_responses = s_data.get("responses", [])
 
@@ -620,7 +785,14 @@ class LibraryReleaseService:
                             p_remote["version_type"], p_remote["version_text"]
                         )
 
-                        if (p_missing["base_norm"] == p_remote["base_norm"] or sim >= 0.80) and ver_compat:
+                        artist_matched = True
+                        if m_artist and not _is_va_string(m_artist) and m_artist.lower() != "unknown artist":
+                            norm_ma = normalize_text(m_artist)
+                            norm_fn = normalize_text(base_fn)
+                            if norm_ma not in norm_fn and sim < 0.90:
+                                artist_matched = False
+
+                        if artist_matched and (p_missing["base_norm"] == p_remote["base_norm"] or sim >= 0.80) and ver_compat:
                             fmt_label, score = AudioQualityAnalyzer.determine_stream_quality(f)
                             if score > best_score:
                                 best_score = score
@@ -646,7 +818,7 @@ class LibraryReleaseService:
             on_progress(100, 100, f"Completed: Queued {len(queued_files)} missing track files.")
 
         return {
-            "artist": artist,
+            "artist": effective_artist,
             "release": release_title,
             "total_missing": len(missing_tracks),
             "queued_count": len(queued_files),
@@ -660,6 +832,7 @@ class LibraryReleaseService:
         artist: str,
         release_title: str,
         track_title: str,
+        track_artist: Optional[str] = None,
         preferred_format: str = "flac",
         search_timeout: float = 20.0,
         dry_run: bool = False
@@ -667,7 +840,19 @@ class LibraryReleaseService:
         """
         Searches Soulseek and downloads a single missing track.
         """
-        query = f"{artist} {track_title}".strip()
+        eff_artist = (track_artist or "").strip()
+        is_va = _is_va_string(artist)
+
+        if eff_artist and not _is_va_string(eff_artist) and eff_artist.lower() != "unknown artist":
+            query = f"{eff_artist} {track_title}".strip()
+            display_artist = eff_artist
+        elif is_va:
+            query = f"{track_title}".strip()
+            display_artist = "Various Artists"
+        else:
+            query = f"{artist} {track_title}".strip()
+            display_artist = artist
+
         search_res = self.slskd_client.search(query=query, timeout=search_timeout)
         responses = search_res.get("responses", [])
 
@@ -702,8 +887,8 @@ class LibraryReleaseService:
         if not best_candidate:
             return {
                 "success": False,
-                "message": f"No compatible peer matches found for '{artist} - {track_title}'.",
-                "artist": artist,
+                "message": f"No compatible peer matches found for '{display_artist} - {track_title}'.",
+                "artist": display_artist,
                 "track": track_title
             }
 
@@ -718,7 +903,7 @@ class LibraryReleaseService:
 
         return {
             "success": True,
-            "artist": artist,
+            "artist": display_artist,
             "track": track_title,
             "user": user,
             "filename": file_obj.get("filename"),

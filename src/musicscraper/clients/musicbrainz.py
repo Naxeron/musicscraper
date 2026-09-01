@@ -646,21 +646,34 @@ class MusicBrainzClient:
 
     def search_release(self, release_title: str, artist_name: Optional[str] = None, limit: int = 5) -> List[Dict[str, Any]]:
         """Searches MusicBrainz for releases matching a title and optional artist name."""
+        results: List[Dict[str, Any]] = []
+
         query_parts = []
         if release_title:
             query_parts.append(f'release:"{release_title}"')
-        if artist_name:
+        if artist_name and artist_name.strip().lower() not in ("various artists", "various", "va", "v.a."):
             query_parts.append(f'artist:"{artist_name}"')
+        elif artist_name and artist_name.strip().lower() in ("various artists", "various", "va", "v.a."):
+            query_parts.append('artist:"Various Artists"')
 
         query_str = " AND ".join(query_parts) if query_parts else release_title
         try:
             res = musicbrainzngs.search_releases(query=query_str, limit=limit)
-            return res.get('release-list', [])
+            results = res.get('release-list', [])
         except Exception:
             try:
                 res = musicbrainzngs.search_releases(release=release_title, artist=artist_name, limit=limit)
-                return res.get('release-list', [])
+                results = res.get('release-list', [])
             except Exception as e:
                 console.print(f"[yellow]Warning: MusicBrainz release search error for '{query_str}': {e}[/yellow]")
-                return []
+
+        # Fallback: If searching with a specific artist yielded no results, search by release title alone
+        if not results and artist_name and release_title:
+            try:
+                res = musicbrainzngs.search_releases(query=f'release:"{release_title}"', limit=limit)
+                results = res.get('release-list', [])
+            except Exception:
+                pass
+
+        return results
 

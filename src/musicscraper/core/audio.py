@@ -22,7 +22,8 @@ from mutagen.apev2 import APEv2
 from musicscraper.core.constants import (
     LOSSLESS_EXTENSIONS,
     LOSSY_EXTENSIONS,
-    AUDIO_EXTENSIONS
+    AUDIO_EXTENSIONS,
+    VA_DIR_MARKERS,
 )
 from musicscraper.core.text import (
     strip_track_number_and_artist,
@@ -101,6 +102,8 @@ class AudioQualityAnalyzer:
         type_name = type(mf).__name__ if mf else "Unknown"
         mime = getattr(mf, "mime", [""])[0] if (mf and hasattr(mf, "mime")) else ""
 
+        is_compilation = False
+
         # Extract Tags
         if mf and hasattr(mf, "tags") and mf.tags is not None:
             tags = mf.tags
@@ -118,11 +121,24 @@ class AudioQualityAnalyzer:
                         meta.track_number = raw_trck.split("/")[0].strip()
                     elif k_str in ("TDRC", "DATE", "YEAR", "\xa9DAY") and not meta.year:
                         meta.year = v_list[0].strip() if v_list else ""
+                    # Album Artist
                     elif k_str in (
-                        "TPE1", "TPE2", "TOPE", "ARTIST", "ALBUMARTIST",
-                        "PERFORMER", "\xa9ART", "AART"
+                        "TPE2", "ALBUMARTIST", "ALBUM ARTIST", "AART",
+                        "TXXX:ALBUMARTIST", "TXXX:ALBUM ARTIST"
+                    ) and not meta.album_artist:
+                        meta.album_artist = v_list[0].strip() if v_list else ""
+                    # Track Artist
+                    elif k_str in (
+                        "TPE1", "TOPE", "ARTIST", "PERFORMER",
+                        "\xa9ART", "TXXX:ARTIST"
                     ) and not meta.artist:
                         meta.artist = v_list[0].strip() if v_list else ""
+
+                    # Compilation flag
+                    if k_str in ("TCMP", "CPIL", "COMPILATION", "TXXX:COMPILATION"):
+                        val_str = str(v_list[0]).strip().lower() if v_list else ""
+                        if val_str in ("1", "true", "yes"):
+                            is_compilation = True
 
                     # Genres
                     if k_str in ("TCON", "GENRE", "\xa9GEN") and not meta.genres:
@@ -154,6 +170,14 @@ class AudioQualityAnalyzer:
                         except Exception:
                             pass
 
+        if is_compilation and not meta.album_artist:
+            meta.album_artist = "Various Artists"
+
+        if meta.album_artist:
+            norm_aa = meta.album_artist.strip().lower()
+            if norm_aa in VA_DIR_MARKERS or norm_aa in ("various artists", "various", "va", "v.a.", "v/a", "compilation", "compilations"):
+                meta.album_artist = "Various Artists"
+
         # Fallback metadata from filename / path hierarchy
         filename_no_ext = file_path.stem
         if not meta.title:
@@ -162,16 +186,52 @@ class AudioQualityAnalyzer:
             parent_name = file_path.parent.name
             if parent_name and parent_name.lower() not in ("music", "downloads", "library", "tracks", "singles"):
                 meta.album = parent_name
+
+        parent_name = file_path.parent.name
+        grandparent_name = file_path.parent.parent.name if file_path.parent != file_path.parent.parent else ""
+        norm_parent = parent_name.lower().strip()
+        norm_grandparent = grandparent_name.lower().strip()
+        is_va_dir = (
+            norm_parent in VA_DIR_MARKERS
+            or norm_grandparent in VA_DIR_MARKERS
+            or norm_parent.startswith("va - ")
+            or norm_parent.startswith("va-")
+            or norm_parent.startswith("va ")
+            or norm_parent.startswith("v.a. - ")
+            or norm_parent.startswith("various artists - ")
+            or norm_parent.startswith("various - ")
+            or "[va]" in norm_parent
+            or "(va)" in norm_parent
+            or norm_parent.endswith(" [va]")
+            or norm_parent.endswith(" (va)")
+        )
+        if is_va_dir and not meta.album_artist:
+            meta.album_artist = "Various Artists"
+
         if not meta.artist:
-            parent_name = file_path.parent.name
-            grandparent_name = file_path.parent.parent.name if file_path.parent != file_path.parent.parent else ""
             if " - " in parent_name:
                 parts = parent_name.split(" - ", 1)
-                meta.artist = parts[0].strip()
-                if not meta.album or meta.album == parent_name:
-                    meta.album = parts[1].strip()
+                first_part = parts[0].strip()
+                if first_part.lower() in ("va", "v.a.", "various", "various artists") or first_part.lower() in VA_DIR_MARKERS:
+                    if not meta.album_artist:
+                        meta.album_artist = "Various Artists"
+                    if not meta.album or meta.album == parent_name:
+                        meta.album = parts[1].strip()
+                else:
+                    meta.artist = first_part
+                    if not meta.album or meta.album == parent_name:
+                        meta.album = parts[1].strip()
             elif grandparent_name and grandparent_name.lower() not in ("music", "downloads", "library"):
-                meta.artist = grandparent_name
+                if grandparent_name.lower() in VA_DIR_MARKERS:
+                    if not meta.album_artist:
+                        meta.album_artist = "Various Artists"
+                else:
+                    meta.artist = grandparent_name
+
+        if meta.artist and meta.artist.strip().lower() in ("va", "v.a.", "various", "various artists"):
+            meta.artist = "Various Artists"
+            if not meta.album_artist:
+                meta.album_artist = "Various Artists"
 
         # Extract Audio Stream Specs
         if mf and hasattr(mf, "info") and mf.info is not None:

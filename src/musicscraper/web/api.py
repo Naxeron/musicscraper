@@ -737,6 +737,7 @@ def run_track_soulseek_download_task(task: BackgroundTask) -> Dict[str, Any]:
     artist = task.params.get("artist", "").strip()
     release_title = task.params.get("release_title", "").strip()
     track_title = task.params.get("track_title", "").strip()
+    track_artist = task.params.get("track_artist", "").strip()
     format_pref = task.params.get("format", "flac")
     dry_run = bool(task.params.get("dry_run", False))
     timeout = float(task.params.get("timeout", 20.0))
@@ -744,12 +745,14 @@ def run_track_soulseek_download_task(task: BackgroundTask) -> Dict[str, Any]:
     if not artist or not track_title:
         raise ValueError("Artist and track title are required.")
 
-    task.update_progress(15, f"Searching Soulseek for single track '{artist} - {track_title}'...")
+    display_name = f"{track_artist} - {track_title}" if track_artist else f"{artist} - {track_title}"
+    task.update_progress(15, f"Searching Soulseek for single track '{display_name}'...")
     service = LibraryReleaseService()
     res = service.download_single_missing_track(
         artist=artist,
         release_title=release_title,
         track_title=track_title,
+        track_artist=track_artist if track_artist else None,
         preferred_format=format_pref,
         search_timeout=timeout,
         dry_run=dry_run

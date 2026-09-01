@@ -1241,14 +1241,20 @@ function renderReleaseDetails(rel) {
       ? `<span class="text-truncate font-mono font-xs" style="max-width: 220px; display: inline-block;">${escapeHtml(t.filename || '-')}</span>`
       : '<span class="text-muted font-xs">Not in local library</span>';
 
+    const trackArtist = t.artist || rel.artist;
+    const showArtistInTitle = t.artist && (rel.artist.toLowerCase() === 'various artists' || t.artist.toLowerCase() !== rel.artist.toLowerCase());
+    const displayTitle = showArtistInTitle
+      ? `<span class="text-muted font-mono font-xs" style="margin-right: 4px;">${escapeHtml(t.artist)} -</span><strong class="${titleClass}">${escapeHtml(t.title)}</strong>`
+      : `<strong class="${titleClass}">${escapeHtml(t.title)}</strong>`;
+
     const actionButton = !isFound
-      ? `<button class="btn btn-xs btn-primary" onclick="downloadSingleMissingTrack('${escapeHtml(rel.artist)}', '${escapeHtml(rel.title)}', '${escapeHtml(t.title)}')">⚡ Download</button>`
-      : `<button class="btn btn-xs btn-outline" onclick="searchSoulseekForTrack('${escapeHtml(rel.artist)}', '${escapeHtml(t.title)}')">🔍 Search</button>`;
+      ? `<button class="btn btn-xs btn-primary" onclick="downloadSingleMissingTrack('${escapeHtml(rel.artist)}', '${escapeHtml(rel.title)}', '${escapeHtml(t.title)}', '${escapeHtml(t.artist || '')}')">⚡ Download</button>`
+      : `<button class="btn btn-xs btn-outline" onclick="searchSoulseekForTrack('${escapeHtml(trackArtist)}', '${escapeHtml(t.title)}')">🔍 Search</button>`;
 
     return `
       <tr class="${trClass}">
         <td><span class="text-muted font-mono">${t.track_number || (idx + 1)}</span></td>
-        <td><strong class="${titleClass}">${escapeHtml(t.title)}</strong></td>
+        <td>${displayTitle}</td>
         <td>${statusBadgeHtml}</td>
         <td>${formatInfo}</td>
         <td>${detailsInfo}</td>
@@ -1275,20 +1281,28 @@ async function downloadMissingForRelease(rel) {
   }, `Download Missing: ${rel.artist} - ${rel.title}`);
 }
 
-async function downloadSingleMissingTrack(artist, releaseTitle, trackTitle) {
+async function downloadSingleMissingTrack(artist, releaseTitle, trackTitle, trackArtist = '') {
   switchTab('tasks');
+  const displayName = trackArtist ? `${trackArtist} - ${trackTitle}` : `${artist} - ${trackTitle}`;
   await startTask('track_soulseek_download', {
     artist,
     release_title: releaseTitle,
     track_title: trackTitle,
+    track_artist: trackArtist,
     format: 'flac',
-  }, `Download Track: ${artist} - ${trackTitle}`);
+  }, `Download Track: ${displayName}`);
 }
 
 function searchSoulseekForTrack(artist, trackTitle) {
   switchTab('soulseek');
   const queryEl = document.getElementById('slsk-query');
-  if (queryEl) queryEl.value = `${artist} ${trackTitle}`;
+  if (queryEl) {
+    if (artist && artist.toLowerCase() !== 'various artists') {
+      queryEl.value = `${artist} ${trackTitle}`;
+    } else {
+      queryEl.value = `${trackTitle}`;
+    }
+  }
 }
 
 function searchSoulseekForSelectedRelease() {
@@ -1296,7 +1310,13 @@ function searchSoulseekForSelectedRelease() {
   const rel = AppState.selectedReleaseData;
   switchTab('soulseek');
   const queryEl = document.getElementById('slsk-query');
-  if (queryEl) queryEl.value = `${rel.artist} ${rel.title}`;
+  if (queryEl) {
+    if (rel.artist && rel.artist.toLowerCase() === 'various artists') {
+      queryEl.value = `${rel.title}`;
+    } else {
+      queryEl.value = `${rel.artist} ${rel.title}`;
+    }
+  }
 }
 
 async function auditSelectedRelease() {
