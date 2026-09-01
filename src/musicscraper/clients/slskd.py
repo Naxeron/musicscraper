@@ -169,7 +169,8 @@ class SlskdClient:
             last_data = {"id": search_id, "searchText": clean_q, "responses": []}
 
         start_time = time.time()
-        while time.time() - start_time < timeout:
+        effective_timeout = max(timeout, 28.0)
+        while time.time() - start_time < effective_timeout:
             time.sleep(poll_interval)
             try:
                 poll_resp = self._request("GET", f"/api/v0/searches/{search_id}?includeResponses=true")
@@ -184,12 +185,14 @@ class SlskdClient:
             except Exception:
                 pass
 
-        # Final poll if loop timed out before completion
-        if not (last_data.get("isComplete", False) or "Completed" in last_data.get("state", "")):
+        # Final poll or fallback to direct /responses endpoint if includeResponses was empty
+        if not last_data.get("responses") and search_id:
             try:
-                poll_resp = self._request("GET", f"/api/v0/searches/{search_id}?includeResponses=true")
-                if poll_resp.status_code == 200:
-                    last_data = poll_resp.json()
+                r_resp = self._request("GET", f"/api/v0/searches/{search_id}/responses")
+                if r_resp.status_code == 200:
+                    r_list = r_resp.json()
+                    if r_list:
+                        last_data["responses"] = r_list
             except Exception:
                 pass
 
@@ -331,7 +334,17 @@ class SlskdClient:
         resp = self._request("GET", f"/api/v0/searches/{search_id}?includeResponses=true")
         if resp.status_code != 200:
             raise SlskdAPIError(f"Failed to get search results for {search_id}: {resp.text}")
-        return resp.json()
+        data = resp.json()
+        if not data.get("responses"):
+            try:
+                r_resp = self._request("GET", f"/api/v0/searches/{search_id}/responses")
+                if r_resp.status_code == 200:
+                    r_list = r_resp.json()
+                    if r_list:
+                        data["responses"] = r_list
+            except Exception:
+                pass
+        return data
 
     def delete_search(self, search_id: str) -> bool:
         """Deletes a search from slskd memory."""

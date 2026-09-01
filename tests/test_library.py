@@ -496,3 +496,134 @@ def test_download_single_missing_track_with_track_artist():
     query = slsk_mock.search.call_args[1]["query"]
     assert query == "Venetian Snares Amen Terror"
 
+
+def test_download_single_missing_track_va_without_track_artist():
+    """Verifies that downloading a single track on a VA release without a track artist queries 'Various Artists <Track Title>'."""
+    mb_mock = MagicMock()
+    slsk_mock = MagicMock()
+    service = LibraryReleaseService(mb_client=mb_mock, slskd_client=slsk_mock)
+
+    slsk_mock.search.return_value = {
+        "responses": [{
+            "username": "CompilationHoarder",
+            "files": [{"filename": "Music\\VA - Amen Destroyer\\05 - Hard Track.flac", "size": 30000000}]
+        }]
+    }
+
+    res = service.download_single_missing_track(
+        artist="Various Artists",
+        release_title="Amen Destroyer",
+        track_title="Hard Track",
+        track_artist=None,
+        dry_run=False
+    )
+
+    assert res["success"] is True
+    assert res["artist"] == "Various Artists"
+    slsk_mock.search.assert_called_once()
+    query = slsk_mock.search.call_args[1]["query"]
+    assert query == "Various Artists Hard Track"
+
+
+def test_scan_library_unifies_mbid_tagged_track_with_untagged_downloads(tmp_path):
+    """Verifies that an album with 1 MBID-tagged track in Library/ and untagged tracks in downloads/ unifies into one release."""
+    music_dir = tmp_path / "music"
+    lib_dir = music_dir / "Library" / "Various Artists" / "新しいフォルダー (10)"
+    dl_dir = music_dir / "downloads" / "Various Artitsts - 新しいフォルダー (10)"
+    lib_dir.mkdir(parents=True)
+    dl_dir.mkdir(parents=True)
+
+    f1 = lib_dir / "30 exnoiz - re_Control.flac"
+    f2 = dl_dir / "01 DJ - Track 1.flac"
+    f3 = dl_dir / "02 Producer - Track 2.flac"
+    f1.write_text("dummy")
+    f2.write_text("dummy")
+    f3.write_text("dummy")
+
+    cache_db = tmp_path / "cache.db"
+    cache = UnifiedCacheManager(db_path=cache_db)
+
+    # Track in Library/ has MBID tag
+    cache.store_audio_metadata(AudioMetadata(
+        path=f1,
+        title="re_Control",
+        artist="exnoiz",
+        album_artist="Various Artists",
+        album="新しいフォルダー (10)",
+        track_number="30/30",
+        format_label="FLAC",
+        mb_release_ids={"062bbccc-346a-49af-b4c8-3037db346d56"}
+    ))
+    # Tracks in downloads/ do NOT have MBID tag and have "Various Artitsts" typo in album artist
+    cache.store_audio_metadata(AudioMetadata(
+        path=f2,
+        title="Track 1",
+        artist="DJ",
+        album_artist="Various Artitsts",
+        album="新しいフォルダー (10)",
+        track_number="1/30",
+        format_label="FLAC"
+    ))
+    cache.store_audio_metadata(AudioMetadata(
+        path=f3,
+        title="Track 2",
+        artist="Producer",
+        album_artist="Various Artitsts",
+        album="新しいフォルダー (10)",
+        track_number="2/30",
+        format_label="FLAC"
+    ))
+
+    service = LibraryReleaseService(cache_manager=cache)
+    releases = service.scan_library_releases(library_dir=music_dir, force_rescan=False)
+
+    # Must be unified into exactly ONE release, NOT split into two
+    matching = [r for r in releases if r["title"] == "新しいフォルダー (10)"]
+    assert len(matching) == 1
+    rel = matching[0]
+    assert rel["artist"] == "Various Artists"
+    assert rel["found_count"] == 3
+    assert rel["mb_release_id"] == "062bbccc-346a-49af-b4c8-3037db346d56"
+    assert "Library" in rel["folder_path"]
+
+
+def test_download_single_missing_track_resolves_placeholder_title():
+    """Verifies that downloading a placeholder 'Track 01 (Missing)' resolves the official title via MusicBrainz."""
+    mb_mock = MagicMock()
+    slsk_mock = MagicMock()
+    service = LibraryReleaseService(mb_client=mb_mock, slskd_client=slsk_mock)
+
+    # MusicBrainz search returns release
+    mb_mock.search_release.return_value = [{"id": "mb-rel-1", "title": "propa bo! EP"}]
+    mb_mock.get_release_by_id.return_value = {
+        "id": "mb-rel-1",
+        "title": "propa bo! EP",
+        "artist-credit": [{"name": "goreshit"}],
+        "medium-list": [{
+            "position": 1,
+            "track-list": [
+                {"number": "1", "recording": {"title": "take you"}},
+                {"number": "2", "recording": {"title": "propa bo!"}}
+            ]
+        }]
+    }
+
+    slsk_mock.search.return_value = {
+        "responses": [{
+            "username": "peer1",
+            "files": [{"filename": "goreshit\\propa bo! EP\\01 take you.flac", "size": 20000000}]
+        }]
+    }
+
+    res = service.download_single_missing_track(
+        artist="goreshit",
+        release_title="propa bo! EP",
+        track_title="Track 01 (Missing)",
+        dry_run=True
+    )
+
+    assert res["success"] is True
+    assert res["track"] == "take you"
+    slsk_mock.search.assert_called_once()
+    assert slsk_mock.search.call_args[1]["query"] == "goreshit take you"
+

@@ -2,6 +2,7 @@
 API controllers and service orchestrator wrappers for MusicScraper Web GUI.
 """
 
+import hashlib
 import os
 import time
 from pathlib import Path
@@ -211,7 +212,12 @@ def browse_library(subpath: str = "") -> Dict[str, Any]:
 _library_releases_cache: Dict[str, Any] = {"timestamp": 0, "releases": []}
 
 
-def get_library_releases(refresh: bool = False, search: str = "", filter_mode: str = "all") -> Dict[str, Any]:
+def get_library_releases(
+    refresh: bool = False,
+    force_disk_rescan: bool = False,
+    search: str = "",
+    filter_mode: str = "all"
+) -> Dict[str, Any]:
     """Scans and retrieves all releases present in the music library."""
     global _library_releases_cache
     from musicscraper.services.library import LibraryReleaseService
@@ -219,7 +225,7 @@ def get_library_releases(refresh: bool = False, search: str = "", filter_mode: s
     now = time.time()
     if refresh or not _library_releases_cache["releases"] or (now - _library_releases_cache["timestamp"] > 300):
         service = LibraryReleaseService()
-        releases = service.scan_library_releases(force_rescan=refresh)
+        releases = service.scan_library_releases(force_rescan=force_disk_rescan)
         _library_releases_cache = {"timestamp": now, "releases": releases}
 
     all_releases = _library_releases_cache["releases"]
@@ -265,20 +271,22 @@ def get_library_release_details(release_id: str, audit: bool = True, force_refre
     global _library_releases_cache
     from musicscraper.services.library import LibraryReleaseService
 
-    if not _library_releases_cache["releases"]:
-        get_library_releases()
+    if force_refresh or not _library_releases_cache["releases"]:
+        get_library_releases(refresh=True, force_disk_rescan=False)
 
     matched_rel = None
     for idx, r in enumerate(_library_releases_cache["releases"]):
-        if r.get("id") == release_id or r.get("mb_release_id") == release_id:
+        mb_legacy_id = hashlib.md5(f"mb_{r.get('mb_release_id')}".encode()).hexdigest()[:16] if r.get("mb_release_id") else None
+        if r.get("id") == release_id or r.get("mb_release_id") == release_id or mb_legacy_id == release_id:
             matched_rel = r
             break
 
-    if not matched_rel:
+    if not matched_rel and not force_refresh:
         # Fallback to fresh scan
-        get_library_releases(refresh=True)
+        get_library_releases(refresh=True, force_disk_rescan=False)
         for idx, r in enumerate(_library_releases_cache["releases"]):
-            if r.get("id") == release_id or r.get("mb_release_id") == release_id:
+            mb_legacy_id = hashlib.md5(f"mb_{r.get('mb_release_id')}".encode()).hexdigest()[:16] if r.get("mb_release_id") else None
+            if r.get("id") == release_id or r.get("mb_release_id") == release_id or mb_legacy_id == release_id:
                 matched_rel = r
                 break
 
@@ -290,7 +298,7 @@ def get_library_release_details(release_id: str, audit: bool = True, force_refre
         audited = service.audit_release(matched_rel, force_refresh=force_refresh)
         # Update cache in place
         for idx, r in enumerate(_library_releases_cache["releases"]):
-            if r.get("id") == release_id:
+            if r.get("id") == matched_rel.get("id") or r.get("id") == release_id:
                 _library_releases_cache["releases"][idx] = audited
                 break
         return audited
@@ -775,30 +783,33 @@ def run_track_soulseek_download_task(task: BackgroundTask) -> Dict[str, Any]:
     release_title = task.params.get("release_title", "").strip()
     track_title = task.params.get("track_title", "").strip()
     track_artist = task.params.get("track_artist", "").strip()
+    track_number = task.params.get("track_number")
     format_pref = task.params.get("format", "flac")
     dry_run = bool(task.params.get("dry_run", False))
-    timeout = float(task.params.get("timeout", 20.0))
+    timeout = float(task.params.get("timeout", 28.0))
 
     if not artist or not track_title:
         raise ValueError("Artist and track title are required.")
 
+    service = LibraryReleaseService()
     display_name = f"{track_artist} - {track_title}" if track_artist else f"{artist} - {track_title}"
     task.update_progress(15, f"Searching Soulseek for single track '{display_name}'...")
-    service = LibraryReleaseService()
     res = service.download_single_missing_track(
         artist=artist,
         release_title=release_title,
         track_title=track_title,
         track_artist=track_artist if track_artist else None,
+        track_number=track_number,
         preferred_format=format_pref,
         search_timeout=timeout,
         dry_run=dry_run
     )
 
+    actual_track = res.get("track", track_title)
     if res.get("success"):
-        task.update_progress(100, f"Queued '{track_title}' from peer '{res.get('user')}'.")
+        task.update_progress(100, f"Queued '{actual_track}' from peer '{res.get('user')}'.")
     else:
-        task.update_progress(100, f"No peer candidates found for '{track_title}'.")
+        task.update_progress(100, res.get("message") or f"No peer candidates found for '{actual_track}'.")
 
     return res
 

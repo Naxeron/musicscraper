@@ -59,6 +59,7 @@ def _is_va_string(name: Optional[str]) -> bool:
     return (
         norm in VA_DIR_MARKERS
         or norm in ("various artists", "various", "va", "v.a.", "v/a", "compilation", "compilations")
+        or bool(re.match(r"^v(?:arious|\.)?\s*arti[st]{2,4}s?$", norm))
     )
 
 
@@ -66,20 +67,16 @@ def _is_va_directory(path: Path) -> bool:
     """Checks if a folder name or parent directory path matches compilation / VA patterns."""
     p_name = path.name.lower().strip()
     gp_name = path.parent.name.lower().strip() if path.parent != path else ""
-    return (
-        p_name in VA_DIR_MARKERS
-        or gp_name in VA_DIR_MARKERS
-        or p_name.startswith("va - ")
-        or p_name.startswith("va-")
-        or p_name.startswith("va ")
-        or p_name.startswith("v.a. - ")
-        or p_name.startswith("various artists - ")
-        or p_name.startswith("various - ")
-        or "[va]" in p_name
-        or "(va)" in p_name
-        or p_name.endswith(" [va]")
-        or p_name.endswith(" (va)")
-    )
+    for name in (p_name, gp_name):
+        if name in VA_DIR_MARKERS:
+            return True
+        if bool(re.match(r"^(?:va|v\.a\.|various\s*arti[st]{2,4}s?)\b", name)):
+            return True
+        if name.startswith(("va - ", "va-", "va ", "v.a. - ", "various artists - ", "various - ", "[va]", "(va)")):
+            return True
+        if "[va]" in name or "(va)" in name or name.endswith(" [va]") or name.endswith(" (va)"):
+            return True
+    return False
 
 
 class LibraryReleaseService:
@@ -193,12 +190,17 @@ class LibraryReleaseService:
             mb_rel_id = next(iter(meta.mb_release_ids)) if meta.mb_release_ids else None
 
             # Generate unique release key
-            if mb_rel_id:
-                rel_key = f"mb_{mb_rel_id}"
-            elif is_va:
-                rel_key = f"va_{norm_album}::{hashlib.md5(folder.encode()).hexdigest()[:8]}"
+            if is_va:
+                if norm_album and norm_album not in ("", "unknown album", "unknown", "untitled", "album"):
+                    rel_key = f"va_{norm_album}"
+                elif mb_rel_id:
+                    rel_key = f"mb_{mb_rel_id}"
+                else:
+                    rel_key = f"dir_{hashlib.md5(folder.encode()).hexdigest()[:12]}"
             elif norm_artist and norm_album:
                 rel_key = f"art_alb_{norm_artist}::{norm_album}"
+            elif mb_rel_id:
+                rel_key = f"mb_{mb_rel_id}"
             else:
                 rel_key = f"dir_{hashlib.md5(folder.encode()).hexdigest()[:12]}"
 
@@ -229,8 +231,22 @@ class LibraryReleaseService:
                     "missing_count": 0,
                     "completion_pct": 100.0,
                 }
+            else:
+                rel = releases_map[rel_key]
+                try:
+                    curr_folder = str(meta.path.parent.relative_to(lib_path))
+                except Exception:
+                    curr_folder = str(meta.path.parent)
+                # If existing folder is in 'downloads' but this track is in a proper library folder, prefer library folder
+                if "download" in rel["folder_path"].lower() and "download" not in curr_folder.lower():
+                    rel["folder_path"] = curr_folder
+                    rel["full_path"] = str(meta.path.parent)
+                if mb_rel_id and not rel.get("mb_release_id"):
+                    rel["mb_release_id"] = mb_rel_id
 
             rel = releases_map[rel_key]
+            if mb_rel_id and not rel.get("mb_release_id"):
+                rel["mb_release_id"] = mb_rel_id
             fmt_label = meta.format_label or meta.file_type.lstrip(".").upper()
             if fmt_label:
                 rel["formats"].add(fmt_label)
@@ -293,7 +309,19 @@ class LibraryReleaseService:
         # 4. Finalize release metrics, perform gap analysis & sort tracks
         release_list: List[Dict[str, Any]] = []
         for rel in releases_map.values():
-            found_tracks = list(rel["tracks"])
+            # Deduplicate multiple files for the same track (e.g. file in Library/ and file in downloads/)
+            deduped_found: Dict[Any, Dict[str, Any]] = {}
+            for t in rel["tracks"]:
+                d_key = (t["track_num_int"], normalize_text(t["title"])) if t["track_num_int"] is not None else normalize_text(t["title"])
+                if d_key not in deduped_found:
+                    deduped_found[d_key] = t
+                else:
+                    existing = deduped_found[d_key]
+                    existing_is_lib = "download" not in (existing.get("path") or "").lower()
+                    new_is_lib = "download" not in (t.get("path") or "").lower()
+                    if (new_is_lib and not existing_is_lib) or (new_is_lib == existing_is_lib and (t.get("quality_score", 0) > existing.get("quality_score", 0))):
+                        deduped_found[d_key] = t
+            found_tracks = list(deduped_found.values())
             found_nums = {t["track_num_int"] for t in found_tracks if t["track_num_int"] is not None and t["track_num_int"] > 0}
 
             max_trk_num = max(found_nums) if found_nums else 0
@@ -625,6 +653,26 @@ class LibraryReleaseService:
         if len(track_artists) > 1 or (len(track_artists) == 1 and not is_va and next(iter(track_artists)).lower() != artist.strip().lower()):
             is_va = True
 
+        # Check if any missing tracks have placeholder names like "Track 01 (Missing)"
+        has_generic_placeholders = any(
+            re.match(r"^Track\s+\d+\s*\(Missing\)$", m.get("title", ""), re.IGNORECASE)
+            for m in missing_tracks
+        )
+        if has_generic_placeholders and release_title:
+            try:
+                stub_rel = {
+                    "artist": artist,
+                    "title": release_title,
+                    "tracks": missing_tracks,
+                    "total_tracks_expected": len(missing_tracks),
+                }
+                audited = self.audit_release(stub_rel)
+                audited_missing = [t for t in audited.get("tracks", []) if t.get("status") == "missing"]
+                if audited_missing and not any(re.match(r"^Track\s+\d+\s*\(Missing\)$", t.get("title", ""), re.IGNORECASE) for t in audited_missing):
+                    missing_tracks = audited_missing
+            except Exception as e:
+                console.print(f"[yellow]Could not auto-resolve placeholder track titles: {e}[/yellow]")
+
         effective_artist = "Various Artists" if is_va else artist
         console.print(f"[cyan]Initiating Soulseek download for {len(missing_tracks)} missing tracks of '{effective_artist} - {release_title}'...[/cyan]")
         if on_progress:
@@ -637,7 +685,11 @@ class LibraryReleaseService:
         # STAGE 1: Peer Directory Album Match
         # -------------------------------------------------------------
         if is_va:
-            album_queries = [f"VA {release_title}".strip(), f"{release_title}".strip()]
+            album_queries = [
+                f"Various Artists {release_title}".strip(),
+                f"{release_title}".strip(),
+                f"VA {release_title}".strip(),
+            ]
         else:
             album_queries = [f"{artist} {release_title}".strip()]
 
@@ -649,9 +701,11 @@ class LibraryReleaseService:
 
         # Fallback album query if specific query yielded 0 responses
         if (not search_res or not search_res.get("responses")) and not is_va and len(missing_tracks) >= 2 and release_title:
-            fallback_res = self.slskd_client.search(query=release_title.strip(), timeout=search_timeout)
-            if fallback_res.get("responses"):
-                search_res = fallback_res
+            for fallback_q in (f"Various Artists {release_title}".strip(), release_title.strip()):
+                fallback_res = self.slskd_client.search(query=fallback_q, timeout=search_timeout)
+                if fallback_res.get("responses"):
+                    search_res = fallback_res
+                    break
 
         responses = search_res.get("responses", []) if search_res else []
 
@@ -749,7 +803,7 @@ class LibraryReleaseService:
                 if m_artist and not _is_va_string(m_artist) and m_artist.lower() != "unknown artist":
                     q = f"{m_artist} - {m_title}".strip()
                 elif is_va:
-                    q = f"{m_title}".strip()
+                    q = f"Various Artists {m_title}".strip()
                 else:
                     q = f"{artist} - {m_title}".strip()
 
@@ -833,13 +887,47 @@ class LibraryReleaseService:
         release_title: str,
         track_title: str,
         track_artist: Optional[str] = None,
+        track_number: Optional[Union[int, str]] = None,
         preferred_format: str = "flac",
-        search_timeout: float = 20.0,
+        search_timeout: float = 28.0,
         dry_run: bool = False
     ) -> Dict[str, Any]:
         """
         Searches Soulseek and downloads a single missing track.
         """
+        # Auto-resolve placeholder titles like "Track 01 (Missing)" via MusicBrainz audit
+        m_match = re.match(r"^Track\s+(\d+)\s*\(Missing\)$", track_title, re.IGNORECASE)
+        t_num = track_number or (int(m_match.group(1)) if m_match else None)
+        if (m_match or not track_title or "missing" in track_title.lower()) and release_title:
+            try:
+                stub_rel = {
+                    "artist": artist,
+                    "title": release_title,
+                    "tracks": [],
+                    "total_tracks_expected": 0,
+                }
+                audited = self.audit_release(stub_rel)
+                for trk in audited.get("tracks", []):
+                    trk_idx = trk.get("track_num_int") or trk.get("track_number")
+                    if t_num and str(trk_idx) == str(t_num):
+                        if trk.get("title") and not re.match(r"^Track\s+\d+\s*\(Missing\)$", trk["title"], re.IGNORECASE):
+                            resolved_title = trk["title"]
+                            console.print(f"[green]Resolved placeholder '{track_title}' to '{resolved_title}' via MusicBrainz[/green]")
+                            track_title = resolved_title
+                            if not track_artist and trk.get("artist"):
+                                track_artist = trk.get("artist")
+                            break
+            except Exception as e:
+                console.print(f"[yellow]Could not auto-resolve placeholder track '{track_title}': {e}[/yellow]")
+
+        if re.match(r"^Track\s+\d+\s*\(Missing\)$", track_title, re.IGNORECASE):
+            return {
+                "success": False,
+                "message": f"Cannot download generic placeholder '{track_title}'. Please audit the release with MusicBrainz to resolve track titles.",
+                "artist": artist,
+                "track": track_title
+            }
+
         eff_artist = (track_artist or "").strip()
         is_va = _is_va_string(artist)
 
@@ -847,7 +935,7 @@ class LibraryReleaseService:
             query = f"{eff_artist} {track_title}".strip()
             display_artist = eff_artist
         elif is_va:
-            query = f"{track_title}".strip()
+            query = f"Various Artists {track_title}".strip()
             display_artist = "Various Artists"
         else:
             query = f"{artist} {track_title}".strip()
@@ -855,6 +943,12 @@ class LibraryReleaseService:
 
         search_res = self.slskd_client.search(query=query, timeout=search_timeout)
         responses = search_res.get("responses", [])
+
+        # Fallback if "Various Artists {track_title}" yielded 0 responses
+        if not responses and is_va and not eff_artist:
+            fallback_res = self.slskd_client.search(query=track_title.strip(), timeout=search_timeout)
+            if fallback_res.get("responses"):
+                responses = fallback_res.get("responses", [])
 
         best_candidate: Optional[Tuple[str, Dict[str, Any]]] = None
         best_score = -1

@@ -175,7 +175,11 @@ class AudioQualityAnalyzer:
 
         if meta.album_artist:
             norm_aa = meta.album_artist.strip().lower()
-            if norm_aa in VA_DIR_MARKERS or norm_aa in ("various artists", "various", "va", "v.a.", "v/a", "compilation", "compilations"):
+            if (
+                norm_aa in VA_DIR_MARKERS
+                or norm_aa in ("various artists", "various", "va", "v.a.", "v/a", "compilation", "compilations")
+                or bool(re.match(r"^v(?:arious|\.)?\s*arti[st]{2,4}s?$", norm_aa))
+            ):
                 meta.album_artist = "Various Artists"
 
         # Fallback metadata from filename / path hierarchy
@@ -194,6 +198,8 @@ class AudioQualityAnalyzer:
         is_va_dir = (
             norm_parent in VA_DIR_MARKERS
             or norm_grandparent in VA_DIR_MARKERS
+            or bool(re.match(r"^(?:va|v\.a\.|various\s*arti[st]{2,4}s?)\b", norm_parent))
+            or bool(re.match(r"^(?:va|v\.a\.|various\s*arti[st]{2,4}s?)\b", norm_grandparent))
             or norm_parent.startswith("va - ")
             or norm_parent.startswith("va-")
             or norm_parent.startswith("va ")
@@ -212,7 +218,11 @@ class AudioQualityAnalyzer:
             if " - " in parent_name:
                 parts = parent_name.split(" - ", 1)
                 first_part = parts[0].strip()
-                if first_part.lower() in ("va", "v.a.", "various", "various artists") or first_part.lower() in VA_DIR_MARKERS:
+                if (
+                    first_part.lower() in ("va", "v.a.", "various", "various artists")
+                    or first_part.lower() in VA_DIR_MARKERS
+                    or bool(re.match(r"^v(?:arious|\.)?\s*arti[st]{2,4}s?$", first_part.lower()))
+                ):
                     if not meta.album_artist:
                         meta.album_artist = "Various Artists"
                     if not meta.album or meta.album == parent_name:
@@ -222,13 +232,19 @@ class AudioQualityAnalyzer:
                     if not meta.album or meta.album == parent_name:
                         meta.album = parts[1].strip()
             elif grandparent_name and grandparent_name.lower() not in ("music", "downloads", "library"):
-                if grandparent_name.lower() in VA_DIR_MARKERS:
+                if (
+                    grandparent_name.lower() in VA_DIR_MARKERS
+                    or bool(re.match(r"^v(?:arious|\.)?\s*arti[st]{2,4}s?$", grandparent_name.lower()))
+                ):
                     if not meta.album_artist:
                         meta.album_artist = "Various Artists"
                 else:
                     meta.artist = grandparent_name
 
-        if meta.artist and meta.artist.strip().lower() in ("va", "v.a.", "various", "various artists"):
+        if meta.artist and (
+            meta.artist.strip().lower() in ("va", "v.a.", "various", "various artists")
+            or bool(re.match(r"^v(?:arious|\.)?\s*arti[st]{2,4}s?$", meta.artist.strip().lower()))
+        ):
             meta.artist = "Various Artists"
             if not meta.album_artist:
                 meta.album_artist = "Various Artists"

@@ -1077,9 +1077,24 @@ async function loadLibraryReleases(refresh = false) {
 
     renderReleasesList();
 
-    // If an existing release was selected, ensure it remains rendered
-    if (AppState.selectedReleaseId && AppState.selectedReleaseData && AppState.selectedReleaseData.id === AppState.selectedReleaseId) {
-      renderReleaseDetails(AppState.selectedReleaseData);
+    // If an existing release was selected, ensure it remains rendered and updated with new data
+    if (AppState.selectedReleaseId) {
+      let updated = (data.releases || []).find((r) => r.id === AppState.selectedReleaseId);
+      if (!updated && AppState.selectedReleaseData) {
+        // Fallback match by title and artist in case ID shifted due to unification
+        updated = (data.releases || []).find(
+          (r) => r.title === AppState.selectedReleaseData.title && r.artist === AppState.selectedReleaseData.artist
+        );
+      }
+      if (updated) {
+        AppState.selectedReleaseId = updated.id;
+        AppState.selectedReleaseData = updated;
+        renderReleaseDetails(updated);
+        // Refresh full audited details in background to ensure tracks match latest disk scan
+        selectLibraryRelease(updated.id, true);
+      } else if (AppState.selectedReleaseData) {
+        renderReleaseDetails(AppState.selectedReleaseData);
+      }
     }
   } catch (err) {
     console.error('Error loading library releases:', err);
@@ -1269,8 +1284,9 @@ function renderReleaseDetails(rel) {
       ? `<span class="text-muted font-mono font-xs" style="margin-right: 4px;">${escapeHtml(t.artist)} -</span><strong class="${titleClass}">${escapeHtml(t.title)}</strong>`
       : `<strong class="${titleClass}">${escapeHtml(t.title)}</strong>`;
 
+    const trkNum = t.track_number || t.track_num_int || (idx + 1);
     const actionButton = !isFound
-      ? `<button class="btn btn-xs btn-primary" onclick="downloadSingleMissingTrack('${escapeHtml(rel.artist)}', '${escapeHtml(rel.title)}', '${escapeHtml(t.title)}', '${escapeHtml(t.artist || '')}')">⚡ Download</button>`
+      ? `<button class="btn btn-xs btn-primary" onclick="downloadSingleMissingTrack('${escapeHtml(rel.artist)}', '${escapeHtml(rel.title)}', '${escapeHtml(t.title)}', '${escapeHtml(t.artist || '')}', '${escapeHtml(trkNum)}')">⚡ Download</button>`
       : `<button class="btn btn-xs btn-outline" onclick="searchSoulseekForTrack('${escapeHtml(trackArtist)}', '${escapeHtml(t.title)}')">🔍 Search</button>`;
 
     return `
@@ -1288,7 +1304,12 @@ function renderReleaseDetails(rel) {
 
 async function downloadMissingForRelease(rel) {
   if (!rel) return;
-  const missingTracks = (rel.tracks || []).filter((t) => t.status === 'missing');
+  // Use audited details from AppState if available to ensure accurate track titles
+  let currentRel = rel;
+  if (AppState.selectedReleaseData && AppState.selectedReleaseData.id === rel.id && AppState.selectedReleaseData.tracks) {
+    currentRel = AppState.selectedReleaseData;
+  }
+  const missingTracks = (currentRel.tracks || []).filter((t) => t.status === 'missing');
   if (missingTracks.length === 0) {
     alert('All tracks for this release are already present in the library!');
     return;
@@ -1296,14 +1317,25 @@ async function downloadMissingForRelease(rel) {
 
   switchTab('tasks');
   await startTask('release_missing_download', {
-    artist: rel.artist,
-    release_title: rel.title,
+    artist: currentRel.artist,
+    release_title: currentRel.title,
     missing_tracks: missingTracks,
     format: 'flac',
-  }, `Download Missing: ${rel.artist} - ${rel.title}`);
+  }, `Download Missing: ${currentRel.artist} - ${currentRel.title}`);
 }
 
-async function downloadSingleMissingTrack(artist, releaseTitle, trackTitle, trackArtist = '') {
+async function downloadSingleMissingTrack(artist, releaseTitle, trackTitle, trackArtist = '', trackNumber = null) {
+  // If trackTitle is still a generic placeholder, check if audited data is available
+  if (/^Track\s+\d+\s*\(Missing\)$/i.test(trackTitle) && AppState.selectedReleaseData && AppState.selectedReleaseData.tracks) {
+    const match = AppState.selectedReleaseData.tracks.find(
+      (t) => String(t.track_number) === String(trackNumber) || String(t.track_num_int) === String(trackNumber)
+    );
+    if (match && match.title && !/^Track\s+\d+\s*\(Missing\)$/i.test(match.title)) {
+      trackTitle = match.title;
+      if (!trackArtist && match.artist) trackArtist = match.artist;
+    }
+  }
+
   switchTab('tasks');
   const displayName = trackArtist ? `${trackArtist} - ${trackTitle}` : `${artist} - ${trackTitle}`;
   await startTask('track_soulseek_download', {
@@ -1311,6 +1343,7 @@ async function downloadSingleMissingTrack(artist, releaseTitle, trackTitle, trac
     release_title: releaseTitle,
     track_title: trackTitle,
     track_artist: trackArtist,
+    track_number: trackNumber,
     format: 'flac',
   }, `Download Track: ${displayName}`);
 }
@@ -1322,7 +1355,7 @@ function searchSoulseekForTrack(artist, trackTitle) {
     if (artist && artist.toLowerCase() !== 'various artists') {
       queryEl.value = `${artist} ${trackTitle}`;
     } else {
-      queryEl.value = `${trackTitle}`;
+      queryEl.value = `Various Artists ${trackTitle}`;
     }
   }
 }
@@ -1333,8 +1366,8 @@ function searchSoulseekForSelectedRelease() {
   switchTab('soulseek');
   const queryEl = document.getElementById('slsk-query');
   if (queryEl) {
-    if (rel.artist && rel.artist.toLowerCase() === 'various artists') {
-      queryEl.value = `${rel.title}`;
+    if (rel.artist && (rel.artist.toLowerCase() === 'various artists' || rel.is_va)) {
+      queryEl.value = `Various Artists ${rel.title}`;
     } else {
       queryEl.value = `${rel.artist} ${rel.title}`;
     }
@@ -1355,14 +1388,21 @@ async function auditSelectedRelease() {
     if (res.ok) {
       const data = await res.json();
       if (data.release) {
+        AppState.selectedReleaseId = data.release.id;
+        AppState.selectedReleaseData = data.release;
         renderReleaseDetails(data.release);
         // Refresh master list item
-        const idx = AppState.libraryReleases.findIndex((r) => r.id === relId);
+        const idx = AppState.libraryReleases.findIndex((r) => r.id === data.release.id || r.id === relId);
         if (idx !== -1) {
           AppState.libraryReleases[idx] = data.release;
-          renderReleasesList();
+        } else {
+          AppState.libraryReleases.push(data.release);
         }
+        renderReleasesList();
       }
+    } else {
+      const errData = await res.json().catch(() => ({}));
+      alert(`Audit error: ${errData.error || res.statusText}`);
     }
   } catch (err) {
     alert(`Audit error: ${err.message}`);
@@ -1408,3 +1448,7 @@ function downloadText(text, filename) {
   el.click();
   el.remove();
 }
+
+// Global aliases for legacy / inline event handlers
+window.selectRelease = selectLibraryRelease;
+window.selectLibraryRelease = selectLibraryRelease;

@@ -62,9 +62,10 @@ Guidelines and invariants for audio file discovery, metadata tag parsing, persis
   - Dispatch searches in controlled chunks (e.g. up to 8 concurrent) to balance speed and prevent slskd internal queue starvation (`state: Queued`).
 - **slskd Search Polling & Completion Invariants**:
   - In slskd REST API (v0), `GET /api/v0/searches/{id}?includeResponses=true` returns an empty `responses: []` array while `isComplete` is `False` (`state: InProgress`), regardless of `responseCount` or `fileCount`.
+  - Always query `GET /api/v0/searches/{id}/responses` as a direct fallback whenever `includeResponses=true` yields an empty responses array. The `/responses` endpoint streams live incoming peer responses in real-time even before search completion.
   - Never terminate search polling loops prematurely based on intermediate response counts or timers before `isComplete` is `True` (or `"Completed" in state`).
   - Newly dispatched (cold) searches must be polled across an adaptive observation window (minimum 5–6s) before evaluating completion, ensuring peer responses on the distributed P2P network are not prematurely truncated.
-  - Default search timeouts must be set to $\ge 25\text{s}$ (e.g. 25–30s) to allow Soulseek distributed network responses to fully arrive and complete.
+  - Default search timeouts must be set to $\ge 28\text{s}$ (e.g. 28–30s) for both single-track and batch searches to allow Soulseek distributed network responses to fully arrive and complete.
   - In-progress searches identified during `use_existing` checks must be attached by their existing ID and polled to completion rather than queried immediately for responses or re-dispatched as duplicates.
 - **Search Result State & Stale Search Purging**:
   - Clean up stale 0-file/timed-out searches from slskd history before initiating fresh batches.
@@ -122,6 +123,42 @@ Guidelines and invariants for audio file discovery, metadata tag parsing, persis
 ## 10. Multi-Lingual & Numeric Title Normalization
 - **Kanji Numeral Parsing**: Catalog track titles with Japanese Kanji numbers (e.g. `九十四`, `一`, `十`) must be converted to Arabic digits (`94`) during normalization to ensure alignment with standard numeric file tags.
 - **Purely Numeric Track Title Safety**: Track-number stripping routines (`strip_track_number_and_artist`) must never strip purely numeric titles (e.g., `"94"`, `"1999"`, `"007"`) down to empty strings. If stripping leaves an empty string, fall back to the original non-extension filename.
+
+## 11. Compilation & Various Artists Release Invariants
+- **Album Artist & Compilation Flag Extraction**:
+  - `AudioQualityAnalyzer` must extract `album_artist` from exact frames (`TPE2`, `ALBUMARTIST`, `aART`) and compilation flags (`TCMP`, `cpil`, `COMPILATION`).
+  - Standardize all compilation aliases (`va`, `v.a.`, `various`, `various artists`, `compilation`) to `"Various Artists"`.
+  - Normalize typo variations on peer folders and tags (e.g. `"Various Artitsts"`, `"Various Artist"`, `"V. Artists"`) via regex `^v(?:arious|\.)?\s*arti[st]{2,4}s?$`.
+- **Contributing Track Independence**:
+  - Never allow a single contributing artist track to define the release-level artist on a compilation or multi-artist directory.
+  - In compilation releases, individual tracks must always retain their true track-level artist credits (`artist-credit` from tags or MusicBrainz).
+- **Soulseek Querying for Compilations**:
+  - Prioritize `"Various Artists <Release Title>"` at the head of compilation album searches, followed by `"<Release Title>"`. Avoid prioritizing `"VA"` which frequently yields noisy or zero results on P2P networks.
+  - When searching for missing compilation tracks without a known track artist, query `"Various Artists <Track Title>"`, with fallback to `"<Track Title>"`. Never prepend a single contributing artist's name to all missing tracks on a compilation.
+
+## 12. Unified Multi-Folder & Partial-Download Release Grouping
+- **Natural Release Key Invariant**:
+  - Library scanning must group releases by natural key (`va_{norm_album}` for compilations, `art_alb_{norm_artist}::{norm_album}` for single artists), rather than splitting by directory hash or MBID.
+  - Untagged downloads (from Soulseek or Bandcamp) and MBID-tagged local files for the same album must be unified into a single release.
+  - If any track on the album contains a `musicbrainz_albumid` tag, propagate `rel["mb_release_id"]` to the unified release so that MusicBrainz reconciliation immediately utilizes it.
+- **Folder Precedence & Deduplication**:
+  - When audio tracks for an album exist across multiple folders (e.g. `Library/` and `downloads/`), the release's primary `folder_path` must prioritize canonical non-download library paths.
+  - Deduplicate multiple file instances of the same track across folders, prioritizing files in `Library/` over `downloads/`.
+
+## 13. Incremental Re-Audit & Client State Synchronization
+- **Fast Incremental Rescan on Re-Audit**:
+  - Triggering a release re-audit (`force_refresh=True`) must trigger a fast incremental library rescan (`force_disk_rescan=False`) before MusicBrainz reconciliation. This reuses cached SQLite metadata for existing files ($<1\text{s}$) while instantly picking up newly downloaded files on disk.
+  - Never reuse stale in-memory cached release objects when the user explicitly requests a re-audit.
+- **Frontend ID Resilience & Selection Sync**:
+  - When a library rescan or audit completes, the frontend must re-bind `AppState.selectedReleaseId` and `AppState.selectedReleaseData` using fallback matching on `(title, artist)` in case release IDs unify or shift.
+  - Re-audits must update both the master release list item and the active details pane without requiring a full page refresh.
+
+## 14. Missing Track Downloader & Placeholder Resolution Invariants
+- **Synthetic Gap Placeholder Resolution**:
+  - Local library scanning generates synthetic placeholders (`Track XX (Missing)`) for missing sequence numbers. Download engines (`download_single_missing_track`, `download_missing_tracks`) must **never** query P2P networks with synthetic placeholder strings.
+  - When a download request contains a placeholder track or track number, automatically invoke `audit_release` to resolve the official title and track-level artist from MusicBrainz before dispatching search queries.
+  - If a placeholder track cannot be resolved via MusicBrainz, abort with a clear, actionable error rather than wasting network timeout budgets searching for generic strings like `"Track 01 (Missing)"`.
+
 
 
 

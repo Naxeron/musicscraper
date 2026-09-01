@@ -522,7 +522,20 @@ class SlskdArtistScraper:
                     if clean_rel not in queries:
                         queries.append(clean_rel)
 
-        # 3. Artist Aliases (Ordered by relevance, skipping overly short/symbolic noise)
+        # 3. Targeted Compilation Release Queries (e.g. "Various Artists Amen Destroyer")
+        if self.catalog:
+            for rel in self.catalog.compilation_releases:
+                rel_title = rel.get("title", "")
+                norm_rel = normalize_text(rel_title)
+                if not rel_title or norm_rel in self.local_found_releases:
+                    continue
+                clean_rel = clean_search_phrase(rel_title)
+                if clean_rel and len(clean_rel) >= 4 and clean_rel.lower() not in DIR_STOP_WORDS and clean_rel.lower() not in GENERIC_OR_COMMON_WORDS:
+                    q_va_rel = clean_search_phrase(f"Various Artists {rel_title}")
+                    if q_va_rel and q_va_rel not in queries:
+                        queries.append(q_va_rel)
+
+        # 4. Artist Aliases (Ordered by relevance, skipping overly short/symbolic noise)
         if self.catalog:
             for alias in self.catalog.aliases:
                 alias_clean = clean_search_phrase(alias)
