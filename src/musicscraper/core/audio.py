@@ -41,6 +41,8 @@ class AudioMetadata:
     album_artist: str = ""
     album: str = ""
     track_number: str = ""
+    disc_number: int = 1
+    total_discs: int = 1
     year: str = ""
     genres: List[str] = field(default_factory=list)
 
@@ -81,6 +83,48 @@ class AudioMetadata:
         return self.bitrate_kbps
 
 
+WORD_NUMS = {
+    "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8,
+    "nine": 9, "ten": 10,
+}
+SIDE_MAP = {
+    "a": 1, "b": 2, "c": 3, "d": 4,
+    "e": 5, "f": 6, "g": 7, "h": 8,
+}
+DISC_DIR_PATTERN = re.compile(
+    r"^(?:(?:vinyl|lp)\s+)?(?:disc|cd|disk|vinyl|lp|side)\s*[-_.]?\s*(?:(\d{1,2})|([a-hA-H])|(one|two|three|four|five|six|seven|eight|nine|ten))\b(?:\s*[-_.:(\[].*)?$",
+    re.IGNORECASE
+)
+
+
+def extract_artist_title_from_filename(stem: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extracts artist and title from filename stem when untagged and directory heuristics fail.
+    Guards against extracting track numbers or single-element titles as artists.
+    """
+    normalized = re.sub(r"[\u2010-\u2015\u2212~]", " - ", stem)
+    parts = [p.strip() for p in normalized.split(" - ") if p.strip()]
+    if len(parts) < 2:
+        return None, None
+
+    p0_clean = re.sub(r"^(?:[a-zA-Z]?\d{1,4}|\d+[-._]\d+)$", "", parts[0]).strip()
+    if not p0_clean:
+        if len(parts) >= 3:
+            cand_artist = parts[1].strip()
+            cand_title = " - ".join(parts[2:]).strip()
+            if cand_artist and not cand_artist.isdigit():
+                return cand_artist, cand_title
+            return None, cand_title
+        return None, parts[1].strip()
+    else:
+        cand_artist = re.sub(r"^(?:[a-zA-Z]?\d{1,4}|\d+[-._]\d+)[\s._\-]+", "", parts[0]).strip()
+        cand_title = " - ".join(parts[1:]).strip()
+        if cand_artist and not re.match(r"^\d+$", cand_artist):
+            return cand_artist, cand_title
+        return None, None
+
+
 class AudioQualityAnalyzer:
     """Inspects audio stream parameters and computes standardized quality scores."""
 
@@ -119,6 +163,41 @@ class AudioQualityAnalyzer:
                     elif k_str in ("TRCK", "TRACKNUMBER", "TXXX:TRACKNUMBER") and not meta.track_number:
                         raw_trck = v_list[0].strip() if v_list else ""
                         meta.track_number = raw_trck.split("/")[0].strip()
+                    elif k_str in (
+                        "TPOS", "DISCNUMBER", "DISC", "TXXX:DISCNUMBER",
+                        "TXXX:DISC", "TXXX:PART OF SET", "TXXX:PARTOFSET",
+                        "DISK", "\xa9DISK", "WM/PARTOFSET"
+                    ):
+                        if isinstance(v, (list, tuple)) and v and isinstance(v[0], (tuple, list)):
+                            try:
+                                d = int(v[0][0])
+                                if d > 0:
+                                    meta.disc_number = d
+                                if len(v[0]) > 1:
+                                    t = int(v[0][1])
+                                    if t > 0:
+                                        meta.total_discs = t
+                            except Exception:
+                                pass
+                        else:
+                            raw_disc = str(v_list[0]).strip() if v_list else ""
+                            if "/" in raw_disc:
+                                parts = raw_disc.split("/", 1)
+                                d_digits = re.sub(r"[^\d]", "", parts[0])
+                                t_digits = re.sub(r"[^\d]", "", parts[1])
+                                if d_digits and int(d_digits) > 0:
+                                    meta.disc_number = int(d_digits)
+                                if t_digits and int(t_digits) > 0:
+                                    meta.total_discs = int(t_digits)
+                            else:
+                                d_digits = re.sub(r"[^\d]", "", raw_disc)
+                                if d_digits and int(d_digits) > 0:
+                                    meta.disc_number = int(d_digits)
+                    elif k_str in ("DISCTOTAL", "TOTALDISCS", "TXXX:DISCTOTAL", "TXXX:TOTALDISCS"):
+                        raw_tot = str(v_list[0]).strip() if v_list else ""
+                        t_digits = re.sub(r"[^\d]", "", raw_tot)
+                        if t_digits and int(t_digits) > 0:
+                            meta.total_discs = int(t_digits)
                     elif k_str in ("TDRC", "DATE", "YEAR", "\xa9DAY") and not meta.year:
                         meta.year = v_list[0].strip() if v_list else ""
                     # Album Artist
@@ -170,6 +249,9 @@ class AudioQualityAnalyzer:
                         except Exception:
                             pass
 
+        if meta.total_discs < meta.disc_number:
+            meta.total_discs = meta.disc_number
+
         if is_compilation and not meta.album_artist:
             meta.album_artist = "Various Artists"
 
@@ -184,17 +266,48 @@ class AudioQualityAnalyzer:
 
         # Fallback metadata from filename / path hierarchy
         filename_no_ext = file_path.stem
-        if not meta.title:
-            meta.title = strip_track_number_and_artist(filename_no_ext)
-        if not meta.album:
-            parent_name = file_path.parent.name
-            if parent_name and parent_name.lower() not in ("music", "downloads", "library", "tracks", "singles"):
-                meta.album = parent_name
 
         parent_name = file_path.parent.name
         grandparent_name = file_path.parent.parent.name if file_path.parent != file_path.parent.parent else ""
-        norm_parent = parent_name.lower().strip()
-        norm_grandparent = grandparent_name.lower().strip()
+        greatgrandparent_name = (
+            file_path.parent.parent.parent.name
+            if file_path.parent.parent != file_path.parent.parent.parent
+            else ""
+        )
+
+        is_disc_subfolder = False
+        disc_from_folder = None
+        m_disc = DISC_DIR_PATTERN.match(parent_name.strip())
+        if m_disc:
+            is_disc_subfolder = True
+            if m_disc.group(1):
+                disc_from_folder = int(m_disc.group(1))
+            elif m_disc.group(2):
+                disc_from_folder = SIDE_MAP.get(m_disc.group(2).lower(), 1)
+            elif m_disc.group(3):
+                disc_from_folder = WORD_NUMS.get(m_disc.group(3).lower(), 1)
+
+        if is_disc_subfolder and disc_from_folder:
+            if meta.disc_number == 1:
+                meta.disc_number = disc_from_folder
+            if meta.total_discs < meta.disc_number:
+                meta.total_discs = meta.disc_number
+
+        if is_disc_subfolder:
+            eff_album_folder = grandparent_name
+            eff_artist_folder = greatgrandparent_name
+        else:
+            eff_album_folder = parent_name
+            eff_artist_folder = grandparent_name
+
+        if not meta.title:
+            meta.title = strip_track_number_and_artist(filename_no_ext)
+        if not meta.album or (meta.album and DISC_DIR_PATTERN.match(meta.album.strip())):
+            if eff_album_folder and eff_album_folder.lower() not in ("music", "downloads", "library", "tracks", "singles"):
+                meta.album = eff_album_folder
+
+        norm_parent = eff_album_folder.lower().strip()
+        norm_grandparent = eff_artist_folder.lower().strip()
         is_va_dir = (
             norm_parent in VA_DIR_MARKERS
             or norm_grandparent in VA_DIR_MARKERS
@@ -215,8 +328,8 @@ class AudioQualityAnalyzer:
             meta.album_artist = "Various Artists"
 
         if not meta.artist:
-            if " - " in parent_name:
-                parts = parent_name.split(" - ", 1)
+            if " - " in eff_album_folder:
+                parts = eff_album_folder.split(" - ", 1)
                 first_part = parts[0].strip()
                 if (
                     first_part.lower() in ("va", "v.a.", "various", "various artists")
@@ -225,21 +338,29 @@ class AudioQualityAnalyzer:
                 ):
                     if not meta.album_artist:
                         meta.album_artist = "Various Artists"
-                    if not meta.album or meta.album == parent_name:
+                    if not meta.album or meta.album == eff_album_folder:
                         meta.album = parts[1].strip()
                 else:
                     meta.artist = first_part
-                    if not meta.album or meta.album == parent_name:
+                    if not meta.album or meta.album == eff_album_folder:
                         meta.album = parts[1].strip()
-            elif grandparent_name and grandparent_name.lower() not in ("music", "downloads", "library"):
+            elif eff_artist_folder and eff_artist_folder.lower() not in ("music", "downloads", "library"):
                 if (
-                    grandparent_name.lower() in VA_DIR_MARKERS
-                    or bool(re.match(r"^v(?:arious|\.)?\s*arti[st]{2,4}s?$", grandparent_name.lower()))
+                    eff_artist_folder.lower() in VA_DIR_MARKERS
+                    or bool(re.match(r"^v(?:arious|\.)?\s*arti[st]{2,4}s?$", eff_artist_folder.lower()))
                 ):
                     if not meta.album_artist:
                         meta.album_artist = "Various Artists"
                 else:
-                    meta.artist = grandparent_name
+                    meta.artist = eff_artist_folder
+
+        if not meta.artist:
+            cand_artist, cand_title = extract_artist_title_from_filename(filename_no_ext)
+            if cand_artist:
+                meta.artist = cand_artist
+                if not meta.title or meta.title == filename_no_ext:
+                    if cand_title:
+                        meta.title = strip_track_number_and_artist(cand_title)
 
         if meta.artist and (
             meta.artist.strip().lower() in ("va", "v.a.", "various", "various artists")

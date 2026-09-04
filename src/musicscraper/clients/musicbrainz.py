@@ -57,6 +57,26 @@ class ArtistCatalog:
 
         self._build_catalog()
 
+    @staticmethod
+    def format_credit(ac_list: Any, default: str = "") -> str:
+        """
+        Formats a MusicBrainz artist-credit list into a clean display string,
+        preserving credited names ('name') and join phrases ('joinphrase').
+        """
+        if not ac_list:
+            return default
+        if isinstance(ac_list, str):
+            return ac_list.strip() or default
+        parts = []
+        for c in ac_list:
+            if isinstance(c, dict):
+                name = c.get('name') or c.get('artist', {}).get('name', '')
+                join = c.get('joinphrase', '')
+                parts.append(name + join)
+            else:
+                parts.append(str(c))
+        return "".join(parts).strip() or default
+
     def _extract_aliases(self) -> None:
         """Extracts all aliases, transliterations, sort names, related personas, and Bandcamp URLs."""
         # Bandcamp URLs from artist relationships
@@ -125,15 +145,7 @@ class ArtistCatalog:
         standalone_counter = 0
 
         def format_credit(ac_list):
-            if not ac_list:
-                return self.name
-            parts = []
-            for c in ac_list:
-                if isinstance(c, dict):
-                    parts.append(c.get('artist', {}).get('name', ''))
-                else:
-                    parts.append(str(c))
-            return "".join(parts) or self.name
+            return ArtistCatalog.format_credit(ac_list, default=self.name)
 
         def is_artist_in_credit(ac_list):
             if not ac_list:

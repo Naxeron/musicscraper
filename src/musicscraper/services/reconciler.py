@@ -2,6 +2,8 @@
 Multi-tier discography reconciler comparing MusicBrainz tracks against local library audio files.
 """
 
+import re
+from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional, Any
 from unidecode import unidecode
 
@@ -12,6 +14,89 @@ from musicscraper.core.text import (
     are_versions_compatible
 )
 from musicscraper.clients.musicbrainz import ArtistCatalog
+
+
+ROMAN_TO_ARABIC = {
+    "i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5,
+    "vi": 6, "vii": 7, "viii": 8, "ix": 9, "x": 10,
+    "xi": 11, "xii": 12, "xiii": 13, "xiv": 14, "xv": 15,
+    "xvi": 16, "xvii": 17, "xviii": 18, "xix": 19, "xx": 20
+}
+
+
+def extract_title_numbers(title: str) -> List[int]:
+    """Extracts numeric values from track titles, converting Roman numerals."""
+    if not title:
+        return []
+
+    def _replace_roman(match):
+        w = match.group(1).lower()
+        return f" {ROMAN_TO_ARABIC[w]} " if w in ROMAN_TO_ARABIC else match.group(0)
+
+    converted = re.sub(
+        r'\b(?:part|pt|act|movement|vol|volume|chapter|suite|no|track)?\s*([ivx]+)\b',
+        _replace_roman,
+        title,
+        flags=re.IGNORECASE
+    )
+    return [int(t) for t in re.findall(r'\b\d+\b', converted)]
+
+
+def have_conflicting_numbers(t1: str, t2: str) -> bool:
+    """Returns True if both titles contain numeric sequence tokens and they do not match."""
+    nums1 = extract_title_numbers(t1)
+    nums2 = extract_title_numbers(t2)
+    return bool(nums1 and nums2 and nums1 != nums2)
+
+
+def have_conflicting_track_numbers(trk1: Any, trk2: Any) -> bool:
+    """Returns True if both track numbers are known integers and do not match."""
+    if not trk1 or not trk2:
+        return False
+    d1 = re.sub(r"[^\d]", "", str(trk1).split("/")[-1].split("-")[-1])
+    d2 = re.sub(r"[^\d]", "", str(trk2).split("/")[-1].split("-")[-1])
+    if d1 and d2:
+        try:
+            return int(d1) != int(d2)
+        except ValueError:
+            pass
+    return False
+
+
+def is_purely_numeric_track(lt: Dict[str, Any]) -> bool:
+    """Checks if a local track lacks title text and is identified only by track number."""
+    raw_title = (lt.get("title") or "").strip()
+    raw_fn = Path(lt.get("filename") or lt.get("path") or "").stem.strip()
+    if raw_fn.isdigit() or re.match(r"^(?:track|trk)[\s._\-]*\d{1,3}$", raw_fn, re.IGNORECASE):
+        if not raw_title or raw_title.isdigit() or re.match(r"^(?:track|trk)[\s._\-]*\d{1,3}$", raw_title, re.IGNORECASE):
+            return True
+    if raw_title.isdigit() and not re.search(r"[a-zA-Z]", raw_fn):
+        return True
+    return False
+
+
+def is_track_number_match(num1: Any, num2: Any) -> bool:
+    """Compares track numbers handling zero-padding, vinyl notation (A1), and disc-track (1-01)."""
+    if num1 is None or num2 is None:
+        return False
+    s1 = str(num1).strip().lower()
+    s2 = str(num2).strip().lower()
+    if not s1 or not s2:
+        return False
+    if s1 == s2:
+        return True
+    d1 = re.sub(r"[^\d]", "", s1.split("/")[-1].split("-")[-1])
+    d2 = re.sub(r"[^\d]", "", s2.split("/")[-1].split("-")[-1])
+    if not d1:
+        d1 = re.sub(r"[^\d]", "", s1)
+    if not d2:
+        d2 = re.sub(r"[^\d]", "", s2)
+    if d1 and d2:
+        try:
+            return int(d1) == int(d2)
+        except ValueError:
+            pass
+    return False
 
 
 def deduplicate_candidate_tracks(tracks_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -80,6 +165,14 @@ class DiscographyReconciler:
         self.matched: Dict[int, Tuple[Dict[str, Any], str]] = {}
         self.unmatched_local: List[Dict[str, Any]] = []
 
+        # Pre-compile word boundary patterns for artist aliases
+        self.artist_alias_patterns = []
+        for alias in self.catalog.aliases:
+            norm_alias = normalize_text(alias)
+            if norm_alias:
+                pat = re.compile(rf"(?<![^\W_]){re.escape(norm_alias)}(?![^\W_])")
+                self.artist_alias_patterns.append((norm_alias, pat))
+
     def reconcile(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         Matches MusicBrainz tracks against local library audio files.
@@ -88,7 +181,6 @@ class DiscographyReconciler:
         matched_mb_indices: Set[int] = set()
         matched_local_paths: Set[str] = set()
         mb_tracks = self.catalog.tracks
-        artist_aliases = self.catalog.aliases
 
         mb_parsed = [parse_track_title_structure(mb["title"]) for mb in mb_tracks]
         local_parsed = [
@@ -141,6 +233,34 @@ class DiscographyReconciler:
                 lt_album_norm = lt.get("norm_album", "")
                 path_norm = normalize_text(str(lt.get("path", "")))
 
+                # Check release container match
+                all_rel_norms = [normalize_text(r) for r in mb.get("all_releases", set())] if mb.get("all_releases") else [mb_rel_norm]
+                if mb_rel_norm and mb_rel_norm not in all_rel_norms:
+                    all_rel_norms.append(mb_rel_norm)
+
+                rel_sim = max([calculate_similarity(r, lt_album_norm) for r in all_rel_norms], default=0.0)
+                path_has_rel = any(r and r in path_norm for r in all_rel_norms)
+                rel_confirmed = rel_sim > 0.7 or path_has_rel
+
+                # Support purely numeric tracks (e.g. 01.flac) in confirmed albums
+                is_num_lt = is_purely_numeric_track(lt)
+                if is_num_lt and rel_confirmed:
+                    lt_trk = lt.get("track_number") or Path(lt.get("filename", "")).stem
+                    if is_track_number_match(lt_trk, mb.get("track_number")):
+                        self.matched[i] = (lt, "Numeric Track in Confirmed Album")
+                        matched_mb_indices.add(i)
+                        matched_local_paths.add(lt["path"])
+                        break
+
+                # Guardrails against numbered track conflict
+                has_num_conflict = have_conflicting_numbers(p_mb["base_norm"], p_lt["base_norm"])
+                has_trk_conflict = (
+                    p_mb["base_norm"] != p_lt["base_norm"]
+                    and have_conflicting_track_numbers(mb.get("track_number"), lt.get("track_number"))
+                )
+                if has_num_conflict or has_trk_conflict:
+                    continue
+
                 base_sim = calculate_similarity(p_mb["base_norm"], p_lt["base_norm"])
                 base_match = (p_mb["base_norm"] == p_lt["base_norm"]) or base_sim > 0.90
                 ver_compat = are_versions_compatible(
@@ -148,19 +268,11 @@ class DiscographyReconciler:
                     p_lt["version_type"], p_lt["version_text"]
                 )
 
-                if base_match and ver_compat:
-                    all_rel_norms = [normalize_text(r) for r in mb.get("all_releases", set())] if mb.get("all_releases") else [mb_rel_norm]
-                    if mb_rel_norm and mb_rel_norm not in all_rel_norms:
-                        all_rel_norms.append(mb_rel_norm)
-
-                    rel_sim = max([calculate_similarity(r, lt_album_norm) for r in all_rel_norms], default=0.0)
-                    path_has_rel = any(r and r in path_norm for r in all_rel_norms)
-
-                    if rel_sim > 0.7 or path_has_rel or mb.get("release_title") == "Standalone / Other":
-                        self.matched[i] = (lt, "Exact Title & Album Match")
-                        matched_mb_indices.add(i)
-                        matched_local_paths.add(lt["path"])
-                        break
+                if base_match and ver_compat and rel_confirmed:
+                    self.matched[i] = (lt, "Exact Title & Album Match")
+                    matched_mb_indices.add(i)
+                    matched_local_paths.add(lt["path"])
+                    break
 
         # -------------------------------------------------------------
         # TIER 3: Track Title + Artist Alias Match (Tags or Path)
@@ -181,12 +293,24 @@ class DiscographyReconciler:
                 path_norm = normalize_text(str(lt.get("path", "")))
 
                 has_artist_tag = any(
-                    any(alias in str(a).lower() or alias in unidecode(str(a).lower()) for alias in artist_aliases)
+                    any(norm_alias == normalize_text(str(a)) or bool(pat.search(normalize_text(str(a))))
+                        for norm_alias, pat in self.artist_alias_patterns)
                     for a in lt.get("artists", [])
                 )
-                has_artist_path = any(alias in path_norm for alias in artist_aliases)
+                has_artist_path = any(
+                    bool(pat.search(path_norm))
+                    for _, pat in self.artist_alias_patterns
+                )
 
                 if has_artist_tag or has_artist_path or (mb.get("recording_ids") and any(rid in lt["mb_rec_ids"] for rid in mb["recording_ids"])):
+                    has_num_conflict = have_conflicting_numbers(p_mb["base_norm"], p_lt["base_norm"])
+                    has_trk_conflict = (
+                        p_mb["base_norm"] != p_lt["base_norm"]
+                        and have_conflicting_track_numbers(mb.get("track_number"), lt.get("track_number"))
+                    )
+                    if has_num_conflict or has_trk_conflict:
+                        continue
+
                     base_sim = calculate_similarity(p_mb["base_norm"], p_lt["base_norm"])
                     base_match = (p_mb["base_norm"] == p_lt["base_norm"]) or base_sim > 0.90
                     ver_compat = are_versions_compatible(
@@ -216,17 +340,35 @@ class DiscographyReconciler:
                 if lt["path"] in matched_local_paths:
                     continue
 
+                if is_purely_numeric_track(lt):
+                    continue
+
                 p_lt = local_parsed[j]
                 path_norm = normalize_text(str(lt.get("path", "")))
 
                 has_artist_tag = any(
-                    any(alias in str(a).lower() or alias in unidecode(str(a).lower()) for alias in artist_aliases)
+                    any(norm_alias == normalize_text(str(a)) or bool(pat.search(normalize_text(str(a))))
+                        for norm_alias, pat in self.artist_alias_patterns)
                     for a in lt.get("artists", [])
                 )
-                has_artist_path = any(alias in path_norm for alias in artist_aliases)
+                has_artist_path = any(
+                    bool(pat.search(path_norm))
+                    for _, pat in self.artist_alias_patterns
+                )
                 has_rel_match = bool(mb_rel_norm and (mb_rel_norm in path_norm or mb_rel_norm == lt.get("norm_album", "")))
 
-                if not (has_artist_tag or has_artist_path or has_rel_match or mb.get("release_title") == "Standalone / Other"):
+                if not (has_artist_tag or has_artist_path or has_rel_match):
+                    continue
+
+                has_num_conflict = (
+                    have_conflicting_numbers(p_mb["base_norm"], p_lt["base_norm"])
+                    or have_conflicting_numbers(mb.get("norm_title", ""), lt.get("norm_title", ""))
+                )
+                has_trk_conflict = (
+                    p_mb["base_norm"] != p_lt["base_norm"]
+                    and have_conflicting_track_numbers(mb.get("track_number"), lt.get("track_number"))
+                )
+                if has_num_conflict or has_trk_conflict:
                     continue
 
                 ver_compat = are_versions_compatible(

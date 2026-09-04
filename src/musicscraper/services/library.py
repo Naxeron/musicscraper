@@ -8,7 +8,7 @@ import json
 import time
 import hashlib
 from pathlib import Path
-from typing import Dict, List, Set, Tuple, Optional, Any, Callable
+from typing import Dict, List, Set, Tuple, Optional, Any, Callable, Union
 from concurrent.futures import ThreadPoolExecutor
 
 from unidecode import unidecode
@@ -27,11 +27,194 @@ from musicscraper.core.text import (
     are_versions_compatible,
     strip_track_number_and_artist,
 )
-from musicscraper.core.audio import AudioMetadata, AudioQualityAnalyzer
+from musicscraper.core.audio import AudioMetadata, AudioQualityAnalyzer, DISC_DIR_PATTERN
 from musicscraper.core.cache import UnifiedCacheManager
 from musicscraper.core.report import console
 from musicscraper.clients.musicbrainz import MusicBrainzClient
 from musicscraper.clients.slskd import SlskdClient, SlskdAPIError
+from musicscraper.services.reconciler import (
+    is_purely_numeric_track,
+    is_track_number_match,
+    have_conflicting_numbers,
+    have_conflicting_track_numbers,
+)
+
+
+def parse_disc_and_track_number(
+    raw_track: Any,
+    filename: Optional[str] = None,
+    meta_disc: Optional[int] = None
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """
+    Robustly parses (disc_number, track_number, total_tracks).
+    Handles:
+    - Standard: '1', '01', '1/12'
+    - Disc-track prefix: '1-01', '1.01', '2-03', '01-02'
+    - Vinyl side notation: 'A1', 'B1', 'A', 'B', 'Side A', 'Side B', 'Vinyl Side B'
+    - Filename prefixes: '1-01 - Title.flac', '2.01 Song.flac', 'A1 Title.mp3', 'Side B 01.flac', '01.flac'
+    - Disc notation in raw_track or filename overrides default disc_num == 1.
+    """
+    disc_num = meta_disc if (meta_disc is not None and meta_disc > 0) else None
+    track_num = None
+    total_tracks = None
+
+    if raw_track is not None:
+        raw_str = str(raw_track).strip()
+        if "/" in raw_str:
+            parts = raw_str.split("/", 1)
+            raw_str = parts[0].strip()
+            tot_str = re.sub(r"[^\d]", "", parts[1])
+            if tot_str:
+                try:
+                    total_tracks = int(tot_str)
+                except ValueError:
+                    pass
+
+        # Side notation with letter in tag: 'Side A', 'Side B', 'Side B 02', 'Vinyl Side B', 'Side B-01'
+        m_side = re.match(r"^(?:(?:vinyl|lp)\s+)?(?:side)\s*[-_.]?\s*([a-zA-Z])(?:\s*[-_.]?\s*(\d{1,3}))?$", raw_str, re.IGNORECASE)
+        if m_side:
+            letter = m_side.group(1).upper()
+            if disc_num is None or disc_num == 1:
+                disc_num = ord(letter) - ord('A') + 1
+            num_part = m_side.group(2)
+            track_num = int(num_part) if num_part else 1
+            return disc_num, track_num, total_tracks
+
+        # Side notation with number in tag: 'Side 1', 'Side 2', 'Side 2 - 01'
+        m_side_num = re.match(r"^(?:(?:vinyl|lp)\s+)?(?:side)\s*[-_.]?\s*(\d{1,2})(?:\s*[-_.]?\s*(\d{1,3}))?$", raw_str, re.IGNORECASE)
+        if m_side_num:
+            d_val = int(m_side_num.group(1))
+            if (disc_num is None or disc_num == 1) and 1 <= d_val <= 20:
+                disc_num = d_val
+            num_part = m_side_num.group(2)
+            track_num = int(num_part) if num_part else 1
+            return disc_num, track_num, total_tracks
+
+        # Disc/CD with number in tag: 'Disc 2 - 01', 'CD 2 - 01', 'Disc 2'
+        m_disc = re.match(r"^(?:disc|cd|disk)\s*[-_.]?\s*(\d{1,2})(?:\s*[-_.:]\s*(\d{1,3})|\s+track\s+(\d{1,3}))?$", raw_str, re.IGNORECASE)
+        if m_disc:
+            d_val = int(m_disc.group(1))
+            if (disc_num is None or disc_num == 1) and 1 <= d_val <= 20:
+                disc_num = d_val
+            num_part = m_disc.group(2) or m_disc.group(3)
+            track_num = int(num_part) if num_part else 1
+            return disc_num, track_num, total_tracks
+
+        # Vinyl side: A1, B2, A, B
+        m_vinyl = re.match(r"^([A-Za-z])(\d{1,3})?$", raw_str)
+        if m_vinyl:
+            letter = m_vinyl.group(1).upper()
+            if disc_num is None or disc_num == 1:
+                disc_num = ord(letter) - ord('A') + 1
+            num_part = m_vinyl.group(2)
+            track_num = int(num_part) if num_part else 1
+            return disc_num, track_num, total_tracks
+
+        # Disc-track pattern: "1-01", "1.01", "2-03", "01-02"
+        m_dt = re.match(r"^(\d{1,2})[-_.](\d{1,3})$", raw_str)
+        if m_dt:
+            d_val = int(m_dt.group(1))
+            t_val = int(m_dt.group(2))
+            if (disc_num is None or disc_num == 1) and 1 <= d_val <= 20:
+                disc_num = d_val
+            track_num = t_val
+            return disc_num, track_num, total_tracks
+
+        # Standard digits
+        digits_only = re.sub(r"[^\d]", "", raw_str)
+        if digits_only:
+            try:
+                track_num = int(digits_only)
+            except ValueError:
+                pass
+
+    # Inspect filename for disc/track information
+    if filename:
+        fn = Path(filename).name
+
+        # Filename side notation with letter: 'Side B 01 - Song.flac', 'Side B - 02.mp3', 'Side B.flac'
+        m_fn_side = re.match(r"^(?:(?:vinyl|lp)\s+)?(?:side)\s*[-_.]?\s*([a-zA-Z])(?:\s*[-_.]?\s*(\d{1,3}))?(?:[\s._\-]|$)", fn, re.IGNORECASE)
+        if m_fn_side:
+            letter = m_fn_side.group(1).upper()
+            if disc_num is None or disc_num == 1:
+                disc_num = ord(letter) - ord('A') + 1
+            if track_num is None:
+                track_num = int(m_fn_side.group(2)) if m_fn_side.group(2) else 1
+            return disc_num, track_num, total_tracks
+
+        # Filename side notation with number: 'Side 2 - 01 Song.flac'
+        m_fn_side_num = re.match(r"^(?:(?:vinyl|lp)\s+)?(?:side)\s*[-_.]?\s*(\d{1,2})(?:\s*[-_.]?\s*(\d{1,3}))?(?:[\s._\-]|$)", fn, re.IGNORECASE)
+        if m_fn_side_num:
+            d_val = int(m_fn_side_num.group(1))
+            if (disc_num is None or disc_num == 1) and 1 <= d_val <= 20:
+                disc_num = d_val
+            if track_num is None:
+                track_num = int(m_fn_side_num.group(2)) if m_fn_side_num.group(2) else 1
+            return disc_num, track_num, total_tracks
+
+        # Filename Disc/CD prefix: 'Disc 2 - 01 Song.flac', 'CD 2 - 01 Song.flac'
+        m_fn_disc = re.match(r"^(?:disc|cd|disk)\s*[-_.]?\s*(\d{1,2})\s*[-_.:\s]\s*(?:track\s+)?(\d{1,3})(?:[\s._\-]|$)", fn, re.IGNORECASE)
+        if m_fn_disc:
+            d_val = int(m_fn_disc.group(1))
+            t_val = int(m_fn_disc.group(2))
+            if (disc_num is None or disc_num == 1) and 1 <= d_val <= 20:
+                disc_num = d_val
+            if track_num is None:
+                track_num = t_val
+            return disc_num, track_num, total_tracks
+
+        # Filename vinyl notation: 'B1 Song.flac', 'B01 - Song.flac', 'A1 - Title.mp3'
+        m_fn_vinyl = re.match(r"^([A-Za-z])(\d{1,3})(?:[\s._\-]|$)", fn)
+        if m_fn_vinyl:
+            letter = m_fn_vinyl.group(1).upper()
+            if disc_num is None or disc_num == 1:
+                disc_num = ord(letter) - ord('A') + 1
+            if track_num is None:
+                track_num = int(m_fn_vinyl.group(2))
+            return disc_num, track_num, total_tracks
+
+        # Filename disc-track prefix: '2-01 Song.flac', '2.01 Song.flac', '02-01 Song.flac'
+        m_fn_dt = re.match(r"^(\d{1,2})[-_.](\d{1,3})(?:[\s._\-]|$)", fn)
+        if m_fn_dt:
+            d_val = int(m_fn_dt.group(1))
+            t_val = int(m_fn_dt.group(2))
+            if (disc_num is None or disc_num == 1) and 1 <= d_val <= 20:
+                disc_num = d_val
+            if track_num is None:
+                track_num = t_val
+            return disc_num, track_num, total_tracks
+
+        # Standard track number fallback from filename (only if track_num not already resolved)
+        if track_num is None:
+            m_fn = re.match(r"^(\d{1,3})(?:[\s._\-]|$)", fn)
+            if m_fn:
+                try:
+                    track_num = int(m_fn.group(1))
+                except ValueError:
+                    pass
+
+    if disc_num is None:
+        disc_num = 1
+
+    return disc_num, track_num, total_tracks
+
+
+def _is_numeric_track_item(lt: Dict[str, Any]) -> bool:
+    """Checks if track is purely numeric or compound disc-track number with no title."""
+    if is_purely_numeric_track(lt):
+        return True
+    raw_title = (lt.get("title") or "").strip()
+    raw_fn = Path(lt.get("filename") or lt.get("path") or "").stem.strip()
+    return bool(
+        re.match(r"^\d{1,2}[-_.]\d{1,3}$", raw_fn)
+        and (
+            not raw_title
+            or raw_title.isdigit()
+            or raw_title == raw_fn
+            or re.match(r"^(?:track|trk)[\s._\-]*\d{1,3}$", raw_title, re.IGNORECASE)
+            or re.match(r"^\d{1,2}[-_.]\d{1,3}$", raw_title)
+        )
+    )
 
 
 def _format_artist_credit(ac_list: Any, default: str = "") -> str:
@@ -189,6 +372,11 @@ class LibraryReleaseService:
             # Check if MB release ID is present
             mb_rel_id = next(iter(meta.mb_release_ids)) if meta.mb_release_ids else None
 
+            # Detect if file is in a disc subfolder
+            is_disc_folder = bool(DISC_DIR_PATTERN.match(meta.path.parent.name))
+            effective_folder_path = meta.path.parent.parent if is_disc_folder else meta.path.parent
+            effective_folder_str = str(effective_folder_path)
+
             # Generate unique release key
             if is_va:
                 if norm_album and norm_album not in ("", "unknown album", "unknown", "untitled", "album"):
@@ -196,20 +384,20 @@ class LibraryReleaseService:
                 elif mb_rel_id:
                     rel_key = f"mb_{mb_rel_id}"
                 else:
-                    rel_key = f"dir_{hashlib.md5(folder.encode()).hexdigest()[:12]}"
+                    rel_key = f"dir_{hashlib.md5(effective_folder_str.encode()).hexdigest()[:12]}"
             elif norm_artist and norm_album:
                 rel_key = f"art_alb_{norm_artist}::{norm_album}"
             elif mb_rel_id:
                 rel_key = f"mb_{mb_rel_id}"
             else:
-                rel_key = f"dir_{hashlib.md5(folder.encode()).hexdigest()[:12]}"
+                rel_key = f"dir_{hashlib.md5(effective_folder_str.encode()).hexdigest()[:12]}"
 
             if rel_key not in releases_map:
                 rel_id = hashlib.md5(rel_key.encode()).hexdigest()[:16]
                 try:
-                    rel_folder = str(meta.path.parent.relative_to(lib_path))
+                    rel_folder = str(effective_folder_path.relative_to(lib_path))
                 except Exception:
-                    rel_folder = str(meta.path.parent)
+                    rel_folder = effective_folder_str
 
                 releases_map[rel_key] = {
                     "id": rel_id,
@@ -220,7 +408,7 @@ class LibraryReleaseService:
                     "is_va": is_va,
                     "year": meta.year or "",
                     "folder_path": rel_folder,
-                    "full_path": str(meta.path.parent),
+                    "full_path": effective_folder_str,
                     "mb_release_id": mb_rel_id,
                     "formats": set(),
                     "is_lossless_all": True,
@@ -234,13 +422,13 @@ class LibraryReleaseService:
             else:
                 rel = releases_map[rel_key]
                 try:
-                    curr_folder = str(meta.path.parent.relative_to(lib_path))
+                    curr_folder = str(effective_folder_path.relative_to(lib_path))
                 except Exception:
-                    curr_folder = str(meta.path.parent)
+                    curr_folder = effective_folder_str
                 # If existing folder is in 'downloads' but this track is in a proper library folder, prefer library folder
                 if "download" in rel["folder_path"].lower() and "download" not in curr_folder.lower():
                     rel["folder_path"] = curr_folder
-                    rel["full_path"] = str(meta.path.parent)
+                    rel["full_path"] = effective_folder_str
                 if mb_rel_id and not rel.get("mb_release_id"):
                     rel["mb_release_id"] = mb_rel_id
 
@@ -255,36 +443,16 @@ class LibraryReleaseService:
             if meta.year and not rel["year"]:
                 rel["year"] = meta.year
 
-            # Track number parsing from tag or filename prefix
-            trk_raw = meta.track_number
-            trk_num = None
-            total_in_tag = None
-            if trk_raw:
-                trk_str = str(trk_raw).strip()
-                if "/" in trk_str:
-                    parts = trk_str.split("/")
-                    try:
-                        trk_num = int(re.sub(r"[^\d]", "", parts[0]))
-                    except Exception:
-                        pass
-                    try:
-                        total_in_tag = int(re.sub(r"[^\d]", "", parts[1]))
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        trk_num = int(re.sub(r"[^\d]", "", trk_str))
-                    except Exception:
-                        pass
-
-            # Fallback: extract leading track number from filename (e.g. "01 - Song.mp3", "02. Song.flac")
-            if trk_num is None:
-                fn_match = re.match(r"^(\d{1,3})[\s._\-]", meta.path.name)
-                if fn_match:
-                    try:
-                        trk_num = int(fn_match.group(1))
-                    except Exception:
-                        pass
+            # Track number and disc number parsing
+            parsed_disc, trk_num, total_in_tag = parse_disc_and_track_number(
+                meta.track_number,
+                filename=meta.path.name,
+                meta_disc=getattr(meta, "disc_number", None)
+            )
+            effective_disc = parsed_disc or getattr(meta, "disc_number", 1) or 1
+            effective_total_discs = getattr(meta, "total_discs", 1) or 1
+            if effective_total_discs < effective_disc:
+                effective_total_discs = effective_disc
 
             if total_in_tag and total_in_tag > rel["total_tracks_expected"]:
                 rel["total_tracks_expected"] = total_in_tag
@@ -294,8 +462,11 @@ class LibraryReleaseService:
                 "filename": meta.path.name,
                 "title": meta.title or meta.path.stem,
                 "artist": meta.artist or artist,
+                "disc_number": effective_disc,
+                "total_discs": effective_total_discs,
                 "track_number": str(trk_num) if trk_num is not None else None,
                 "track_num_int": trk_num,
+                "total_in_tag": total_in_tag,
                 "format": fmt_label,
                 "bitrate": meta.bitrate_kbps,
                 "is_lossless": meta.is_lossless,
@@ -312,53 +483,88 @@ class LibraryReleaseService:
             # Deduplicate multiple files for the same track (e.g. file in Library/ and file in downloads/)
             deduped_found: Dict[Any, Dict[str, Any]] = {}
             for t in rel["tracks"]:
-                d_key = (t["track_num_int"], normalize_text(t["title"])) if t["track_num_int"] is not None else normalize_text(t["title"])
+                d_num = t.get("disc_number", 1) or 1
+                d_key = (
+                    d_num,
+                    t["track_num_int"],
+                    normalize_text(t["title"])
+                ) if t.get("track_num_int") is not None else (
+                    d_num,
+                    normalize_text(t["title"])
+                )
                 if d_key not in deduped_found:
                     deduped_found[d_key] = t
                 else:
                     existing = deduped_found[d_key]
                     existing_is_lib = "download" not in (existing.get("path") or "").lower()
                     new_is_lib = "download" not in (t.get("path") or "").lower()
-                    if (new_is_lib and not existing_is_lib) or (new_is_lib == existing_is_lib and (t.get("quality_score", 0) > existing.get("quality_score", 0))):
+                    if (new_is_lib and not existing_is_lib) or (
+                        new_is_lib == existing_is_lib
+                        and (t.get("quality_score", 0) > existing.get("quality_score", 0))
+                    ):
                         deduped_found[d_key] = t
             found_tracks = list(deduped_found.values())
-            found_nums = {t["track_num_int"] for t in found_tracks if t["track_num_int"] is not None and t["track_num_int"] > 0}
 
-            max_trk_num = max(found_nums) if found_nums else 0
-            # If max track number is reasonable (e.g. <= 60), use it for expected count
-            if 0 < max_trk_num <= 60 and max_trk_num > rel["total_tracks_expected"]:
-                rel["total_tracks_expected"] = max_trk_num
+            # Group found tracks by disc
+            discs: Dict[int, List[Dict[str, Any]]] = {}
+            disc_expected_tags: Dict[int, int] = {}
+            for t in found_tracks:
+                d = t.get("disc_number", 1) or 1
+                discs.setdefault(d, []).append(t)
+                tot = t.get("total_in_tag")
+                if tot and tot > disc_expected_tags.get(d, 0):
+                    disc_expected_tags[d] = tot
 
-            # Check if sequence gaps or total tag indicate missing tracks
-            total_expected = max(rel["total_tracks_expected"], len(found_tracks))
+            max_disc_num = max(
+                max((t.get("disc_number", 1) or 1 for t in found_tracks), default=1),
+                max((t.get("total_discs", 1) or 1 for t in found_tracks), default=1),
+            )
+            if max_disc_num > 1:
+                for d in range(1, max_disc_num + 1):
+                    discs.setdefault(d, [])
+
             all_tracks_list: List[Dict[str, Any]] = list(found_tracks)
+            is_multi_disc = len(discs) > 1
 
-            if total_expected > len(found_tracks) and 0 < total_expected <= 60:
-                # Add placeholder missing track objects for missing sequence numbers
-                for k in range(1, total_expected + 1):
-                    if k not in found_nums:
-                        all_tracks_list.append({
-                            "disc_number": 1,
-                            "track_number": str(k),
-                            "track_num_int": k,
-                            "title": f"Track {k:02d} (Missing)",
-                            "status": "missing",
-                            "filename": None,
-                            "path": None,
-                            "format": None,
-                            "bitrate": None,
-                            "is_lossless": None,
-                            "quality_score": 0,
-                            "duration": None,
-                            "mb_recording_id": None
-                        })
+            for d_num, d_tracks in sorted(discs.items()):
+                found_nums = {
+                    t["track_num_int"] for t in d_tracks
+                    if t.get("track_num_int") is not None and t["track_num_int"] > 0
+                }
+                max_trk_num = max(found_nums) if found_nums else 0
+                expected_from_tag = disc_expected_tags.get(d_num, 0)
+                disc_expected = max(expected_from_tag, max_trk_num)
 
-            # Sort tracks by track number or filename
-            def _sort_key(t: Dict[str, Any]) -> Tuple[int, str]:
+                if 0 < disc_expected <= 60:
+                    for k in range(1, disc_expected + 1):
+                        if k not in found_nums:
+                            missing_title = (
+                                f"Disc {d_num} Track {k:02d} (Missing)"
+                                if is_multi_disc
+                                else f"Track {k:02d} (Missing)"
+                            )
+                            all_tracks_list.append({
+                                "disc_number": d_num,
+                                "track_number": str(k),
+                                "track_num_int": k,
+                                "title": missing_title,
+                                "status": "missing",
+                                "filename": None,
+                                "path": None,
+                                "format": None,
+                                "bitrate": None,
+                                "is_lossless": None,
+                                "quality_score": 0,
+                                "duration": None,
+                                "mb_recording_id": None
+                            })
+
+            # Sort tracks by disc_number, track_num_int, and title/filename
+            def _sort_key(t: Dict[str, Any]) -> Tuple[int, int, str]:
+                d = t.get("disc_number", 1) or 1
                 tn = t.get("track_num_int")
-                if tn is not None and tn > 0:
-                    return tn, t.get("title", "")
-                return 9999, t.get("filename") or t.get("title", "")
+                order = tn if (tn is not None and tn > 0) else 9999
+                return d, order, t.get("filename") or t.get("title", "")
 
             all_tracks_list.sort(key=_sort_key)
             rel["tracks"] = all_tracks_list
@@ -370,7 +576,7 @@ class LibraryReleaseService:
 
             rel["found_count"] = found_count
             rel["missing_count"] = missing_count
-            rel["total_tracks_expected"] = total_count
+            rel["total_tracks_expected"] = max(rel["total_tracks_expected"], total_count)
 
             if missing_count > 0:
                 rel["status"] = "has_missing"
@@ -434,6 +640,23 @@ class LibraryReleaseService:
             if t.get("filename") or t.get("path")
         ]
 
+        # Defensive normalization: ensure disc_number and track_number are accurately parsed from filenames
+        for lt in local_tracks:
+            curr_disc = lt.get("disc_number")
+            if not curr_disc or curr_disc == 1:
+                p_disc, p_trk, _ = parse_disc_and_track_number(
+                    lt.get("track_number"),
+                    filename=lt.get("filename") or lt.get("path"),
+                    meta_disc=curr_disc
+                )
+                if p_disc and p_disc > 1:
+                    lt["disc_number"] = p_disc
+                if p_trk is not None:
+                    if not lt.get("track_number") or lt.get("track_number") == "-":
+                        lt["track_number"] = str(p_trk)
+                    if lt.get("track_num_int") is None:
+                        lt["track_num_int"] = p_trk
+
         mb_release = None
 
         # 1. Look up by MBID if available
@@ -448,14 +671,13 @@ class LibraryReleaseService:
                 norm_target_title = normalize_text(title)
                 for cand in search_results:
                     cand_title = normalize_text(cand.get("title", ""))
-                    if cand_title == norm_target_title:
+                    if cand_title == norm_target_title or calculate_similarity(cand_title, norm_target_title) >= 0.70:
                         best_cand = cand
                         break
-                if not best_cand:
-                    best_cand = search_results[0]
-                best_id = best_cand.get("id")
-                if best_id:
-                    mb_release = self.mb_client.get_release_by_id(best_id, force_refresh=force_refresh)
+                if best_cand:
+                    best_id = best_cand.get("id")
+                    if best_id:
+                        mb_release = self.mb_client.get_release_by_id(best_id, force_refresh=force_refresh)
 
         # 3. If MB release found, reconcile official tracks against local files
         if mb_release:
@@ -518,32 +740,79 @@ class LibraryReleaseService:
                         matched_local_indices.add(idx)
                         break
 
-                # Pass 2: Track number + Title match
+                # Pass 2: Track number + Title match (with numeric filename support)
                 if not matched_local:
                     for idx, lt in enumerate(local_tracks):
                         if idx in matched_local_indices:
                             continue
+
+                        # Check disc number alignment if both are specified
+                        lt_disc = lt.get("disc_number")
+                        off_disc = off_trk.get("disc_number")
+                        if lt_disc is not None and off_disc is not None and int(lt_disc) != int(off_disc):
+                            continue
+
                         lt_num = lt.get("track_number")
-                        if lt_num and str(lt_num).strip() == str(off_trk["track_number"]).strip():
+                        off_num = off_trk.get("track_number")
+
+                        if is_track_number_match(lt_num, off_num):
                             p_lt = parse_track_title_structure(lt.get("title", ""))
-                            sim = calculate_similarity(p_off["base_norm"], p_lt["base_norm"])
-                            if (p_off["base_norm"] == p_lt["base_norm"]) or sim >= 0.70:
+
+                            # Fast-path: local file is purely numeric (e.g. 01.flac, 1-01.flac) in confirmed album
+                            if _is_numeric_track_item(lt):
                                 matched_local = lt
                                 matched_local_indices.add(idx)
                                 break
+
+                            # Title match with numeric conflict guardrail
+                            has_num_conflict = have_conflicting_numbers(p_off["base_norm"], p_lt["base_norm"])
+                            if not has_num_conflict:
+                                sim = calculate_similarity(p_off["base_norm"], p_lt["base_norm"])
+                                ver_compat = are_versions_compatible(
+                                    p_off["version_type"], p_off["version_text"],
+                                    p_lt["version_type"], p_lt["version_text"]
+                                )
+                                if ((p_off["base_norm"] == p_lt["base_norm"]) or sim >= 0.70) and ver_compat:
+                                    matched_local = lt
+                                    matched_local_indices.add(idx)
+                                    break
 
                 # Pass 3: High title similarity
                 if not matched_local:
                     for idx, lt in enumerate(local_tracks):
                         if idx in matched_local_indices:
                             continue
+
+                        if _is_numeric_track_item(lt):
+                            continue
+
+                        # Check disc number alignment if both are specified
+                        lt_disc = lt.get("disc_number")
+                        off_disc = off_trk.get("disc_number")
+                        if lt_disc is not None and off_disc is not None:
+                            try:
+                                if int(lt_disc) != int(off_disc):
+                                    continue
+                            except (ValueError, TypeError):
+                                pass
+
                         p_lt = parse_track_title_structure(lt.get("title", ""))
+
+                        if have_conflicting_numbers(p_off["base_norm"], p_lt["base_norm"]):
+                            continue
+
+                        if (
+                            p_off["base_norm"] != p_lt["base_norm"]
+                            and have_conflicting_track_numbers(off_trk.get("track_number"), lt.get("track_number"))
+                        ):
+                            continue
+
                         sim = calculate_similarity(p_off["base_norm"], p_lt["base_norm"])
                         ver_compat = are_versions_compatible(
                             p_off["version_type"], p_off["version_text"],
                             p_lt["version_type"], p_lt["version_text"]
                         )
-                        if (p_off["base_norm"] == p_lt["base_norm"] or sim >= 0.85) and ver_compat:
+                        if ((p_off["base_norm"] == p_lt["base_norm"] or sim >= 0.85) and ver_compat):
                             matched_local = lt
                             matched_local_indices.add(idx)
                             break
@@ -587,7 +856,7 @@ class LibraryReleaseService:
             for idx, lt in enumerate(local_tracks):
                 if idx not in matched_local_indices and (lt.get("filename") or lt.get("path")):
                     reconciled_tracklist.append({
-                        "disc_number": 1,
+                        "disc_number": lt.get("disc_number", 1) or 1,
                         "track_number": lt.get("track_number") or "-",
                         "title": lt.get("title") or lt.get("filename"),
                         "artist": lt.get("artist") or rel_artist,
@@ -601,6 +870,18 @@ class LibraryReleaseService:
                         "duration": lt.get("duration"),
                         "mb_recording_id": None
                     })
+
+            # Sort tracks cleanly by (disc_number, track_number)
+            def _audit_sort_key(t: Dict[str, Any]) -> Tuple[int, int, str]:
+                dn = t.get("disc_number") or 1
+                tn_val = t.get("track_number")
+                try:
+                    tn_int = int(re.sub(r"[^\d]", "", str(tn_val))) if tn_val else 9999
+                except Exception:
+                    tn_int = 9999
+                return dn, tn_int, t.get("title", "")
+
+            reconciled_tracklist.sort(key=_audit_sort_key)
 
             total_tracks = len(reconciled_tracklist)
             found_count = sum(1 for t in reconciled_tracklist if t["status"] == "found")
@@ -653,9 +934,9 @@ class LibraryReleaseService:
         if len(track_artists) > 1 or (len(track_artists) == 1 and not is_va and next(iter(track_artists)).lower() != artist.strip().lower()):
             is_va = True
 
-        # Check if any missing tracks have placeholder names like "Track 01 (Missing)"
+        # Check if any missing tracks have placeholder names like "Track 01 (Missing)" or "Disc 1 Track 02 (Missing)"
         has_generic_placeholders = any(
-            re.match(r"^Track\s+\d+\s*\(Missing\)$", m.get("title", ""), re.IGNORECASE)
+            re.match(r"^(?:Disc\s+\d+\s+)?Track\s+\d+\s*\(Missing\)$", m.get("title", ""), re.IGNORECASE)
             for m in missing_tracks
         )
         if has_generic_placeholders and release_title:
@@ -668,7 +949,7 @@ class LibraryReleaseService:
                 }
                 audited = self.audit_release(stub_rel)
                 audited_missing = [t for t in audited.get("tracks", []) if t.get("status") == "missing"]
-                if audited_missing and not any(re.match(r"^Track\s+\d+\s*\(Missing\)$", t.get("title", ""), re.IGNORECASE) for t in audited_missing):
+                if audited_missing and not any(re.match(r"^(?:Disc\s+\d+\s+)?Track\s+\d+\s*\(Missing\)$", t.get("title", ""), re.IGNORECASE) for t in audited_missing):
                     missing_tracks = audited_missing
             except Exception as e:
                 console.print(f"[yellow]Could not auto-resolve placeholder track titles: {e}[/yellow]")
@@ -796,7 +1077,7 @@ class LibraryReleaseService:
             for m in remaining_missing:
                 m_title = m.get("title", "")
                 m_artist = (m.get("artist") or "").strip()
-                if re.match(r"^Track\s+\d+\s*\(Missing\)$", m_title, re.IGNORECASE):
+                if re.match(r"^(?:Disc\s+\d+\s+)?Track\s+\d+\s*\(Missing\)$", m_title, re.IGNORECASE):
                     # Cannot search Soulseek for generic "Track 02 (Missing)"
                     continue
 
@@ -895,9 +1176,12 @@ class LibraryReleaseService:
         """
         Searches Soulseek and downloads a single missing track.
         """
-        # Auto-resolve placeholder titles like "Track 01 (Missing)" via MusicBrainz audit
-        m_match = re.match(r"^Track\s+(\d+)\s*\(Missing\)$", track_title, re.IGNORECASE)
-        t_num = track_number or (int(m_match.group(1)) if m_match else None)
+        # Auto-resolve placeholder titles like "Track 01 (Missing)" or "Disc 1 Track 02 (Missing)" via MusicBrainz audit
+        m_match = re.match(r"^(?:Disc\s+(\d+)\s+)?Track\s+(\d+)\s*\(Missing\)$", track_title, re.IGNORECASE)
+        disc_from_m = int(m_match.group(1)) if (m_match and m_match.group(1)) else None
+        track_from_m = int(m_match.group(2)) if (m_match and m_match.group(2)) else None
+        t_num = track_number or track_from_m
+
         if (m_match or not track_title or "missing" in track_title.lower()) and release_title:
             try:
                 stub_rel = {
@@ -909,8 +1193,11 @@ class LibraryReleaseService:
                 audited = self.audit_release(stub_rel)
                 for trk in audited.get("tracks", []):
                     trk_idx = trk.get("track_num_int") or trk.get("track_number")
-                    if t_num and str(trk_idx) == str(t_num):
-                        if trk.get("title") and not re.match(r"^Track\s+\d+\s*\(Missing\)$", trk["title"], re.IGNORECASE):
+                    trk_d = trk.get("disc_number", 1) or 1
+                    disc_matches = (disc_from_m is None) or (trk_d == disc_from_m)
+
+                    if t_num and str(trk_idx) == str(t_num) and disc_matches:
+                        if trk.get("title") and not re.match(r"^(?:Disc\s+\d+\s+)?Track\s+\d+\s*\(Missing\)$", trk["title"], re.IGNORECASE):
                             resolved_title = trk["title"]
                             console.print(f"[green]Resolved placeholder '{track_title}' to '{resolved_title}' via MusicBrainz[/green]")
                             track_title = resolved_title
@@ -920,7 +1207,7 @@ class LibraryReleaseService:
             except Exception as e:
                 console.print(f"[yellow]Could not auto-resolve placeholder track '{track_title}': {e}[/yellow]")
 
-        if re.match(r"^Track\s+\d+\s*\(Missing\)$", track_title, re.IGNORECASE):
+        if re.match(r"^(?:Disc\s+\d+\s+)?Track\s+\d+\s*\(Missing\)$", track_title, re.IGNORECASE):
             return {
                 "success": False,
                 "message": f"Cannot download generic placeholder '{track_title}'. Please audit the release with MusicBrainz to resolve track titles.",

@@ -4,6 +4,7 @@ Unified text processing, NLP, fuzzy matching, and Unicode normalization for Musi
 
 import re
 import time
+import unicodedata
 import urllib.parse
 from functools import lru_cache
 from difflib import SequenceMatcher
@@ -32,6 +33,55 @@ KANJI_NUMERALS: Dict[str, str] = {
     "十": "10", "百": "100", "千": "1000",
 }
 
+ROMAN_NUMERALS_MAP: Dict[str, str] = {
+    "i": "1", "ii": "2", "iii": "3", "iv": "4", "v": "5",
+    "vi": "6", "vii": "7", "viii": "8", "ix": "9", "x": "10",
+    "xi": "11", "xii": "12", "xiii": "13", "xiv": "14", "xv": "15",
+    "xvi": "16", "xvii": "17", "xviii": "18", "xix": "19", "xx": "20",
+}
+
+UNAMBIGUOUS_ROMAN: Set[str] = {
+    "ii", "iii", "iv", "vi", "vii", "viii", "ix",
+    "xi", "xii", "xiii", "xiv", "xv", "xvi", "xvii", "xviii", "xix", "xx"
+}
+
+
+def normalize_roman_numerals(text: str) -> str:
+    """
+    Translates Roman numerals (I through XX) in track and movement indicators to Arabic digits.
+    Guards against mangling common words and pronouns (e.g. 'I', 'V', 'X').
+    """
+    if not text:
+        return ""
+
+    # 1. Indicator + Roman numeral (I through XX, case-insensitive)
+    pat_indicator = re.compile(
+        r"(\b(?:part|pt|act|movement|mov|mvt|vol|volume|chapter|suite|no|nr|track|scene|phase|section|book|canto|opus|op)\b\.?\s*)([ivx]{1,6})\b",
+        re.IGNORECASE
+    )
+    result = pat_indicator.sub(
+        lambda m: f"{m.group(1)}{ROMAN_NUMERALS_MAP.get(m.group(2).lower(), m.group(2))}",
+        text
+    )
+
+    # 2. Standalone unambiguous Roman numerals (II through XX, excluding single letters 'I', 'V', 'X')
+    pat_unambiguous = re.compile(r"\b([ivx]{2,6})\b", re.IGNORECASE)
+    result = pat_unambiguous.sub(
+        lambda m: ROMAN_NUMERALS_MAP.get(m.group(1).lower(), m.group(1))
+        if m.group(1).lower() in UNAMBIGUOUS_ROMAN else m.group(1),
+        result
+    )
+
+    # 3. Bracketed Roman numerals: (I), [I], {I}, (V), [V], (X)
+    pat_bracketed = re.compile(r"([\(\[\{])\s*([ivx]{1,6})\s*([\)\]\}])", re.IGNORECASE)
+    result = pat_bracketed.sub(
+        lambda m: f"{m.group(1)}{ROMAN_NUMERALS_MAP.get(m.group(2).lower(), m.group(2))}{m.group(3)}"
+        if m.group(2).lower() in ROMAN_NUMERALS_MAP else m.group(0),
+        result
+    )
+
+    return result
+
 
 def kanji_to_arabic(text: str) -> str:
     """Converts simple Kanji and full-width Japanese numerals to Arabic digits."""
@@ -55,17 +105,18 @@ def kanji_to_arabic(text: str) -> str:
 @lru_cache(maxsize=65536)
 def normalize_text(text: Optional[str]) -> str:
     """
-    Applies comprehensive Unicode normalization, Katakana/Hiragana unification,
-    Kanji numeral conversion, punctuation stripping, and diacritics removal.
+    Applies comprehensive Unicode NFC normalization, Katakana/Hiragana unification,
+    Kanji numeral conversion, Roman numeral conversion, punctuation stripping, and diacritics removal.
     """
     if not text:
         return ""
 
-    raw = str(text).strip()
+    raw = unicodedata.normalize('NFC', str(text)).strip()
     raw = raw.translate(ZENKAKU_TO_HANKAKU)
     raw = raw.translate(KATAKANA_TO_HIRAGANA)
     raw = raw.translate(POLISH_DIACRITICS_MAP)
     raw = kanji_to_arabic(raw)
+    raw = normalize_roman_numerals(raw)
     ascii_norm = unidecode(raw).lower()
     clean = re.sub(r"[^\w\s]", " ", ascii_norm)
     clean = re.sub(r"\s+", " ", clean).strip()
@@ -84,7 +135,8 @@ def clean_search_phrase(query: str) -> str:
     """Cleans punctuation and symbols from a search query for maximum index recall, preserving non-Latin scripts."""
     if not query:
         return ""
-    q = query.translate(POLISH_DIACRITICS_MAP)
+    q = unicodedata.normalize('NFC', str(query)).strip()
+    q = q.translate(POLISH_DIACRITICS_MAP)
     q = q.translate(ZENKAKU_TO_HANKAKU)
     q = re.sub(r"[^\w\s\-\.\']", " ", q, flags=re.UNICODE)
     q = re.sub(r"\s+", " ", q).strip()
@@ -126,6 +178,23 @@ def calculate_similarity(str1: str, str2: str) -> float:
     return SequenceMatcher(None, str1, str2).ratio()
 
 
+VERSION_DESCRIPTOR_RE = re.compile(
+    r"^(?:"
+    r"(?:.*?\s+)?(?:remix|rmx|re-mix|flip|bootleg|rework|refix|mashup|mash-up)|"
+    r"(?:.*?\s+)?vip(?:\s*mix)?|"
+    r"instrumental|inst|off\s*vocal|karaoke|backing\s*track|"
+    r"acapella|a\s*cappella|vocal\s*version|"
+    r"acoustic(?:\s*ver(?:sion)?)?|unplugged(?:\s*ver(?:sion)?)?|piano\s*ver(?:sion)?|"
+    r"live(?:\s+at\s+.*|\s+in\s+.*|\s+version|\s*\d{4})?|"
+    r"speed\s*up|sped\s*up|slowed|nightcore|daycore|chopped\s*and\s*screwed|"
+    r"demo|alternate\s*take|alt\s*take|alt\s*mix|rough\s*mix|"
+    r"club\s*mix|extended\s*mix|extended\s*version|radio\s*edit|dub\s*mix|dub|original\s*mix|album\s*version|"
+    r"remaster(?:ed)?|digital\s*remaster|anniversary\s*edition|deluxe\s*(?:edition|version)|bonus\s*track"
+    r")$",
+    re.IGNORECASE
+)
+
+
 @lru_cache(maxsize=65536)
 def strip_track_number_and_artist(filename_no_ext: str) -> str:
     """
@@ -135,28 +204,48 @@ def strip_track_number_and_artist(filename_no_ext: str) -> str:
     e.g. 'Aphex Twin - Syro - 03 - produk 29' -> 'produk 29'
     e.g. 'Aphex Twin (On)-[WAP 39CD]-[01]-On' -> 'On'
     """
-    raw = filename_no_ext.strip()
+    raw = unicodedata.normalize('NFC', str(filename_no_ext or "")).strip()
+    for ext in ('.mp3', '.flac', '.m4a', '.ogg', '.opus', '.wav', '.aiff', '.ape', '.wv', '.wma'):
+        if raw.lower().endswith(ext):
+            raw = raw[:-len(ext)].strip()
+            break
     cleaned = raw
+
+    # Standardize typographic dashes to ASCII hyphen
+    cleaned = re.sub(r'[\u2010-\u2015\u2212\uFF0D]', '-', cleaned)
+    # Standardize tildes / wave dashes used as separators to standard ' - '
+    cleaned = re.sub(r'\s*[~～〜]\s*', ' - ', cleaned)
+
     cleaned = re.sub(r'^(?:\d{1,4}\s*[-._]+\s*|\d+[-._]\d+\s*[-._]*\s*)', '', cleaned)
-    cleaned = re.sub(r'^0\d\s+', '', cleaned)
+    cleaned = re.sub(r'^(?:[a-zA-Z]?\d{1,4})\s+', '', cleaned)
     cleaned = re.sub(r'-\[\d+\]-', ' - ', cleaned)
     cleaned = re.sub(r'^\[\d+\]\s*[-._]*\s*', '', cleaned)
 
+    delimiter = None
     if ' - ' in cleaned:
-        parts = cleaned.split(' - ')
-        cleaned = parts[-1].strip()
-        cleaned = re.sub(r'^(?:\d{1,4}\s*[-._]+\s*|\d+[-._]\d+\s*[-._]*\s*)', '', cleaned)
-        cleaned = re.sub(r'^0\d\s+', '', cleaned)
+        delimiter = ' - '
     elif ' _ ' in cleaned:
-        parts = cleaned.split(' _ ')
-        cleaned = parts[-1].strip()
-        cleaned = re.sub(r'^(?:\d{1,4}\s*[-._]+\s*|\d+[-._]\d+\s*[-._]*\s*)', '', cleaned)
-        cleaned = re.sub(r'^0\d\s+', '', cleaned)
+        delimiter = ' _ '
     elif ']-[' in cleaned:
-        parts = cleaned.split(']-[')
-        cleaned = parts[-1].rstrip(']').strip()
-        cleaned = re.sub(r'^(?:\d{1,4}\s*[-._]+\s*|\d+[-._]\d+\s*[-._]*\s*)', '', cleaned)
-        cleaned = re.sub(r'^0\d\s+', '', cleaned)
+        delimiter = ']-['
+
+    if delimiter:
+        parts = [p.strip().rstrip(']') for p in cleaned.split(delimiter) if p.strip()]
+        if len(parts) >= 2 and VERSION_DESCRIPTOR_RE.match(parts[-1]):
+            version_desc = parts[-1]
+            title_part = parts[-2]
+            title_part = re.sub(r'^(?:\d{1,4}\s*[-._]+\s*|\d+[-._]\d+\s*[-._]*\s*)', '', title_part)
+            title_part = re.sub(r'^(?:[a-zA-Z]?\d{1,4})\s+', '', title_part)
+            if title_part.strip() and not title_part.strip().isdigit():
+                cleaned = f"{title_part} ({version_desc})"
+            else:
+                cleaned = parts[-1]
+                cleaned = re.sub(r'^(?:\d{1,4}\s*[-._]+\s*|\d+[-._]\d+\s*[-._]*\s*)', '', cleaned)
+                cleaned = re.sub(r'^(?:[a-zA-Z]?\d{1,4})\s+', '', cleaned)
+        elif parts:
+            cleaned = parts[-1]
+            cleaned = re.sub(r'^(?:\d{1,4}\s*[-._]+\s*|\d+[-._]\d+\s*[-._]*\s*)', '', cleaned)
+            cleaned = re.sub(r'^(?:[a-zA-Z]?\d{1,4})\s+', '', cleaned)
 
     return cleaned.strip() if cleaned.strip() else raw
 
@@ -175,7 +264,7 @@ REMASTER_OR_NOISE_PATTERNS = [
 
 FEATURE_PATTERNS = [
     re.compile(r"[\(\[\{]\s*(?:feat\.?|ft\.?|featuring|with)\s+([^\)\]\}]+)[\)\]\}]", re.IGNORECASE),
-    re.compile(r"(?:\bfeat\.?|\bft\.?|\bfeaturing\b|\bwith\b)\s*([^,\-\(\[\{]+)", re.IGNORECASE),
+    re.compile(r"(?:\bfeat\.?|\bft\.?|\bfeaturing\b)\s*([^,\-\(\[\{]+)", re.IGNORECASE),
 ]
 
 VERSION_PATTERNS = [
@@ -201,7 +290,7 @@ def parse_track_title_structure(title: str) -> Dict[str, Any]:
     - Version type and normalized descriptor text (e.g. remix, instrumental, live)
     - Featured artist list
     """
-    raw = (title or "").strip()
+    raw = unicodedata.normalize('NFC', str(title or "")).strip()
     if not raw:
         return {
             "raw": "",
@@ -220,9 +309,11 @@ def parse_track_title_structure(title: str) -> Dict[str, Any]:
     features = []
     for pat in FEATURE_PATTERNS:
         for m in pat.finditer(cleaned):
-            f_text = m.group(1).strip()
+            f_text = m.group(1).strip().rstrip(")]}")
             if f_text:
-                features.append(normalize_text(f_text))
+                norm_f = normalize_text(f_text)
+                if norm_f and norm_f not in features:
+                    features.append(norm_f)
 
     # 2. Extract version / remix
     v_type = None
@@ -263,6 +354,7 @@ def are_versions_compatible(
 ) -> bool:
     """
     Determines if two track version modifiers are musically compatible.
+    Supports flexible matching for instrumental, acoustic, live, demo, and remix variations.
     """
     if v1_type is None and v2_type is None:
         return True
@@ -270,10 +362,15 @@ def are_versions_compatible(
         return False
     if v1_type != v2_type:
         return False
+
+    if not v1_text or not v2_text:
+        return True
+
+    # Generic types where variations represent equivalent musical content
+    if v1_type in ("instrumental", "acapella"):
+        return True
+
     if v1_type in ("remix", "mix_edit", "vip"):
-        if not v1_text or not v2_text:
-            return True
-        # Strip generic keywords like 'remix', 'mix', 'edit' to compare the remixer name specifically
         c1 = re.sub(r"\b(remix|rmx|re-mix|flip|edit|bootleg|version|mix)\b", "", v1_text).strip()
         c2 = re.sub(r"\b(remix|rmx|re-mix|flip|edit|bootleg|version|mix)\b", "", v2_text).strip()
         if c1 and c2:
@@ -282,9 +379,18 @@ def are_versions_compatible(
         sim = calculate_similarity(v1_text, v2_text)
         return (sim >= 0.75 or v1_text in v2_text or v2_text in v1_text)
 
-    if v1_text and v2_text:
-        return (v1_text == v2_text) or (calculate_similarity(v1_text, v2_text) > 0.8)
-    return True
+    if v1_type in ("acoustic", "live", "demo"):
+        c1 = re.sub(r"\b(version|take|mix|live|acoustic|demo|rough|alt|alternate|unplugged|piano)\b", "", v1_text).strip()
+        c2 = re.sub(r"\b(version|take|mix|live|acoustic|demo|rough|alt|alternate|unplugged|piano)\b", "", v2_text).strip()
+        if not c1 or not c2:
+            return True
+        if c1 == c2 or c1 in c2 or c2 in c1:
+            return True
+        return calculate_similarity(c1, c2) >= 0.75
+
+    if v1_text == v2_text or v1_text in v2_text or v2_text in v1_text:
+        return True
+    return calculate_similarity(v1_text, v2_text) >= 0.75
 
 
 def extract_dir_and_filename(full_path: str) -> Tuple[str, str]:

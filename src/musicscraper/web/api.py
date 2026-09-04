@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Any
 
 from musicscraper.config import Config
 from musicscraper.core.report import console
-from musicscraper.web.tasks import BackgroundTask, global_task_manager
+from musicscraper.web.tasks import BackgroundTask, TaskCancelledException, global_task_manager
 
 
 _last_status_cache: Optional[Dict[str, Any]] = None
@@ -108,35 +108,38 @@ def get_system_config() -> Dict[str, Any]:
 
 def update_system_config(updates: Dict[str, Any]) -> Dict[str, Any]:
     """Updates runtime configuration settings and persists to .env."""
-    if "DEFAULT_LIBRARY_DIR" in updates:
-        Config.DEFAULT_LIBRARY_DIR = Path(updates["DEFAULT_LIBRARY_DIR"]).resolve()
-    if "DEFAULT_OUTPUT_DIR" in updates:
-        Config.DEFAULT_OUTPUT_DIR = Path(updates["DEFAULT_OUTPUT_DIR"]).resolve()
-    if "SLSKD_URL" in updates:
-        Config.SLSKD_URL = updates["SLSKD_URL"].rstrip("/")
-    if "SLSKD_USERNAME" in updates:
-        Config.SLSKD_USERNAME = updates["SLSKD_USERNAME"]
+    if not isinstance(updates, dict):
+        raise ValueError("Configuration updates must be a JSON object")
+
+    if "DEFAULT_LIBRARY_DIR" in updates and updates["DEFAULT_LIBRARY_DIR"] is not None:
+        Config.DEFAULT_LIBRARY_DIR = Path(str(updates["DEFAULT_LIBRARY_DIR"])).resolve()
+    if "DEFAULT_OUTPUT_DIR" in updates and updates["DEFAULT_OUTPUT_DIR"] is not None:
+        Config.DEFAULT_OUTPUT_DIR = Path(str(updates["DEFAULT_OUTPUT_DIR"])).resolve()
+    if "SLSKD_URL" in updates and updates["SLSKD_URL"] is not None:
+        Config.SLSKD_URL = str(updates["SLSKD_URL"]).rstrip("/")
+    if "SLSKD_USERNAME" in updates and updates["SLSKD_USERNAME"] is not None:
+        Config.SLSKD_USERNAME = str(updates["SLSKD_USERNAME"])
     # Only update password if a non-empty string is passed (preserves existing password)
     if updates.get("SLSKD_PASSWORD"):
-        Config.SLSKD_PASSWORD = updates["SLSKD_PASSWORD"]
-    if "NAVIDROME_URL" in updates:
-        Config.NAVIDROME_URL = updates["NAVIDROME_URL"].rstrip("/")
+        Config.SLSKD_PASSWORD = str(updates["SLSKD_PASSWORD"])
+    if "NAVIDROME_URL" in updates and updates["NAVIDROME_URL"] is not None:
+        Config.NAVIDROME_URL = str(updates["NAVIDROME_URL"]).rstrip("/")
     if "NAVIDROME_USER" in updates or "NAVIDROME_USERNAME" in updates:
-        user_val = updates.get("NAVIDROME_USER") or updates.get("NAVIDROME_USERNAME") or ""
+        user_val = str(updates.get("NAVIDROME_USER") or updates.get("NAVIDROME_USERNAME") or "")
         Config.NAVIDROME_USER = user_val
         Config.NAVIDROME_USERNAME = user_val
     if updates.get("NAVIDROME_TOKEN"):
-        token_val = updates["NAVIDROME_TOKEN"]
+        token_val = str(updates["NAVIDROME_TOKEN"])
         Config.NAVIDROME_TOKEN = token_val
         Config.NAVIDROME_PASSWORD = token_val
     elif updates.get("NAVIDROME_PASSWORD"):
-        token_val = updates["NAVIDROME_PASSWORD"]
+        token_val = str(updates["NAVIDROME_PASSWORD"])
         Config.NAVIDROME_TOKEN = token_val
         Config.NAVIDROME_PASSWORD = token_val
-    if "LASTFM_API_KEY" in updates:
-        Config.LASTFM_API_KEY = updates["LASTFM_API_KEY"]
-    if "BANDCAMP_EMAIL" in updates:
-        Config.BANDCAMP_EMAIL = updates["BANDCAMP_EMAIL"]
+    if "LASTFM_API_KEY" in updates and updates["LASTFM_API_KEY"] is not None:
+        Config.LASTFM_API_KEY = str(updates["LASTFM_API_KEY"])
+    if "BANDCAMP_EMAIL" in updates and updates["BANDCAMP_EMAIL"] is not None:
+        Config.BANDCAMP_EMAIL = str(updates["BANDCAMP_EMAIL"])
 
     global _last_status_cache
     _last_status_cache = None
@@ -167,10 +170,11 @@ def get_slskd_transfers() -> Dict[str, Any]:
 def browse_library(subpath: str = "") -> Dict[str, Any]:
     """Lists folders and audio files in the music library."""
     from musicscraper.core.constants import AUDIO_EXTENSIONS
-    base_dir = Config.DEFAULT_LIBRARY_DIR
-    target = (base_dir / subpath.lstrip("/")).resolve()
+    base_dir = Config.DEFAULT_LIBRARY_DIR.resolve()
+    clean_subpath = (subpath or "").lstrip("/\\")
+    target = (base_dir / clean_subpath).resolve()
 
-    if not str(target).startswith(str(base_dir)):
+    if target != base_dir and base_dir not in target.parents:
         target = base_dir
 
     if not target.exists() or not target.is_dir():
@@ -183,10 +187,11 @@ def browse_library(subpath: str = "") -> Dict[str, Any]:
         for entry in sorted(os.scandir(target), key=lambda e: e.name.lower()):
             if entry.name.startswith("."):
                 continue
+            entry_path = Path(entry.path).resolve()
             if entry.is_dir():
                 directories.append({
                     "name": entry.name,
-                    "rel_path": str(Path(entry.path).relative_to(base_dir))
+                    "rel_path": str(entry_path.relative_to(base_dir))
                 })
             elif entry.is_file():
                 ext = Path(entry.name).suffix.lower()
@@ -195,7 +200,7 @@ def browse_library(subpath: str = "") -> Dict[str, Any]:
                     files.append({
                         "name": entry.name,
                         "size": stat.st_size,
-                        "rel_path": str(Path(entry.path).relative_to(base_dir))
+                        "rel_path": str(entry_path.relative_to(base_dir))
                     })
     except Exception as e:
         return {"current_path": str(target), "error": str(e), "directories": [], "files": []}
@@ -313,6 +318,7 @@ def get_library_release_details(release_id: str, audit: bool = True, force_refre
 
 def run_audit_task(task: BackgroundTask) -> Dict[str, Any]:
     """Executes artist discography audit against local library."""
+    task.check_cancelled()
     from musicscraper.services.auditor import AuditorService
     artist = task.params.get("artist", "").strip()
     music_dir = Path(task.params.get("music_dir", str(Config.DEFAULT_LIBRARY_DIR)))
@@ -323,6 +329,7 @@ def run_audit_task(task: BackgroundTask) -> Dict[str, Any]:
         raise ValueError("Artist name or MBID is required for audit.")
 
     task.update_progress(10, f"Resolving MusicBrainz discography for '{artist}'...")
+    task.check_cancelled()
     auditor = AuditorService()
     catalog, found_items, missing_items = auditor.audit_artist(
         artist_query=artist,
@@ -331,6 +338,7 @@ def run_audit_task(task: BackgroundTask) -> Dict[str, Any]:
         force_refresh=force_refresh
     )
 
+    task.check_cancelled()
     task.update_progress(80, "Aggregating audit metrics...")
 
     # Group releases with found/missing breakdowns
@@ -428,6 +436,7 @@ def run_audit_task(task: BackgroundTask) -> Dict[str, Any]:
 
 def run_soulseek_search_task(task: BackgroundTask) -> Dict[str, Any]:
     """Searches Soulseek via slskd for artist/album/track query."""
+    task.check_cancelled()
     from musicscraper.clients.slskd import SlskdClient
     from musicscraper.core.audio import AudioQualityAnalyzer
 
@@ -439,8 +448,10 @@ def run_soulseek_search_task(task: BackgroundTask) -> Dict[str, Any]:
         raise ValueError("Search query is required.")
 
     task.update_progress(20, f"Submitting Soulseek search for '{query}'...")
+    task.check_cancelled()
     client = SlskdClient(timeout=timeout + 10)
     search_data = client.search(query=query, timeout=timeout)
+    task.check_cancelled()
 
     task.update_progress(85, "Parsing discovered peer directories...")
     res = search_data.get("responses", [])
@@ -448,6 +459,7 @@ def run_soulseek_search_task(task: BackgroundTask) -> Dict[str, Any]:
     parsed_dirs: List[Dict[str, Any]] = []
     if res and isinstance(res, list):
         for resp in res:
+            task.check_cancelled()
             user = resp.get("username", "Unknown")
             files = resp.get("files", [])
             if not files:
@@ -480,6 +492,7 @@ def run_soulseek_search_task(task: BackgroundTask) -> Dict[str, Any]:
                     "files": audio_files
                 })
 
+    task.check_cancelled()
     task.update_progress(100, f"Found {len(parsed_dirs)} peer folders.")
     return {
         "query": query,
@@ -490,6 +503,7 @@ def run_soulseek_search_task(task: BackgroundTask) -> Dict[str, Any]:
 
 def run_soulseek_queue_task(task: BackgroundTask) -> Dict[str, Any]:
     """Enqueues files or directory transfers to slskd."""
+    task.check_cancelled()
     from musicscraper.clients.slskd import SlskdClient
     username = task.params.get("username", "").strip()
     files = task.params.get("files", [])
@@ -498,6 +512,7 @@ def run_soulseek_queue_task(task: BackgroundTask) -> Dict[str, Any]:
         raise ValueError("Username and files list are required to queue transfers.")
 
     task.update_progress(20, f"Queueing {len(files)} items from user '{username}'...")
+    task.check_cancelled()
     client = SlskdClient()
     client.enqueue_download(username, files)
     task.update_progress(100, "Transfers successfully queued.")
@@ -506,6 +521,7 @@ def run_soulseek_queue_task(task: BackgroundTask) -> Dict[str, Any]:
 
 def run_artist_download_task(task: BackgroundTask) -> Dict[str, Any]:
     """Executes multi-source artist discography downloader."""
+    task.check_cancelled()
     from musicscraper.services.artist import ArtistDownloadOrchestrator
     artist = task.params.get("artist", "").strip()
     output_dir = Path(task.params.get("output_dir", str(Config.DEFAULT_OUTPUT_DIR)))
@@ -520,6 +536,7 @@ def run_artist_download_task(task: BackgroundTask) -> Dict[str, Any]:
         raise ValueError("Artist name is required.")
 
     task.update_progress(10, f"Initializing multi-source orchestrator for '{artist}'...")
+    task.check_cancelled()
     orchestrator = ArtistDownloadOrchestrator(
         artist_query=artist,
         output_dir=output_dir,
@@ -531,23 +548,27 @@ def run_artist_download_task(task: BackgroundTask) -> Dict[str, Any]:
         search_timeout=timeout
     )
     res = orchestrator.run()
+    task.check_cancelled()
     task.update_progress(100, "Artist download orchestration completed.")
     return res
 
 
 def run_quality_scan_task(task: BackgroundTask) -> Dict[str, Any]:
     """Scans local library to discover low-bitrate tracks eligible for upgrade."""
+    task.check_cancelled()
     from musicscraper.services.quality import LocalLibraryQualityScanner
     library_dir = Path(task.params.get("library_dir", str(Config.DEFAULT_LIBRARY_DIR)))
     target_format = task.params.get("format", "flac")
     artist_filter = task.params.get("artist_filter", "").strip() or None
 
     task.update_progress(10, f"Scanning library at {library_dir} for low-bitrate audio...")
+    task.check_cancelled()
     scanner = LocalLibraryQualityScanner(
         library_dir=library_dir,
         target_format=target_format
     )
     candidates = scanner.scan(artist_filter=artist_filter)
+    task.check_cancelled()
     task.update_progress(90, f"Found {len(candidates)} candidate tracks.")
 
     candidate_list = []
@@ -564,6 +585,7 @@ def run_quality_scan_task(task: BackgroundTask) -> Dict[str, Any]:
             "current_label": c.current_label
         })
 
+    task.check_cancelled()
     task.update_progress(100, f"Scan finished. {len(candidate_list)} tracks need upgrade.")
     return {
         "candidate_count": len(candidate_list),
@@ -573,6 +595,7 @@ def run_quality_scan_task(task: BackgroundTask) -> Dict[str, Any]:
 
 def run_quality_upgrade_task(task: BackgroundTask) -> Dict[str, Any]:
     """Scans and upgrades low-bitrate tracks via Soulseek."""
+    task.check_cancelled()
     from musicscraper.services.quality import LocalLibraryQualityScanner, SoulseekQualityUpgrader
     library_dir = Path(task.params.get("library_dir", str(Config.DEFAULT_LIBRARY_DIR)))
     target_format = task.params.get("format", "flac")
@@ -581,16 +604,20 @@ def run_quality_upgrade_task(task: BackgroundTask) -> Dict[str, Any]:
     timeout = float(task.params.get("timeout", 25.0))
 
     task.update_progress(10, "Scanning library for upgrade candidates...")
+    task.check_cancelled()
     scanner = LocalLibraryQualityScanner(library_dir=library_dir, target_format=target_format)
     candidates = scanner.scan(artist_filter=artist_filter)
+    task.check_cancelled()
 
     if not candidates:
         task.update_progress(100, "No upgrade candidates found.")
         return {"candidate_count": 0, "upgraded_count": 0, "candidates": []}
 
     task.update_progress(30, f"Searching Soulseek for {len(candidates)} candidates...")
+    task.check_cancelled()
     upgrader = SoulseekQualityUpgrader(preferred_format=target_format, dry_run=dry_run, search_timeout=timeout)
     upgrader.upgrade_candidates(candidates)
+    task.check_cancelled()
 
     task.update_progress(100, f"Quality upgrade run completed ({'Dry run' if dry_run else 'Queued'}).")
     return {
@@ -601,6 +628,7 @@ def run_quality_upgrade_task(task: BackgroundTask) -> Dict[str, Any]:
 
 def run_genre_tag_task(task: BackgroundTask) -> Dict[str, Any]:
     """Runs Last.fm genre tagger service."""
+    task.check_cancelled()
     from musicscraper.services.tagger import GenreTaggerService
     path = Path(task.params.get("path", str(Config.DEFAULT_LIBRARY_DIR)))
     strategy = task.params.get("strategy", "cascade")
@@ -609,6 +637,7 @@ def run_genre_tag_task(task: BackgroundTask) -> Dict[str, Any]:
     dry_run = bool(task.params.get("dry_run", False))
 
     task.update_progress(15, f"Tagging files in {path} (strategy: {strategy}, dry-run: {dry_run})...")
+    task.check_cancelled()
     tagger = GenreTaggerService(
         strategy=strategy,
         limit=limit,
@@ -616,12 +645,14 @@ def run_genre_tag_task(task: BackgroundTask) -> Dict[str, Any]:
         dry_run=dry_run
     )
     tagger.process_target(path)
+    task.check_cancelled()
     task.update_progress(100, "Genre tagging completed.")
     return {"path": str(path), "strategy": strategy, "dry_run": dry_run}
 
 
 def run_bandcamp_download_task(task: BackgroundTask) -> Dict[str, Any]:
     """Downloads releases/tracks from Bandcamp."""
+    task.check_cancelled()
     from musicscraper.scrapers.bandcamp import BandcampEngine
     targets = task.params.get("targets", [])
     if isinstance(targets, str):
@@ -636,6 +667,7 @@ def run_bandcamp_download_task(task: BackgroundTask) -> Dict[str, Any]:
         raise ValueError("At least one Bandcamp URL or artist name is required.")
 
     task.update_progress(10, f"Initializing Bandcamp engine for {len(targets)} targets...")
+    task.check_cancelled()
     engine = BandcampEngine(
         output_dir=output_dir,
         audio_format=audio_format,
@@ -645,27 +677,35 @@ def run_bandcamp_download_task(task: BackgroundTask) -> Dict[str, Any]:
 
     downloaded = []
     for idx, target in enumerate(targets):
+        task.check_cancelled()
         task.update_progress(20 + int((idx / len(targets)) * 75), f"Processing Bandcamp target: {target}")
         norm_url, target_type = BandcampEngine.normalize_target(target)
         if target_type == "artist":
+            task.check_cancelled()
             rel_urls = engine.get_artist_release_urls(norm_url)
             for r_url in rel_urls:
+                task.check_cancelled()
                 meta = engine.get_release_metadata(r_url)
                 if meta:
+                    task.check_cancelled()
                     engine.download_release(meta)
                     downloaded.append(meta.get("title", r_url))
         else:
+            task.check_cancelled()
             meta = engine.get_release_metadata(norm_url)
             if meta:
+                task.check_cancelled()
                 engine.download_release(meta)
                 downloaded.append(meta.get("title", norm_url))
 
+    task.check_cancelled()
     task.update_progress(100, f"Bandcamp download complete. {len(downloaded)} releases processed.")
     return {"targets": targets, "downloaded_count": len(downloaded), "releases": downloaded}
 
 
 def run_universal_scrape_task(task: BackgroundTask) -> Dict[str, Any]:
     """Crawls a music release website and batch downloads audio files."""
+    task.check_cancelled()
     from musicscraper.scrapers.universal import UniversalScraper, MusicDownloader
     url = task.params.get("url", "").strip()
     output_dir = Path(task.params.get("output_dir", str(Config.DEFAULT_OUTPUT_DIR)))
@@ -676,12 +716,15 @@ def run_universal_scrape_task(task: BackgroundTask) -> Dict[str, Any]:
         raise ValueError("URL to scrape is required.")
 
     task.update_progress(15, f"Crawling release links from {url}...")
+    task.check_cancelled()
     scraper = UniversalScraper(base_url=url)
     releases = scraper.crawl()
+    task.check_cancelled()
 
     task.update_progress(50, f"Discovered {len(releases)} releases. Starting downloads...")
     downloader = MusicDownloader(output_dir=output_dir, max_workers=max_workers, overwrite=overwrite)
     downloader.download_all(releases)
+    task.check_cancelled()
 
     task.update_progress(100, f"Downloaded {len(releases)} releases from {url}.")
     return {"url": url, "releases_count": len(releases)}
@@ -689,13 +732,16 @@ def run_universal_scrape_task(task: BackgroundTask) -> Dict[str, Any]:
 
 def run_clean_folders_task(task: BackgroundTask) -> Dict[str, Any]:
     """Scans and cleans empty / non-music directories."""
+    task.check_cancelled()
     from musicscraper.services.cleaner import FolderCleanerService
     path = Path(task.params.get("path", str(Config.DEFAULT_OUTPUT_DIR)))
     execute = bool(task.params.get("execute", False))
 
     task.update_progress(20, f"Scanning folders in {path} (mode: {'Execute Deletion' if execute else 'Preview Dry-run'})...")
+    task.check_cancelled()
     cleaner = FolderCleanerService()
     deleted_paths, total_scanned = cleaner.clean(target_dir=path, dry_run=not execute)
+    task.check_cancelled()
 
     task.update_progress(100, f"Finished scan. {len(deleted_paths)} empty folders {'deleted' if execute else 'identified'}.")
     return {
@@ -710,15 +756,18 @@ def run_clean_folders_task(task: BackgroundTask) -> Dict[str, Any]:
 def run_library_scan_task(task: BackgroundTask) -> Dict[str, Any]:
     """Scans and caches all releases present in the music library."""
     global _library_releases_cache
+    task.check_cancelled()
     from musicscraper.services.library import LibraryReleaseService
 
     library_dir = Path(task.params.get("library_dir", str(Config.DEFAULT_LIBRARY_DIR)))
     force_rescan = bool(task.params.get("force_rescan", True))
 
     task.update_progress(10, f"Scanning audio files in library: {library_dir}...")
+    task.check_cancelled()
     service = LibraryReleaseService()
 
     def on_prog(done, total, msg):
+        task.check_cancelled()
         pct = 10 + int((done / max(1, total)) * 75)
         task.update_progress(pct, f"{msg} ({done}/{total})")
 
@@ -727,6 +776,7 @@ def run_library_scan_task(task: BackgroundTask) -> Dict[str, Any]:
         force_rescan=force_rescan,
         on_progress=on_prog
     )
+    task.check_cancelled()
 
     _library_releases_cache = {"timestamp": time.time(), "releases": releases}
     task.update_progress(100, f"Discovered and organized {len(releases)} releases in library.")
@@ -739,6 +789,7 @@ def run_library_scan_task(task: BackgroundTask) -> Dict[str, Any]:
 
 def run_release_missing_download_task(task: BackgroundTask) -> Dict[str, Any]:
     """Searches Soulseek and downloads all missing tracks for a specific release."""
+    task.check_cancelled()
     from musicscraper.services.library import LibraryReleaseService
 
     artist = task.params.get("artist", "").strip()
@@ -756,9 +807,11 @@ def run_release_missing_download_task(task: BackgroundTask) -> Dict[str, Any]:
         return {"status": "skipped", "queued_count": 0}
 
     task.update_progress(10, f"Searching Soulseek for {len(missing_tracks)} missing tracks of '{artist} - {release_title}'...")
+    task.check_cancelled()
     service = LibraryReleaseService()
 
     def on_prog(done, total, msg):
+        task.check_cancelled()
         task.update_progress(done, msg)
 
     res = service.download_missing_tracks(
@@ -770,6 +823,7 @@ def run_release_missing_download_task(task: BackgroundTask) -> Dict[str, Any]:
         dry_run=dry_run,
         on_progress=on_prog
     )
+    task.check_cancelled()
 
     task.update_progress(100, f"Queued {res.get('queued_count', 0)} of {len(missing_tracks)} missing tracks.")
     return res
@@ -777,6 +831,7 @@ def run_release_missing_download_task(task: BackgroundTask) -> Dict[str, Any]:
 
 def run_track_soulseek_download_task(task: BackgroundTask) -> Dict[str, Any]:
     """Searches Soulseek and downloads a single missing track."""
+    task.check_cancelled()
     from musicscraper.services.library import LibraryReleaseService
 
     artist = task.params.get("artist", "").strip()
@@ -794,6 +849,7 @@ def run_track_soulseek_download_task(task: BackgroundTask) -> Dict[str, Any]:
     service = LibraryReleaseService()
     display_name = f"{track_artist} - {track_title}" if track_artist else f"{artist} - {track_title}"
     task.update_progress(15, f"Searching Soulseek for single track '{display_name}'...")
+    task.check_cancelled()
     res = service.download_single_missing_track(
         artist=artist,
         release_title=release_title,
@@ -804,6 +860,7 @@ def run_track_soulseek_download_task(task: BackgroundTask) -> Dict[str, Any]:
         search_timeout=timeout,
         dry_run=dry_run
     )
+    task.check_cancelled()
 
     actual_track = res.get("track", track_title)
     if res.get("success"):
@@ -817,15 +874,18 @@ def run_track_soulseek_download_task(task: BackgroundTask) -> Dict[str, Any]:
 def run_library_audit_all_task(task: BackgroundTask) -> Dict[str, Any]:
     """Audits all library releases against MusicBrainz to find missing tracks across the entire library."""
     global _library_releases_cache
+    task.check_cancelled()
     from musicscraper.services.library import LibraryReleaseService
 
     library_dir = Path(task.params.get("library_dir", str(Config.DEFAULT_LIBRARY_DIR)))
     force_refresh = bool(task.params.get("force_refresh", True))
 
     task.update_progress(10, "Starting MusicBrainz audit for all library releases...")
+    task.check_cancelled()
     service = LibraryReleaseService()
 
     def on_prog(done, total, msg):
+        task.check_cancelled()
         pct = 10 + int((done / max(1, total)) * 85)
         task.update_progress(pct, f"[{done}/{total}] {msg}")
 
@@ -834,6 +894,7 @@ def run_library_audit_all_task(task: BackgroundTask) -> Dict[str, Any]:
         force_refresh=force_refresh,
         on_progress=on_prog
     )
+    task.check_cancelled()
 
     _library_releases_cache = {"timestamp": time.time(), "releases": audited}
 
@@ -860,14 +921,20 @@ TASK_DISPATCHER = {
     "universal_scrape": run_universal_scrape_task,
     "clean_folders": run_clean_folders_task,
     "library_scan": run_library_scan_task,
+    "library_audit": run_library_audit_all_task,
     "library_audit_all": run_library_audit_all_task,
     "release_missing_download": run_release_missing_download_task,
     "track_soulseek_download": run_track_soulseek_download_task,
 }
 
 
-def launch_task(task_type: str, params: Dict[str, Any], name: Optional[str] = None) -> BackgroundTask:
+def launch_task(task_type: str, params: Optional[Dict[str, Any]] = None, name: Optional[str] = None) -> BackgroundTask:
     """Dispatches and launches an asynchronous task."""
+    if not isinstance(task_type, str) or not task_type.strip():
+        raise ValueError("Task type must be a non-empty string")
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("Task params must be a dictionary")
+    params = params or {}
     fn = TASK_DISPATCHER.get(task_type)
     if not fn:
         raise ValueError(f"Unknown task type: {task_type}")

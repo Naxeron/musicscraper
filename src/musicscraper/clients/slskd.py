@@ -7,6 +7,7 @@ import re
 import time
 import urllib.parse
 import threading
+from collections import OrderedDict
 from typing import Dict, List, Optional, Any, Union, Tuple, Set, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -14,6 +15,8 @@ import requests
 
 from musicscraper.config import Config
 from musicscraper.clients.http import create_resilient_session
+
+MAX_DIRECTORY_CACHE_SIZE: int = 500
 
 
 class SlskdAPIError(Exception):
@@ -23,6 +26,8 @@ class SlskdAPIError(Exception):
 
 class SlskdClient:
     """Client for communicating with the slskd REST API."""
+
+    MAX_DIRECTORY_CACHE_SIZE: int = MAX_DIRECTORY_CACHE_SIZE
 
     def __init__(
         self,
@@ -43,10 +48,19 @@ class SlskdClient:
         self.token_expiry: float = 0
         self._lock = threading.Lock()
 
-        # Memory cache for directory browsing
-        self._directory_cache: Dict[str, List[Dict[str, Any]]] = {}
+        # Bounded LRU memory cache for directory browsing
+        self._max_cache_size: int = MAX_DIRECTORY_CACHE_SIZE
+        self._directory_cache: OrderedDict[str, List[Dict[str, Any]]] = OrderedDict()
 
         self._ensure_authenticated()
+
+    @property
+    def max_directory_cache_size(self) -> int:
+        return self._max_cache_size
+
+    @max_directory_cache_size.setter
+    def max_directory_cache_size(self, value: int) -> None:
+        self._max_cache_size = value
 
     def _ensure_authenticated(self, force_refresh: bool = False) -> None:
         """Ensures an active, valid authentication token or API key header."""
@@ -356,6 +370,7 @@ class SlskdClient:
         cache_key = f"{username}:{directory}"
         with self._lock:
             if use_cache and cache_key in self._directory_cache:
+                self._directory_cache.move_to_end(cache_key)
                 return self._directory_cache[cache_key]
 
         try:
@@ -364,9 +379,12 @@ class SlskdClient:
                 return []
 
             data = resp.json()
-            if use_cache and data:
+            if use_cache and data is not None:
                 with self._lock:
                     self._directory_cache[cache_key] = data
+                    self._directory_cache.move_to_end(cache_key)
+                    while len(self._directory_cache) > self._max_cache_size:
+                        self._directory_cache.popitem(last=False)
             return data
         except Exception:
             return []
@@ -386,6 +404,7 @@ class SlskdClient:
             cache_key = f"{user}:{dir_path}"
             with self._lock:
                 if use_cache and cache_key in self._directory_cache:
+                    self._directory_cache.move_to_end(cache_key)
                     results[(user, dir_path)] = self._directory_cache[cache_key]
                     continue
             to_fetch.append((user, dir_path))
